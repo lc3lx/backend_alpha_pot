@@ -25,6 +25,7 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
     private readonly string _loginUrl;
     private readonly string _signupUrl;
     private readonly int _timeoutMs;
+    private readonly string? _proxyServer;
     private readonly SemaphoreSlim _gate = new(1, 1);
 
     public NodeBinollaCredentialAuth(
@@ -43,6 +44,8 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
             configuration.GetValue("Binolla:CredentialLogin:TimeoutSeconds", 60) * 1000,
             15_000,
             120_000);
+        _proxyServer = configuration["BINOLLA_AUTH_PROXY"]
+                       ?? configuration["Binolla:CredentialLogin:ProxyServer"];
 
         var configured = configuration["Binolla:CredentialLogin:ToolDirectory"];
         _toolDirectory = !string.IsNullOrWhiteSpace(configured)
@@ -73,6 +76,7 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
             playwrightExists = Directory.Exists(Path.Combine(_toolDirectory, "node_modules", "playwright")),
             headless = _headless,
             timeoutMs = _timeoutMs,
+            hasProxy = !string.IsNullOrWhiteSpace(_proxyServer),
             emailLen = email?.Length ?? 0,
             contentRootHint = Directory.GetCurrentDirectory()
         });
@@ -150,6 +154,8 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         psi.Environment["SCARALPHA_AGENT_DEBUG_LOG"] =
             Environment.GetEnvironmentVariable("SCARALPHA_AGENT_DEBUG_LOG")
             ?? "/home/web/backend/logs/debug-660ec2.log";
+        if (!string.IsNullOrWhiteSpace(_proxyServer))
+            psi.Environment["BINOLLA_AUTH_PROXY"] = _proxyServer;
 
         psi.ArgumentList.Add("capture.mjs");
         psi.ArgumentList.Add("--mode");
@@ -162,6 +168,11 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         psi.ArgumentList.Add(_signupUrl);
         psi.ArgumentList.Add("--timeoutMs");
         psi.ArgumentList.Add(_timeoutMs.ToString());
+        if (!string.IsNullOrWhiteSpace(_proxyServer))
+        {
+            psi.ArgumentList.Add("--proxy");
+            psi.ArgumentList.Add(_proxyServer);
+        }
 
         _logger.LogInformation("Starting Binolla credential {Mode} capture from {ToolDir}", mode, _toolDirectory);
         // #region agent log
@@ -170,7 +181,8 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
             mode,
             toolDirectory = _toolDirectory,
             nodeExecutable = _nodeExecutable,
-            timeoutMs = _timeoutMs
+            timeoutMs = _timeoutMs,
+            hasProxy = !string.IsNullOrWhiteSpace(_proxyServer)
         });
         // #endregion
 
@@ -328,6 +340,11 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
             || blob.Contains("libatk", StringComparison.OrdinalIgnoreCase)
             || blob.Contains("cannot open shared object", StringComparison.OrdinalIgnoreCase))
             return "missing-os-libs";
+        if (blob.Contains("not available in your current location", StringComparison.OrdinalIgnoreCase)
+            || blob.Contains("United Kingdom", StringComparison.OrdinalIgnoreCase)
+            || blob.Contains("(GB)", StringComparison.OrdinalIgnoreCase)
+            || blob.Contains("geo-restriction", StringComparison.OrdinalIgnoreCase))
+            return "geo-blocked";
         if (blob.Contains("browserType.launch", StringComparison.OrdinalIgnoreCase))
             return "browser-launch";
         if (blob.Contains("timed out", StringComparison.OrdinalIgnoreCase))
@@ -342,6 +359,13 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         {
             return "Binolla browser failed to start on the server (missing Chromium OS libraries). "
                    + "On the VPS run: cd /home/web/backend/tools/binolla-auth && chmod +x install-deps.sh && ./install-deps.sh";
+        }
+
+        if (kind == "geo-blocked")
+        {
+            return "Binolla blocked this server IP by location (geo-restriction). "
+                   + "Set BINOLLA_AUTH_PROXY in scaralpha.env to a proxy in an allowed country, "
+                   + "or paste your Binolla SSID from Edit Profile.";
         }
 
         if (string.IsNullOrWhiteSpace(error))

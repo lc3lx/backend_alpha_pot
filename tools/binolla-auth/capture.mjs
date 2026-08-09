@@ -208,10 +208,30 @@ async function tryInPageAuthApi(page, { isSignup, email, password, lid }) {
 
       const bodies = isSignup
         ? [
-            { email, password, passwordConfirm: password, lid },
-            { email, password, confirmPassword: password, lid: String(lid) },
-            { email, password, lid },
-            { email, password },
+            {
+              email,
+              password,
+              passwordConfirm: password,
+              agreement: true,
+              isNotUsCitizen: true,
+              lid,
+            },
+            {
+              email,
+              password,
+              confirmPassword: password,
+              agreement: true,
+              isNotUsCitizen: true,
+              lid: String(lid),
+            },
+            {
+              email,
+              password,
+              agreement: true,
+              isNotUsCitizen: true,
+              lid,
+            },
+            { email, password, agreement: true, isNotUsCitizen: true },
           ]
         : [{ email, password }, { email, password, remember: true }];
 
@@ -235,9 +255,15 @@ async function tryInPageAuthApi(page, { isSignup, email, password, lid }) {
               ct: res.headers.get('content-type') || '',
               body: text.slice(0, 1200),
             });
-            // Stop early on clear success or credential rejection.
+            // Stop early on success, geo-block, or hard credential rejection.
             if (res.status >= 200 && res.status < 300) return { attempts, okStatus: true };
-            if (res.status === 400 || res.status === 401 || res.status === 422) {
+            if (
+              /not available in your current location|geo|region|restricted/i.test(text)
+            ) {
+              return { attempts, okStatus: false, geoBlocked: true };
+            }
+            // Keep trying other bodies on validation errors (e.g. missing agreement).
+            if (res.status === 401 || res.status === 403) {
               return { attempts, okStatus: false };
             }
           } catch (e) {
@@ -265,6 +291,8 @@ async function main() {
   const timeoutMs = Number(arg('timeoutMs', '45000')) || 45000;
   // Leave headroom so C# WaitForExit (timeoutMs+15s) does not kill us mid-exit.
   const waitBudgetMs = Math.max(12_000, Math.min(timeoutMs - 20_000, 45_000));
+  const proxyServer =
+    arg('proxy') || process.env.BINOLLA_AUTH_PROXY || process.env.Binolla__CredentialLogin__ProxyServer || '';
 
   if (!email || !password) {
     agentLog('A', 'capture.mjs:missingCreds', 'email/password missing', { mode });
@@ -289,6 +317,7 @@ async function main() {
     headless,
     timeoutMs,
     waitBudgetMs,
+    hasProxy: Boolean(proxyServer),
     urlHost: (() => {
       try {
         return new URL(url).host;
@@ -300,7 +329,7 @@ async function main() {
 
   let browser;
   try {
-    browser = await chromium.launch({
+    const launchOpts = {
       headless,
       args: [
         '--no-sandbox',
@@ -309,7 +338,11 @@ async function main() {
         '--disable-dev-shm-usage',
         '--ignore-certificate-errors',
       ],
-    });
+    };
+    if (proxyServer) {
+      launchOpts.proxy = { server: proxyServer };
+    }
+    browser = await chromium.launch(launchOpts);
   } catch (launchErr) {
     const raw = launchErr instanceof Error ? launchErr.message : String(launchErr);
     const missingLibs = /shared libraries|libatk|cannot open shared object/i.test(raw);
@@ -473,7 +506,14 @@ async function main() {
           ],
           password,
         );
-        // Accept all visible checkboxes (terms / age / marketing).
+        // Required Binolla checkboxes (from live DOM: agreement + isNotUsCitizen).
+        for (const name of ['agreement', 'isNotUsCitizen']) {
+          try {
+            await page.locator(`input[type="checkbox"][name="${name}"]`).check({ timeout: 2000 });
+          } catch {
+            /* try generic below */
+          }
+        }
         try {
           const boxes = page.locator('input[type="checkbox"]');
           const count = await boxes.count();
@@ -548,6 +588,14 @@ async function main() {
         error = lastBody.slice(0, 180) || error;
       } else if (diag?.hasCfChallenge) {
         error = 'Binolla Cloudflare challenge blocked auth on the server';
+      } else if (
+        /not available in your current location/i.test(lastBody) ||
+        /United Kingdom|\(GB\)/i.test(lastBody) ||
+        (diag?.alerts || []).some((a) => /current location|United Kingdom|\(GB\)/i.test(a))
+      ) {
+        error =
+          'Binolla blocked this server IP by location (geo-restriction). ' +
+          'Set BINOLLA_AUTH_PROXY in scaralpha.env to a proxy in an allowed country, or paste SSID from Edit Profile.';
       } else if (diag?.alerts?.length) {
         error = diag.alerts[0].slice(0, 180);
       } else if (/Registration \| Binolla/i.test(diag?.title || '')) {

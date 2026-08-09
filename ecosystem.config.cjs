@@ -46,6 +46,7 @@ module.exports = {
         TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
         CORS_ORIGINS: process.env.CORS_ORIGINS || '',
         ADMIN_TELEGRAM_USER_IDS: process.env.ADMIN_TELEGRAM_USER_IDS || '',
+        BINOLLA_AUTH_PROXY: process.env.BINOLLA_AUTH_PROXY || '',
         DOTNET_ROOT: process.env.DOTNET_ROOT || '',
         PATH: process.env.PATH || '',
       },
