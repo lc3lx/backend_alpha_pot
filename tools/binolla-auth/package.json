@@ -1,0 +1,10 @@
+{
+  "name": "scaralpha-binolla-auth",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Binolla email/password → session token (A11ksa/API-Binolla style)",
+  "type": "module",
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}

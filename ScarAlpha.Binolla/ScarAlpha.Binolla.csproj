@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>ScarAlpha.Binolla</RootNamespace>
+    <AssemblyName>ScarAlpha.Binolla</AssemblyName>
+    <Description>Multi-user safe Binolla WebSocket trading engine (protocol retained from BinollaApiDotNetPro).</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+
+</Project>
