@@ -193,15 +193,21 @@ async function main() {
       args: ['--disable-blink-features=AutomationControlled', '--disable-dev-shm-usage'],
     });
   } catch (launchErr) {
+    const raw = launchErr instanceof Error ? launchErr.message : String(launchErr);
+    const missingLibs =
+      /shared libraries|libatk|cannot open shared object/i.test(raw);
     // #region agent log
     agentLog('A', 'capture.mjs:launchFail', 'chromium.launch failed', {
-      error: launchErr instanceof Error ? launchErr.message : String(launchErr),
+      missingLibs,
+      error: raw.slice(0, 400),
     });
     // #endregion
     process.stdout.write(
       JSON.stringify({
         ok: false,
-        error: launchErr instanceof Error ? launchErr.message : String(launchErr),
+        error: missingLibs
+          ? 'missing OS libraries for Chromium (libatk). Run tools/binolla-auth/install-deps.sh'
+          : raw,
       }),
     );
     process.exit(1);

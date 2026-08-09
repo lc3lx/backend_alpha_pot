@@ -255,21 +255,21 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
 
         if (!result.Ok || string.IsNullOrWhiteSpace(result.Token) || result.Token.Length < 16)
         {
+            var safeError = SanitizeCaptureError(result.Error, stderr);
             // #region agent log
             AgentDebugLog.Write("A", "NodeBinollaCredentialAuth.RunNodeCaptureAsync:fail", "capture returned error", new
             {
                 mode,
                 ok = result.Ok,
-                error = result.Error,
+                error = safeError,
+                rawErrorKind = ClassifyCaptureError(result.Error, stderr),
                 hasToken = !string.IsNullOrWhiteSpace(result.Token)
             });
             // #endregion
             // Use 400 so clients do not treat this as Scar Alpha JWT expiry.
             throw new ApiException(
                 ApiErrorCodes.BinollaLoginFailed,
-                string.IsNullOrWhiteSpace(result.Error)
-                    ? "Binolla login failed."
-                    : result.Error,
+                safeError,
                 400);
         }
 
@@ -319,6 +319,36 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
             throw new ApiException(ApiErrorCodes.ValidationError, "Binolla password is required.");
         if (password.Length > 128 || email.Length > 256)
             throw new ApiException(ApiErrorCodes.ValidationError, "Credentials exceed allowed length.");
+    }
+
+    private static string ClassifyCaptureError(string? error, string? stderr)
+    {
+        var blob = $"{error}\n{stderr}";
+        if (blob.Contains("shared libraries", StringComparison.OrdinalIgnoreCase)
+            || blob.Contains("libatk", StringComparison.OrdinalIgnoreCase)
+            || blob.Contains("cannot open shared object", StringComparison.OrdinalIgnoreCase))
+            return "missing-os-libs";
+        if (blob.Contains("browserType.launch", StringComparison.OrdinalIgnoreCase))
+            return "browser-launch";
+        if (blob.Contains("timed out", StringComparison.OrdinalIgnoreCase))
+            return "timeout";
+        return "other";
+    }
+
+    private static string SanitizeCaptureError(string? error, string? stderr = null)
+    {
+        var kind = ClassifyCaptureError(error, stderr);
+        if (kind is "missing-os-libs" or "browser-launch")
+        {
+            return "Binolla browser failed to start on the server (missing Chromium OS libraries). "
+                   + "On the VPS run: cd /home/web/backend/tools/binolla-auth && chmod +x install-deps.sh && ./install-deps.sh";
+        }
+
+        if (string.IsNullOrWhiteSpace(error))
+            return "Binolla login failed.";
+
+        var trimmed = error.Trim();
+        return trimmed.Length > 240 ? trimmed[..240] + "…" : trimmed;
     }
 
     private static readonly JsonSerializerOptions JsonOptions = new()
