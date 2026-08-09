@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using ScarAlpha.Application.Contracts;
 using ScarAlpha.Application.Services;
+using ScarAlpha.Infrastructure.Diagnostics;
 
 namespace ScarAlpha.Api.Endpoints;
 
@@ -18,6 +19,46 @@ public static class AuthEndpoints
             var result = await auth.AuthenticateTelegramAsync(request, ct);
             return Results.Ok(new { accessToken = result.AccessToken, userId = result.UserId });
         });
+
+        return group;
+    }
+}
+
+public static class DebugAgentEndpoints
+{
+    public static RouteGroupBuilder MapDebugAgentEndpoints(this IEndpointRouteBuilder app)
+    {
+        var group = app.MapGroup("/api/debug").WithTags("Debug");
+
+        // Temporary session ingest for Binolla login/signup debugging (660ec2).
+        group.MapPost("/agent-log", async (HttpRequest request) =>
+        {
+            using var reader = new StreamReader(request.Body);
+            var body = await reader.ReadToEndAsync();
+            if (string.IsNullOrWhiteSpace(body) || body.Length > 8000)
+                return Results.BadRequest();
+
+            try
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(body);
+                var root = doc.RootElement;
+                if (root.TryGetProperty("sessionId", out var sid) && sid.GetString() != "660ec2")
+                    return Results.BadRequest();
+
+                AgentDebugLog.Write(
+                    root.TryGetProperty("hypothesisId", out var h) ? h.GetString() ?? "FE" : "FE",
+                    root.TryGetProperty("location", out var loc) ? loc.GetString() ?? "fe" : "fe",
+                    root.TryGetProperty("message", out var msg) ? msg.GetString() ?? "fe-log" : "fe-log",
+                    root.TryGetProperty("data", out var data) ? data.Clone() : null,
+                    root.TryGetProperty("runId", out var run) ? run.GetString() ?? "pre-fix" : "pre-fix");
+            }
+            catch
+            {
+                return Results.BadRequest();
+            }
+
+            return Results.NoContent();
+        }).AllowAnonymous();
 
         return group;
     }
@@ -45,11 +86,77 @@ public static class BinollaEndpoints
             .RequireRateLimiting("connect");
 
         group.MapPost("/login", async ([FromBody] BinollaCredentialRequest request, BinollaAppService svc, CancellationToken ct) =>
-            Results.Ok(await svc.LoginWithCredentialsAsync(request, ct)))
+        {
+            // #region agent log
+            AgentDebugLog.Write("C", "ApiEndpoints.binolla/login:entry", "login endpoint hit", new
+            {
+                emailLen = request?.Email?.Length ?? 0,
+                hasPassword = !string.IsNullOrEmpty(request?.Password),
+                accountType = request?.AccountType
+            });
+            // #endregion
+            try
+            {
+                var result = await svc.LoginWithCredentialsAsync(request!, ct);
+                // #region agent log
+                AgentDebugLog.Write("C", "ApiEndpoints.binolla/login:ok", "login endpoint success", new
+                {
+                    connected = result.Connected,
+                    access = result.Access,
+                    approvalStatus = result.ApprovalStatus
+                });
+                // #endregion
+                return Results.Ok(result);
+            }
+            catch (Exception ex)
+            {
+                // #region agent log
+                AgentDebugLog.Write("C", "ApiEndpoints.binolla/login:error", "login endpoint error", new
+                {
+                    type = ex.GetType().Name,
+                    message = ex.Message
+                });
+                // #endregion
+                throw;
+            }
+        })
             .RequireRateLimiting("connect");
 
         group.MapPost("/signup", async ([FromBody] BinollaCredentialRequest request, BinollaAppService svc, CancellationToken ct) =>
-            Results.Ok(await svc.SignUpWithCredentialsAsync(request, ct)))
+        {
+            // #region agent log
+            AgentDebugLog.Write("C", "ApiEndpoints.binolla/signup:entry", "signup endpoint hit", new
+            {
+                emailLen = request?.Email?.Length ?? 0,
+                hasPassword = !string.IsNullOrEmpty(request?.Password),
+                accountType = request?.AccountType
+            });
+            // #endregion
+            try
+            {
+                var result = await svc.SignUpWithCredentialsAsync(request!, ct);
+                // #region agent log
+                AgentDebugLog.Write("C", "ApiEndpoints.binolla/signup:ok", "signup endpoint success", new
+                {
+                    connected = result.Connected,
+                    access = result.Access,
+                    approvalStatus = result.ApprovalStatus
+                });
+                // #endregion
+                return Results.Ok(result);
+            }
+            catch (Exception ex)
+            {
+                // #region agent log
+                AgentDebugLog.Write("C", "ApiEndpoints.binolla/signup:error", "signup endpoint error", new
+                {
+                    type = ex.GetType().Name,
+                    message = ex.Message
+                });
+                // #endregion
+                throw;
+            }
+        })
             .RequireRateLimiting("connect");
 
         group.MapGet("/status", async (BinollaAppService svc, CancellationToken ct) =>

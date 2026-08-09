@@ -7,6 +7,38 @@
  * Prints JSON: { "ok": true, "token": "..." } or { "ok": false, "error": "..." }
  */
 import { chromium } from 'playwright';
+import fs from 'fs';
+
+// #region agent log
+function agentLog(hypothesisId, location, message, data = {}) {
+  try {
+    const line = JSON.stringify({
+      sessionId: '660ec2',
+      runId: 'pre-fix',
+      hypothesisId,
+      location,
+      message,
+      data,
+      timestamp: Date.now(),
+    });
+    const paths = [
+      process.env.SCARALPHA_AGENT_DEBUG_LOG,
+      '/home/web/backend/logs/debug-660ec2.log',
+      new URL('../../../debug-660ec2.log', import.meta.url).pathname,
+    ].filter(Boolean);
+    for (const p of paths) {
+      try {
+        fs.mkdirSync(p.replace(/[/\\][^/\\]+$/, ''), { recursive: true });
+        fs.appendFileSync(p, line + '\n');
+      } catch {
+        /* next */
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+}
+// #endregion
 
 function arg(name, fallback = '') {
   const idx = process.argv.indexOf(`--${name}`);
@@ -128,6 +160,9 @@ async function main() {
   const timeoutMs = Number(arg('timeoutMs', '45000')) || 45000;
 
   if (!email || !password) {
+    // #region agent log
+    agentLog('A', 'capture.mjs:missingCreds', 'email/password missing', { mode });
+    // #endregion
     process.stdout.write(JSON.stringify({ ok: false, error: 'email and password are required' }));
     process.exit(2);
   }
@@ -136,10 +171,41 @@ async function main() {
   const url = isSignup ? signupUrl : loginUrl;
   let token = null;
 
-  const browser = await chromium.launch({
+  // #region agent log
+  agentLog('A', 'capture.mjs:main', 'launching chromium', {
+    mode,
     headless,
-    args: ['--disable-blink-features=AutomationControlled', '--disable-dev-shm-usage'],
+    timeoutMs,
+    urlHost: (() => {
+      try {
+        return new URL(url).host;
+      } catch {
+        return 'invalid';
+      }
+    })(),
   });
+  // #endregion
+
+  let browser;
+  try {
+    browser = await chromium.launch({
+      headless,
+      args: ['--disable-blink-features=AutomationControlled', '--disable-dev-shm-usage'],
+    });
+  } catch (launchErr) {
+    // #region agent log
+    agentLog('A', 'capture.mjs:launchFail', 'chromium.launch failed', {
+      error: launchErr instanceof Error ? launchErr.message : String(launchErr),
+    });
+    // #endregion
+    process.stdout.write(
+      JSON.stringify({
+        ok: false,
+        error: launchErr instanceof Error ? launchErr.message : String(launchErr),
+      }),
+    );
+    process.exit(1);
+  }
 
   try {
     const context = await browser.newContext({
@@ -195,6 +261,13 @@ async function main() {
     });
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+    // #region agent log
+    agentLog('A', 'capture.mjs:navigated', 'page loaded', {
+      mode,
+      finalUrl: page.url(),
+      title: await page.title().catch(() => ''),
+    });
+    // #endregion
 
     const emailOk = await fillFirst(page, [
       'input[name="email"]',
@@ -212,6 +285,10 @@ async function main() {
       'input[autocomplete="new-password"]',
     ], password);
     if (!passOk) throw new Error('Could not find Binolla password field');
+
+    // #region agent log
+    agentLog('A', 'capture.mjs:filled', 'credentials filled', { mode, emailOk, passOk, isSignup });
+    // #endregion
 
     if (isSignup) {
       await fillFirst(
@@ -244,6 +321,13 @@ async function main() {
     }
 
     if (!token) {
+      // #region agent log
+      agentLog('A', 'capture.mjs:noToken', 'token not captured', {
+        mode,
+        finalUrl: page.url(),
+        title: await page.title().catch(() => ''),
+      });
+      // #endregion
       process.stdout.write(
         JSON.stringify({
           ok: false,
@@ -255,8 +339,17 @@ async function main() {
       process.exit(1);
     }
 
+    // #region agent log
+    agentLog('A', 'capture.mjs:ok', 'token captured', { mode, tokenLen: token.length });
+    // #endregion
     process.stdout.write(JSON.stringify({ ok: true, token }));
   } catch (err) {
+    // #region agent log
+    agentLog('A', 'capture.mjs:error', 'capture failed', {
+      mode,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    // #endregion
     process.stdout.write(
       JSON.stringify({
         ok: false,

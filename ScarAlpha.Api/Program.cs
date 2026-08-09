@@ -154,6 +154,7 @@ try
     app.UseRateLimiter();
 
     app.MapHealthEndpoints();
+    app.MapDebugAgentEndpoints();
     app.MapAuthEndpoints().RequireRateLimiting("auth");
     app.MapMeEndpoints();
     app.MapBinollaEndpoints();
