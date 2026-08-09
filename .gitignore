@@ -4,3 +4,9 @@
 *.user
 *.suo
 TestResults/
+publish/
+logs/
+run/
+scaralpha.env
+.env
+*.log

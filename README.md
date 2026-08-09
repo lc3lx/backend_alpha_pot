@@ -49,6 +49,29 @@ $env:BINOLLA_TOKEN_ENCRYPTION_KEY = '...'
 dotnet run --project ScarAlpha.Api -c Release
 ```
 
+## Run API on VPS with PM2 (Linux)
+
+```bash
+cd /home/web/backend
+cp scaralpha.env.example scaralpha.env
+nano scaralpha.env          # set TELEGRAM_BOT_TOKEN
+chmod +x start-backend-pm2.sh
+./start-backend-pm2.sh      # publish + pm2 start (scaralpha-api)
+```
+
+Useful:
+
+```bash
+./start-backend-pm2.sh status
+./start-backend-pm2.sh logs
+./start-backend-pm2.sh restart
+./start-backend-pm2.sh stop
+pm2 startup                 # enable boot persistence (once)
+pm2 save
+```
+
+Files: `start-backend-pm2.sh`, `ecosystem.config.cjs`, `scaralpha.env.example`
+
 ## Demo smoke (engine only)
 
 ```powershell

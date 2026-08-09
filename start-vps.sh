@@ -117,9 +117,24 @@ install_deps() {
   info "Installing system packages (may take a few minutes)..."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
+
+  # Base packages (always)
   apt-get install -y curl ca-certificates gnupg apt-transport-https software-properties-common \
-    build-essential libnss3 libatk-bridge2.0-0 libdrm2 libxkbcommon0 libgbm1 libasound2 \
-    libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libpango-1.0-0 libcairo2 fonts-liberation
+    build-essential fonts-liberation
+
+  # Chromium/Playwright libs — Ubuntu 24.04 (Noble) uses t64 package names.
+  # Install best-effort so one missing package does not abort the whole script.
+  local chrome_pkgs=(
+    libnss3 libdrm2 libxkbcommon0 libgbm1
+    libxcomposite1 libxdamage1 libxfixes3 libxrandr2
+    libpango-1.0-0 libcairo2
+    libatk-bridge2.0-0t64 libatk-bridge2.0-0
+    libasound2t64 libasound2
+  )
+  local pkg
+  for pkg in "${chrome_pkgs[@]}"; do
+    apt-get install -y "$pkg" >/dev/null 2>&1 || true
+  done
 
   if ! need_cmd dotnet || ! dotnet --list-sdks 2>/dev/null | grep -q '^8\.'; then
     info "Installing .NET 8 SDK..."
@@ -336,7 +351,7 @@ main() {
   case "$mode" in
     --install|install)
       install_deps
-      [[ -n "$BACKEND_DIR" ]] || die "backend folder not found"
+      [[ -n "$BACKEND_DIR" ]] || die "backend folder not found"chmod +x /home/web/start-vps.sh
       setup_binolla_tool
       exit 0
       ;;
