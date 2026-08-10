@@ -51,6 +51,38 @@ function arg(name, fallback = '') {
   return process.argv[idx + 1] ?? fallback;
 }
 
+function normalizeToken(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  let s = raw.trim();
+  if (!s) return null;
+
+  // localStorage sometimes stores: {"value":"<uuid>","expiry":"..."}
+  if (s.startsWith('{')) {
+    try {
+      const obj = JSON.parse(s);
+      if (obj && typeof obj === 'object') {
+        if (typeof obj.value === 'string' && obj.value.length >= 16) s = obj.value.trim();
+        else if (typeof obj.token === 'string' && obj.token.length >= 16) s = obj.token.trim();
+      }
+    } catch {
+      /* keep s */
+    }
+  }
+
+  // Double-encoded JSON string
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    try {
+      const inner = JSON.parse(s);
+      if (typeof inner === 'string') return normalizeToken(inner);
+    } catch {
+      /* keep s */
+    }
+  }
+
+  if (s.length < 16 || s.includes('{') || s.includes('}')) return null;
+  return s;
+}
+
 function extractToken(text) {
   if (!text || typeof text !== 'string') return null;
 
@@ -61,11 +93,15 @@ function extractToken(text) {
       if (Array.isArray(arr) && arr.length >= 2 && typeof arr[1] === 'object' && arr[1]) {
         const event = String(arr[0] ?? '');
         const data = arr[1];
-        if (/auth/i.test(event) && typeof data.token === 'string' && data.token.length >= 16) {
-          return data.token;
+        if (/auth/i.test(event)) {
+          const n = normalizeToken(typeof data.token === 'string' ? data.token : null);
+          if (n) return n;
         }
         for (const [k, v] of Object.entries(data)) {
-          if (/token/i.test(k) && typeof v === 'string' && v.length >= 16) return v;
+          if (/token/i.test(k) && typeof v === 'string') {
+            const n = normalizeToken(v);
+            if (n) return n;
+          }
         }
       }
     } catch {
@@ -76,20 +112,31 @@ function extractToken(text) {
   try {
     const obj = JSON.parse(text);
     if (obj && typeof obj === 'object') {
-      if (typeof obj.token === 'string' && obj.token.length >= 16) return obj.token;
-      for (const key of ['message', 'data', 'payload', 'result', 'user']) {
+      // Auth cookie/session shape: { value, expiry }
+      const fromValue = normalizeToken(typeof obj.value === 'string' ? obj.value : null);
+      if (fromValue) return fromValue;
+
+      const fromToken = normalizeToken(typeof obj.token === 'string' ? obj.token : null);
+      if (fromToken) return fromToken;
+
+      for (const key of ['message', 'data', 'payload', 'result', 'user', 'session']) {
         const nested = obj[key];
-        if (nested && typeof nested.token === 'string' && nested.token.length >= 16) {
-          return nested.token;
-        }
+        if (!nested || typeof nested !== 'object') continue;
+        const n =
+          normalizeToken(typeof nested.value === 'string' ? nested.value : null) ||
+          normalizeToken(typeof nested.token === 'string' ? nested.token : null);
+        if (n) return n;
       }
     }
   } catch {
     /* ignore */
   }
 
-  const m = text.match(/"token"\s*:\s*"([A-Za-z0-9._-]{16,})"/);
-  return m?.[1] ?? null;
+  const m = text.match(/"value"\s*:\s*"([A-Za-z0-9._-]{16,})"/);
+  if (m) return normalizeToken(m[1]);
+
+  const m2 = text.match(/"token"\s*:\s*"([A-Za-z0-9._-]{16,})"/);
+  return normalizeToken(m2?.[1] ?? null);
 }
 
 function redactAuthBody(text) {
@@ -148,17 +195,48 @@ async function clickSubmit(page, isSignup) {
 
 async function scanStorage(page) {
   return page.evaluate(() => {
+    const unwrap = (raw) => {
+      if (!raw || typeof raw !== 'string') return null;
+      let s = raw.trim();
+      if (!s) return null;
+      if (s.startsWith('{')) {
+        try {
+          const obj = JSON.parse(s);
+          if (obj && typeof obj.value === 'string' && obj.value.length >= 16) s = obj.value.trim();
+          else if (obj && typeof obj.token === 'string' && obj.token.length >= 16) s = obj.token.trim();
+        } catch {
+          /* keep */
+        }
+      }
+      if (s.length < 16 || s.includes('{') || s.includes('}')) return null;
+      return s;
+    };
+
     try {
       for (let i = 0; i < localStorage.length; i++) {
         const k = localStorage.key(i);
         const v = localStorage.getItem(k) || '';
-        if (/token/i.test(k || '') && v.length >= 16) return v;
+        if (/token|session|auth/i.test(k || '')) {
+          const n = unwrap(v);
+          if (n) return n;
+        }
+        const mValue = /"value"\s*:\s*"([A-Za-z0-9._-]{16,})"/.exec(v);
+        if (mValue) {
+          const n = unwrap(mValue[1]);
+          if (n) return n;
+        }
         const m = /"token"\s*:\s*"([A-Za-z0-9._-]{16,})"/.exec(v);
-        if (m) return m[1];
+        if (m) {
+          const n = unwrap(m[1]);
+          if (n) return n;
+        }
       }
       for (const part of (document.cookie || '').split(';')) {
         const [ck, cv] = part.split('=');
-        if (/token/i.test(ck || '') && (cv || '').length >= 16) return cv;
+        if (/token|session|auth/i.test(ck || '')) {
+          const n = unwrap(decodeURIComponent(cv || ''));
+          if (n) return n;
+        }
       }
     } catch {
       /* ignore */
@@ -398,14 +476,17 @@ async function main() {
     const page = await context.newPage();
 
     const tryCapture = (candidate, source) => {
-      if (!token && candidate && candidate.length >= 16) {
-        token = candidate;
-        agentLog('G', 'capture.mjs:tokenHit', 'token captured', {
-          mode,
-          source,
-          tokenLen: candidate.length,
-        });
-      }
+      if (token) return;
+      const normalized = normalizeToken(candidate);
+      if (!normalized) return;
+      token = normalized;
+      agentLog('G', 'capture.mjs:tokenHit', 'token captured', {
+        mode,
+        source,
+        tokenLen: normalized.length,
+        looksLikeUuid: /^[0-9a-f-]{36}$/i.test(normalized),
+        wasJsonWrapper: typeof candidate === 'string' && candidate.trim().startsWith('{'),
+      });
     };
 
     page.on('response', async (response) => {

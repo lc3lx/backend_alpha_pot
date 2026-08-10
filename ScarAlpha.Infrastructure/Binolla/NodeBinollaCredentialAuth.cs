@@ -115,14 +115,21 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         try
         {
             var token = await RunNodeCaptureAsync(mode, email.Trim(), password, cancellationToken);
+            token = NormalizeSessionToken(token);
             // #region agent log
             AgentDebugLog.Write("A", "NodeBinollaCredentialAuth.CaptureAsync:success", "token captured", new
             {
                 mode,
-                tokenLen = token.Length
+                tokenLen = token.Length,
+                looksLikeUuid = System.Text.RegularExpressions.Regex.IsMatch(
+                    token,
+                    @"^[0-9a-fA-F-]{36}$")
             });
             // #endregion
-            return $$"""42["authorization",{"isDemo":true,"token":"{{token}}"}]""";
+            // Escape for embedding inside a JSON string literal in the SSID frame.
+            var safe = token.Replace("\\", "\\\\", StringComparison.Ordinal)
+                .Replace("\"", "\\\"", StringComparison.Ordinal);
+            return $$"""42["authorization",{"isDemo":true,"token":"{{safe}}"}]""";
         }
         finally
         {
@@ -321,6 +328,45 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         }
 
         return candidates[0];
+    }
+
+    private static string NormalizeSessionToken(string token)
+    {
+        if (string.IsNullOrWhiteSpace(token))
+            throw new ApiException(ApiErrorCodes.BinollaLoginFailed, "Binolla login failed.", 400);
+
+        var s = token.Trim();
+        if (s.StartsWith('{'))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(s);
+                if (doc.RootElement.TryGetProperty("value", out var value) &&
+                    value.ValueKind == JsonValueKind.String)
+                {
+                    s = value.GetString()?.Trim() ?? s;
+                }
+                else if (doc.RootElement.TryGetProperty("token", out var nested) &&
+                         nested.ValueKind == JsonValueKind.String)
+                {
+                    s = nested.GetString()?.Trim() ?? s;
+                }
+            }
+            catch (JsonException)
+            {
+                // keep original
+            }
+        }
+
+        if (s.Length < 16 || s.Contains('{', StringComparison.Ordinal) || s.Contains('}', StringComparison.Ordinal))
+        {
+            throw new ApiException(
+                ApiErrorCodes.BinollaLoginFailed,
+                "Binolla returned an invalid session token shape.",
+                400);
+        }
+
+        return s;
     }
 
     private static void ValidateCredentials(string email, string password)
