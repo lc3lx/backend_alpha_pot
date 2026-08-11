@@ -51,7 +51,9 @@ public sealed record BinollaStatusDto(
     string AccountType,
     string Status,
     DateTimeOffset? LastConnectedAt,
-    decimal? Balance);
+    decimal? Balance,
+    string? Lifecycle = null,
+    bool WebSocketConnected = false);
 
 public sealed record BinollaBalanceDto(
     bool Connected,

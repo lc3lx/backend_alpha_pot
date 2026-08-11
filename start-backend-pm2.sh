@@ -76,25 +76,44 @@ load_env() {
   export DOTNET_ROOT="${DOTNET_ROOT:-$HOME/.dotnet}"
   export PATH="$DOTNET_ROOT:$DOTNET_ROOT/tools:/usr/local/bin:$PATH"
 
-  export ASPNETCORE_ENVIRONMENT="${ASPNETCORE_ENVIRONMENT:-Development}"
+  export ASPNETCORE_ENVIRONMENT="${ASPNETCORE_ENVIRONMENT:-Production}"
   export BACKEND_PORT="${BACKEND_PORT:-5207}"
   export ASPNETCORE_URLS="${ASPNETCORE_URLS:-http://0.0.0.0:${BACKEND_PORT}}"
-  export DATABASE_PROVIDER="${DATABASE_PROVIDER:-InMemory}"
+  export DATABASE_PROVIDER="${DATABASE_PROVIDER:-Npgsql}"
   export DATABASE_INMEMORY_NAME="${DATABASE_INMEMORY_NAME:-ScarAlphaVps}"
   export JWT_ISSUER="${JWT_ISSUER:-ScarAlpha}"
   export JWT_AUDIENCE="${JWT_AUDIENCE:-ScarAlpha.App}"
 
-  if [[ -z "${JWT_SECRET:-}" ]]; then
-    export JWT_SECRET
-    JWT_SECRET="$(rand_secret)"
-    export JWT_SECRET
-    echo "WARN: JWT_SECRET was empty — generated ephemeral secret (set it in scaralpha.env for stable tokens)"
+  if [[ "${ASPNETCORE_ENVIRONMENT}" == "Production" ]]; then
+    if [[ "${DATABASE_PROVIDER}" == "InMemory" ]]; then
+      die "Production forbids DATABASE_PROVIDER=InMemory — set Npgsql + DATABASE_CONNECTION_STRING"
+    fi
+    if [[ -z "${DATABASE_CONNECTION_STRING:-}" ]]; then
+      die "Production requires DATABASE_CONNECTION_STRING"
+    fi
+    if [[ -z "${JWT_SECRET:-}" ]]; then
+      die "Production requires JWT_SECRET in scaralpha.env (do not leave empty)"
+    fi
+    if [[ -z "${BINOLLA_TOKEN_ENCRYPTION_KEY:-}" ]]; then
+      die "Production requires BINOLLA_TOKEN_ENCRYPTION_KEY in scaralpha.env"
+    fi
+  else
+    # Development convenience only — ephemeral secrets / InMemory allowed
+    if [[ -z "${JWT_SECRET:-}" ]]; then
+      JWT_SECRET="$(rand_secret)"
+      export JWT_SECRET
+      echo "WARN: JWT_SECRET was empty — generated ephemeral secret"
+    fi
+    if [[ -z "${BINOLLA_TOKEN_ENCRYPTION_KEY:-}" ]]; then
+      BINOLLA_TOKEN_ENCRYPTION_KEY="$(rand_secret)"
+      export BINOLLA_TOKEN_ENCRYPTION_KEY
+      echo "WARN: BINOLLA_TOKEN_ENCRYPTION_KEY was empty — generated ephemeral key"
+    fi
+    if [[ "${DATABASE_PROVIDER}" == "InMemory" ]]; then
+      echo "WARN: DATABASE_PROVIDER=InMemory — data will not survive restart"
+    fi
   fi
-  if [[ -z "${BINOLLA_TOKEN_ENCRYPTION_KEY:-}" ]]; then
-    BINOLLA_TOKEN_ENCRYPTION_KEY="$(rand_secret)"
-    export BINOLLA_TOKEN_ENCRYPTION_KEY
-    echo "WARN: BINOLLA_TOKEN_ENCRYPTION_KEY was empty — generated ephemeral key"
-  fi
+
   if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
     export TELEGRAM_BOT_TOKEN="000000000:REPLACE_ME_DEV_TOKEN"
     echo "WARN: TELEGRAM_BOT_TOKEN not set — Telegram auth will fail"
@@ -106,6 +125,7 @@ load_env() {
   export CORS_ORIGINS="${CORS_ORIGINS:-http://${ip}:4173,http://127.0.0.1:4173,http://localhost:4173}"
   export ADMIN_TELEGRAM_USER_IDS="${ADMIN_TELEGRAM_USER_IDS:-}"
   export DATABASE_CONNECTION_STRING="${DATABASE_CONNECTION_STRING:-}"
+  export BINOLLA_AUTH_PROXY="${BINOLLA_AUTH_PROXY:-}"
 }
 
 ensure_pm2() {

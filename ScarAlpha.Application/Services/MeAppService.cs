@@ -45,7 +45,9 @@ public sealed class MeAppService
                     ? nameof(BinollaLinkStatus.Connected)
                     : (link?.Status.ToString() ?? nameof(BinollaLinkStatus.Disconnected)),
                 LastConnectedAt: link?.LastConnectedAt,
-                Balance: null);
+                Balance: null,
+                Lifecycle: client?.Lifecycle.ToString() ?? "None",
+                WebSocketConnected: liveConnected);
         }
 
         return new MeResponse(

@@ -6,7 +6,6 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using ScarAlpha.Application.Abstractions;
 using ScarAlpha.Application.Common;
-using ScarAlpha.Infrastructure.Diagnostics;
 
 namespace ScarAlpha.Infrastructure.Binolla;
 
@@ -65,28 +64,8 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         string password,
         CancellationToken cancellationToken)
     {
-        // #region agent log
-        AgentDebugLog.Write("E", "NodeBinollaCredentialAuth.CaptureAsync:entry", "credential capture start", new
-        {
-            mode,
-            enabled = _enabled,
-            toolDirectory = _toolDirectory,
-            scriptExists = File.Exists(Path.Combine(_toolDirectory, "capture.mjs")),
-            nodeModulesExists = Directory.Exists(Path.Combine(_toolDirectory, "node_modules")),
-            playwrightExists = Directory.Exists(Path.Combine(_toolDirectory, "node_modules", "playwright")),
-            headless = _headless,
-            timeoutMs = _timeoutMs,
-            hasProxy = !string.IsNullOrWhiteSpace(_proxyServer),
-            emailLen = email?.Length ?? 0,
-            contentRootHint = Directory.GetCurrentDirectory()
-        });
-        // #endregion
-
         if (!_enabled)
         {
-            // #region agent log
-            AgentDebugLog.Write("E", "NodeBinollaCredentialAuth.CaptureAsync:disabled", "credential login disabled");
-            // #endregion
             throw new ApiException(
                 ApiErrorCodes.BinollaLoginFailed,
                 "Binolla credential login is disabled on this server.",
@@ -98,13 +77,6 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         var scriptPath = Path.Combine(_toolDirectory, "capture.mjs");
         if (!File.Exists(scriptPath))
         {
-            // #region agent log
-            AgentDebugLog.Write("E", "NodeBinollaCredentialAuth.CaptureAsync:missingTool", "capture.mjs missing", new
-            {
-                toolDirectory = _toolDirectory,
-                scriptPath
-            });
-            // #endregion
             throw new ApiException(
                 ApiErrorCodes.BinollaLoginFailed,
                 $"Binolla auth tool is missing at '{_toolDirectory}'. Run npm install in backend/tools/binolla-auth.",
@@ -116,16 +88,6 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         {
             var token = await RunNodeCaptureAsync(mode, email.Trim(), password, cancellationToken);
             token = NormalizeSessionToken(token);
-            // #region agent log
-            AgentDebugLog.Write("A", "NodeBinollaCredentialAuth.CaptureAsync:success", "token captured", new
-            {
-                mode,
-                tokenLen = token.Length,
-                looksLikeUuid = System.Text.RegularExpressions.Regex.IsMatch(
-                    token,
-                    @"^[0-9a-fA-F-]{36}$")
-            });
-            // #endregion
             // Escape for embedding inside a JSON string literal in the SSID frame.
             var safe = token.Replace("\\", "\\\\", StringComparison.Ordinal)
                 .Replace("\"", "\\\"", StringComparison.Ordinal);
@@ -158,9 +120,6 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         // Prefer env vars so the password is not visible in process argv.
         psi.Environment["BINOLLA_AUTH_EMAIL"] = email;
         psi.Environment["BINOLLA_AUTH_PASSWORD"] = password;
-        psi.Environment["SCARALPHA_AGENT_DEBUG_LOG"] =
-            Environment.GetEnvironmentVariable("SCARALPHA_AGENT_DEBUG_LOG")
-            ?? "/home/web/backend/logs/debug-660ec2.log";
         if (!string.IsNullOrWhiteSpace(_proxyServer))
             psi.Environment["BINOLLA_AUTH_PROXY"] = _proxyServer;
 
@@ -182,16 +141,6 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         }
 
         _logger.LogInformation("Starting Binolla credential {Mode} capture from {ToolDir}", mode, _toolDirectory);
-        // #region agent log
-        AgentDebugLog.Write("A", "NodeBinollaCredentialAuth.RunNodeCaptureAsync:start", "spawning node capture", new
-        {
-            mode,
-            toolDirectory = _toolDirectory,
-            nodeExecutable = _nodeExecutable,
-            timeoutMs = _timeoutMs,
-            hasProxy = !string.IsNullOrWhiteSpace(_proxyServer)
-        });
-        // #endregion
 
         using var process = new Process { StartInfo = psi, EnableRaisingEvents = true };
         if (!process.Start())
@@ -215,13 +164,6 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             TryKill(process);
-            // #region agent log
-            AgentDebugLog.Write("D", "NodeBinollaCredentialAuth.RunNodeCaptureAsync:timeout", "process wait timed out", new
-            {
-                mode,
-                timeoutMs = _timeoutMs
-            });
-            // #endregion
             throw new ApiException(
                 ApiErrorCodes.BinollaLoginFailed,
                 "Binolla login timed out.",
@@ -233,18 +175,6 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
 
         if (!string.IsNullOrWhiteSpace(stderr))
             _logger.LogDebug("Binolla auth tool stderr length={Length}", stderr.Length);
-
-        // #region agent log
-        AgentDebugLog.Write("A", "NodeBinollaCredentialAuth.RunNodeCaptureAsync:exit", "node capture finished", new
-        {
-            mode,
-            exitCode = process.HasExited ? process.ExitCode : (int?)null,
-            stdoutLen = stdout.Length,
-            stderrLen = stderr.Length,
-            stderrTail = stderr.Length > 400 ? stderr[^400..] : stderr,
-            stdoutPreview = stdout.Length > 180 ? stdout[..180] : stdout
-        });
-        // #endregion
 
         if (string.IsNullOrWhiteSpace(stdout))
         {
@@ -263,9 +193,6 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         catch (JsonException)
         {
             _logger.LogWarning("Binolla auth tool returned non-JSON output");
-            // #region agent log
-            AgentDebugLog.Write("A", "NodeBinollaCredentialAuth.RunNodeCaptureAsync:badJson", "non-JSON stdout");
-            // #endregion
             throw new ApiException(
                 ApiErrorCodes.BinollaLoginFailed,
                 "Binolla auth tool returned an invalid response.",
@@ -275,16 +202,6 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         if (!result.Ok || string.IsNullOrWhiteSpace(result.Token) || result.Token.Length < 16)
         {
             var safeError = SanitizeCaptureError(result.Error, stderr);
-            // #region agent log
-            AgentDebugLog.Write("A", "NodeBinollaCredentialAuth.RunNodeCaptureAsync:fail", "capture returned error", new
-            {
-                mode,
-                ok = result.Ok,
-                error = safeError,
-                rawErrorKind = ClassifyCaptureError(result.Error, stderr),
-                hasToken = !string.IsNullOrWhiteSpace(result.Token)
-            });
-            // #endregion
             // Use 400 so clients do not treat this as Scar Alpha JWT expiry.
             throw new ApiException(
                 ApiErrorCodes.BinollaLoginFailed,

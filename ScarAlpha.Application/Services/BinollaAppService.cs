@@ -206,7 +206,9 @@ public sealed class BinollaAppService
                 ? nameof(BinollaLinkStatus.Connected)
                 : (link?.Status.ToString() ?? nameof(BinollaLinkStatus.Disconnected)),
             LastConnectedAt: link?.LastConnectedAt,
-            Balance: balance);
+            Balance: balance,
+            Lifecycle: client?.Lifecycle.ToString() ?? "None",
+            WebSocketConnected: connected);
     }
 
     public async Task<BinollaBalanceDto> GetBalanceAsync(CancellationToken ct)

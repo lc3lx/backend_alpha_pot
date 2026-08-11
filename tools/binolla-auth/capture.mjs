@@ -12,38 +12,6 @@
  * 3) Fall back to DOM form fill + network/WS/storage token capture
  */
 import { chromium } from 'playwright';
-import fs from 'fs';
-
-// #region agent log
-function agentLog(hypothesisId, location, message, data = {}) {
-  try {
-    const line = JSON.stringify({
-      sessionId: '660ec2',
-      runId: 'post-fix',
-      hypothesisId,
-      location,
-      message,
-      data,
-      timestamp: Date.now(),
-    });
-    const paths = [
-      process.env.SCARALPHA_AGENT_DEBUG_LOG,
-      '/home/web/backend/logs/debug-660ec2.log',
-      new URL('../../../debug-660ec2.log', import.meta.url).pathname,
-    ].filter(Boolean);
-    for (const p of paths) {
-      try {
-        fs.mkdirSync(p.replace(/[/\\][^/\\]+$/, ''), { recursive: true });
-        fs.appendFileSync(p, line + '\n');
-      } catch {
-        /* next */
-      }
-    }
-  } catch {
-    /* ignore */
-  }
-}
-// #endregion
 
 function arg(name, fallback = '') {
   const idx = process.argv.indexOf(`--${name}`);
@@ -373,7 +341,6 @@ async function main() {
     arg('proxy') || process.env.BINOLLA_AUTH_PROXY || process.env.Binolla__CredentialLogin__ProxyServer || '';
 
   if (!email || !password) {
-    agentLog('A', 'capture.mjs:missingCreds', 'email/password missing', { mode });
     process.stdout.write(JSON.stringify({ ok: false, error: 'email and password are required' }));
     process.exit(2);
   }
@@ -390,20 +357,6 @@ async function main() {
   let token = null;
   const authHits = [];
 
-  agentLog('F', 'capture.mjs:main', 'launching chromium', {
-    mode,
-    headless,
-    timeoutMs,
-    waitBudgetMs,
-    hasProxy: Boolean(proxyServer),
-    urlHost: (() => {
-      try {
-        return new URL(url).host;
-      } catch {
-        return 'invalid';
-      }
-    })(),
-  });
 
   let browser;
   try {
@@ -424,10 +377,6 @@ async function main() {
   } catch (launchErr) {
     const raw = launchErr instanceof Error ? launchErr.message : String(launchErr);
     const missingLibs = /shared libraries|libatk|cannot open shared object/i.test(raw);
-    agentLog('A', 'capture.mjs:launchFail', 'chromium.launch failed', {
-      missingLibs,
-      error: raw.slice(0, 400),
-    });
     process.stdout.write(
       JSON.stringify({
         ok: false,
@@ -480,13 +429,6 @@ async function main() {
       const normalized = normalizeToken(candidate);
       if (!normalized) return;
       token = normalized;
-      agentLog('G', 'capture.mjs:tokenHit', 'token captured', {
-        mode,
-        source,
-        tokenLen: normalized.length,
-        looksLikeUuid: /^[0-9a-f-]{36}$/i.test(normalized),
-        wasJsonWrapper: typeof candidate === 'string' && candidate.trim().startsWith('{'),
-      });
     };
 
     page.on('response', async (response) => {
@@ -523,22 +465,10 @@ async function main() {
       /* best effort */
     }
 
-    agentLog('F', 'capture.mjs:navigated', 'page loaded', {
-      mode,
-      finalUrl: page.url(),
-      title: await page.title().catch(() => ''),
-    });
 
     // --- Preferred path: in-page auth API (CF cookies already set) ---
     const apiResult = await tryInPageAuthApi(page, { isSignup, email, password, lid });
     for (const attempt of apiResult.attempts || []) {
-      agentLog('H', 'capture.mjs:apiAttempt', 'in-page auth API attempt', {
-        mode,
-        path: attempt.path,
-        status: attempt.status,
-        ct: attempt.ct || '',
-        body: redactAuthBody(attempt.body || attempt.error || ''),
-      });
       if (attempt.body) tryCapture(extractToken(attempt.body), `api:${attempt.path}:${attempt.status}`);
     }
 
@@ -569,12 +499,6 @@ async function main() {
       );
       if (!passOk) throw new Error('Could not find Binolla password field');
 
-      agentLog('F', 'capture.mjs:filled', 'credentials filled', {
-        mode,
-        emailOk,
-        passOk,
-        isSignup,
-      });
 
       if (isSignup) {
         await fillFirst(
@@ -611,7 +535,6 @@ async function main() {
       }
 
       const clicked = await clickSubmit(page, isSignup);
-      agentLog('F', 'capture.mjs:submitted', 'form submit clicked', { mode, clicked });
 
       try {
         await page.waitForLoadState('networkidle', { timeout: Math.min(12000, waitBudgetMs) });
@@ -632,26 +555,6 @@ async function main() {
 
     if (!token) {
       const diag = await readPageDiagnostics(page).catch(() => null);
-      agentLog('F', 'capture.mjs:noToken', 'token not captured', {
-        mode,
-        finalUrl: page.url(),
-        title: await page.title().catch(() => ''),
-        authHits: authHits.slice(-12),
-        apiStatuses: (apiResult.attempts || []).map((a) => ({
-          path: a.path,
-          status: a.status,
-        })),
-        diag: diag
-          ? {
-              url: diag.url,
-              title: diag.title,
-              hasCfChallenge: diag.hasCfChallenge,
-              alerts: diag.alerts,
-              inputs: diag.inputs,
-              textSnippet: diag.textSnippet,
-            }
-          : null,
-      });
 
       const apiHint = (apiResult.attempts || [])
         .map((a) => `${a.path}:${a.status}`)
@@ -690,13 +593,8 @@ async function main() {
       process.exit(1);
     }
 
-    agentLog('G', 'capture.mjs:ok', 'token captured', { mode, tokenLen: token.length });
     process.stdout.write(JSON.stringify({ ok: true, token }));
   } catch (err) {
-    agentLog('F', 'capture.mjs:error', 'capture failed', {
-      mode,
-      error: err instanceof Error ? err.message : String(err),
-    });
     process.stdout.write(
       JSON.stringify({
         ok: false,
