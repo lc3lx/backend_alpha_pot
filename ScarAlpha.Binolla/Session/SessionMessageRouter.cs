@@ -82,15 +82,14 @@ internal sealed class SessionMessageRouter
                 upcoming = _upcomingMessageType
             });
 
-            // Auth success often arrives as binary event header before payload.
-            if (IsPostAuthSignal(_upcomingMessageType) ||
-                string.Equals(_upcomingMessageType, BinollaWire.EvAuthorization, StringComparison.Ordinal))
+            // Auth success payload — do not bootstrap on the 451 header alone (that raced
+            // bootstrap commands and produced live 42["unauthorized"] storms).
+            if (string.Equals(_upcomingMessageType, BinollaWire.EvAuthorization, StringComparison.Ordinal))
             {
                 ProtocolTrace.Write("H15", "SessionMessageRouter", "post_auth_binary_header", new
                 {
                     upcoming = _upcomingMessageType
                 });
-                await EnsureAuthorizedAsync(cancellationToken).ConfigureAwait(false);
             }
 
             return;
@@ -183,17 +182,28 @@ internal sealed class SessionMessageRouter
 
     private async Task HandleUnauthorizedAsync(CancellationToken cancellationToken)
     {
+        var lifecycle = _state.Lifecycle;
         // #region agent log
         ProtocolTrace.Write("H40", "SessionMessageRouter.HandleUnauthorizedAsync", "unauthorized_received", new
         {
-            lifecycle = _state.Lifecycle.ToString(),
+            lifecycle = lifecycle.ToString(),
             hadAuth = Volatile.Read(ref _authorized) == 1,
             reauthSent = Volatile.Read(ref _unauthorizedReauthSent) == 1
         });
         // #endregion
 
-        // One silent SSID re-send — live logs show 42["unauthorized"] after subscribe while
-        // Lifecycle still looked Connected (zombie session with cached assets only).
+        // During initial handshake, unauthorized means the SSID was rejected — fail fast.
+        // Re-auth loops here caused repeated bootstrap and empty quotes/balance in production.
+        if (lifecycle is SessionLifecycleState.Connecting or SessionLifecycleState.Disconnected)
+        {
+            _state.ResetMarketCaches();
+            _state.ClearSubscriptions();
+            _state.SetLifecycle(SessionLifecycleState.AuthenticationFailed, "Binolla unauthorized during connect.");
+            Interlocked.Exchange(ref _authorized, 0);
+            return;
+        }
+
+        // One silent SSID re-send after we were already Connected/Reconnected.
         if (Interlocked.CompareExchange(ref _unauthorizedReauthSent, 1, 0) == 0 &&
             !string.IsNullOrEmpty(_state.Ssid))
         {
@@ -275,8 +285,8 @@ internal sealed class SessionMessageRouter
         if (Interlocked.Exchange(ref _authorized, 1) == 1)
             return;
 
-        // Fresh auth window — allow one unauthorized→reauth cycle again.
-        Interlocked.Exchange(ref _unauthorizedReauthSent, 0);
+        // Do NOT reset unauthorizedReauthSent here — that re-enabled infinite
+        // unauthorized → reauth → bootstrap loops in production.
 
         ProtocolTrace.Write("H15", "SessionMessageRouter", "ensure_authorized_enter", new
         {
@@ -298,10 +308,10 @@ internal sealed class SessionMessageRouter
     {
         if (string.IsNullOrEmpty(value))
             return false;
+        // Only balance/assets/authorization prove the session is usable for market data.
+        // s_orders alone previously triggered early bootstrap and unauthorized storms.
         return value.Contains("s_balances/", StringComparison.Ordinal)
                || value.Contains("s_assets/", StringComparison.Ordinal)
-               || value.Contains("s_account/", StringComparison.Ordinal)
-               || value.Contains("s_orders/", StringComparison.Ordinal)
                || value.Contains(BinollaWire.EvAuthorization, StringComparison.Ordinal);
     }
 

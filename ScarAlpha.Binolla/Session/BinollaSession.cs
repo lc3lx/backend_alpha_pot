@@ -134,11 +134,28 @@ public sealed class BinollaSession : IBinollaClient
             // best effort
         }
 
-        await WaitForConditionAsync(
-                () => State.BalanceUpdatedAt is not null,
-                _options.MarketDataTimeout,
-                cancellationToken)
-            .ConfigureAwait(false);
+        try
+        {
+            await WaitForConditionAsync(
+                    () => State.BalanceUpdatedAt is not null,
+                    _options.MarketDataTimeout,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // #region agent log
+            ProtocolTrace.Write("H42", "BinollaSession.GetBalanceAsync", "balance_wait_fail", new
+            {
+                exType = ex.GetType().Name,
+                clientAbort = cancellationToken.IsCancellationRequested,
+                lifecycle = State.Lifecycle.ToString(),
+                hasBalance = State.BalanceUpdatedAt is not null,
+                hasCookie = !string.IsNullOrEmpty(State.CookieHeader)
+            });
+            // #endregion
+            throw;
+        }
 
         if (State.BalanceUpdatedAt is null)
             throw new BinollaTimeoutException("Balance was not received in time.");
@@ -384,6 +401,7 @@ public sealed class BinollaSession : IBinollaClient
                 clientAbort = cancellationToken.IsCancellationRequested,
                 quoteKeys = State.LatestQuotes.Keys.Take(8).ToArray(),
                 quoteCount = State.LatestQuotes.Count,
+                lifecycle = State.Lifecycle.ToString(),
                 runId = "post-fix"
             });
             // #endregion
@@ -443,7 +461,8 @@ public sealed class BinollaSession : IBinollaClient
                 exType = ex.GetType().Name,
                 clientAbort = cancellationToken.IsCancellationRequested,
                 historyKeys = State.HistoricalData.Keys.Take(8).ToArray(),
-                historyCount = State.HistoricalData.Count
+                historyCount = State.HistoricalData.Count,
+                lifecycle = State.Lifecycle.ToString()
             });
             // #endregion
             throw;

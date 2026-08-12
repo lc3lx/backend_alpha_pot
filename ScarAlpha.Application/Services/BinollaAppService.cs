@@ -143,7 +143,7 @@ public sealed class BinollaAppService
             try
             {
                 using var balCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                balCts.CancelAfter(TimeSpan.FromSeconds(3));
+                balCts.CancelAfter(TimeSpan.FromSeconds(8));
                 var balance = await client.GetBalanceAsync(balCts.Token);
                 balanceValue = balance.DemoBalance;
             }
