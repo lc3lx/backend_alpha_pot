@@ -93,6 +93,10 @@ public sealed class MarketAppService
         {
             throw new ApiException(ApiErrorCodes.MarketUnavailable, "Quote is not available for this asset.", 503);
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw new ApiException(ApiErrorCodes.MarketUnavailable, "Quote request was cancelled.", 503);
+        }
         catch (BinollaConnectionException)
         {
             throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Binolla session is not connected.", 409);
@@ -145,6 +149,10 @@ public sealed class MarketAppService
         catch (BinollaTimeoutException)
         {
             throw new ApiException(ApiErrorCodes.MarketUnavailable, "Candles are not available for this asset.", 503);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw new ApiException(ApiErrorCodes.MarketUnavailable, "Candles request was cancelled.", 503);
         }
         catch (BinollaConnectionException)
         {

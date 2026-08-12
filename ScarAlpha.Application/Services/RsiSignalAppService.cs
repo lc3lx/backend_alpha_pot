@@ -41,25 +41,49 @@ public sealed class RsiSignalAppService
         var client = RequireConnectedClient();
 
         var symbol = asset.Trim();
-        var history = await client.GetHistoryAsync(symbol, periodSeconds, ct);
+        try
+        {
+            var history = await client.GetHistoryAsync(symbol, periodSeconds, ct);
 
-        var candles = history.Candles
-            .Select(c => new RsiCandle(
-                Timestamp: DateTimeOffset.FromUnixTimeMilliseconds((long)(c.Timestamp * 1000)),
-                Close: (decimal)c.Close,
-                EndTimestamp: c.EndTimestamp is null
-                    ? null
-                    : DateTimeOffset.FromUnixTimeMilliseconds((long)(c.EndTimestamp.Value * 1000))))
-            .ToList();
+            var candles = history.Candles
+                .Select(c => new RsiCandle(
+                    Timestamp: DateTimeOffset.FromUnixTimeMilliseconds((long)(c.Timestamp * 1000)),
+                    Close: (decimal)c.Close,
+                    EndTimestamp: c.EndTimestamp is null
+                        ? null
+                        : DateTimeOffset.FromUnixTimeMilliseconds((long)(c.EndTimestamp.Value * 1000))))
+                .ToList();
 
-        var options = RsiStrategyOptions.Default60Seconds with { TimeframeSeconds = periodSeconds };
-        return await _signalService.GetSignalAsync(
-            userId: _currentUser.UserId,
-            asset: symbol,
-            candles: candles,
-            options: options,
-            now: DateTimeOffset.UtcNow,
-            ct: ct);
+            var options = RsiStrategyOptions.Default60Seconds with { TimeframeSeconds = periodSeconds };
+            return await _signalService.GetSignalAsync(
+                userId: _currentUser.UserId,
+                asset: symbol,
+                candles: candles,
+                options: options,
+                now: DateTimeOffset.UtcNow,
+                ct: ct);
+        }
+        catch (BinollaAuthenticationException)
+        {
+            throw new ApiException(ApiErrorCodes.BinollaSessionExpired, "Binolla session expired.", 401);
+        }
+        catch (BinollaTimeoutException)
+        {
+            throw new ApiException(ApiErrorCodes.MarketUnavailable, "RSI candles are not available for this asset.", 503);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw new ApiException(ApiErrorCodes.MarketUnavailable, "RSI request was cancelled.", 503);
+        }
+        catch (BinollaConnectionException)
+        {
+            throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Binolla session is not connected.", 409);
+        }
+        catch (ApiException) { throw; }
+        catch (Exception)
+        {
+            throw new ApiException(ApiErrorCodes.BinollaConnectionFailed, "Unable to load RSI signal.", 502);
+        }
     }
 
     private IBinollaClient RequireConnectedClient()

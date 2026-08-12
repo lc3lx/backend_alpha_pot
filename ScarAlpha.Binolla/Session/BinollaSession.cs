@@ -16,6 +16,7 @@ public sealed class BinollaSession : IBinollaClient
     private readonly WebSocketTransportFactory _transportFactory;
     private readonly SemaphoreSlim _lifecycleLock = new(1, 1);
     private readonly SemaphoreSlim _inboundGate = new(1, 1);
+    private readonly SemaphoreSlim _subscribeLock = new(1, 1);
     private readonly OrderCorrelationHub _orders = new();
 
     private IWebSocketTransport? _trading;
@@ -308,21 +309,29 @@ public sealed class BinollaSession : IBinollaClient
         State.Touch();
 
         var transport = _trading ?? throw new BinollaConnectionException("Not connected.");
-        // #region agent log
-        ProtocolTrace.Write("H18", "BinollaSession.SubscribePairAsync", "subscribe_send", new
+        await _subscribeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
-            pair,
-            period,
-            quoteCached = State.LatestQuotes.ContainsKey(pair.Trim()),
-            historyCached = State.HistoricalData.ContainsKey($"{pair.Trim()}:{period}"),
-            quoteCount = State.LatestQuotes.Count,
-            historyCount = State.HistoricalData.Count
-        });
-        // #endregion
-        await transport.SendAsync(BinollaFraming.BuildAlertList(), cancellationToken).ConfigureAwait(false);
-        await transport.SendAsync(BinollaFraming.BuildAlertClosedList(), cancellationToken).ConfigureAwait(false);
-        await transport.SendAsync(BinollaFraming.BuildAssetChange(pair, period), cancellationToken).ConfigureAwait(false);
-        State.RememberSubscription(pair);
+            // #region agent log
+            ProtocolTrace.Write("H18", "BinollaSession.SubscribePairAsync", "subscribe_send", new
+            {
+                pair,
+                period,
+                quoteCached = State.LatestQuotes.ContainsKey(pair.Trim()),
+                historyCached = State.HistoricalData.ContainsKey($"{pair.Trim()}:{period}"),
+                quoteCount = State.LatestQuotes.Count,
+                historyCount = State.HistoricalData.Count
+            });
+            // #endregion
+            await transport.SendAsync(BinollaFraming.BuildAlertList(), cancellationToken).ConfigureAwait(false);
+            await transport.SendAsync(BinollaFraming.BuildAlertClosedList(), cancellationToken).ConfigureAwait(false);
+            await transport.SendAsync(BinollaFraming.BuildAssetChange(pair, period), cancellationToken).ConfigureAwait(false);
+            State.RememberSubscription(pair);
+        }
+        finally
+        {
+            _subscribeLock.Release();
+        }
     }
 
     public async Task<IReadOnlyList<TradingAsset>> GetTradingAssetsAsync(CancellationToken cancellationToken = default)
@@ -398,7 +407,8 @@ public sealed class BinollaSession : IBinollaClient
                 exType = ex.GetType().Name,
                 clientAbort = cancellationToken.IsCancellationRequested,
                 quoteKeys = State.LatestQuotes.Keys.Take(8).ToArray(),
-                quoteCount = State.LatestQuotes.Count
+                quoteCount = State.LatestQuotes.Count,
+                runId = "post-fix"
             });
             // #endregion
             throw;
