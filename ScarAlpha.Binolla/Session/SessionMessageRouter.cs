@@ -533,13 +533,21 @@ internal sealed class SessionMessageRouter
             {
                 if (item is not JArray arr || arr.Count < 5) continue;
                 // Format: [timestamp, open, low, high, close, volume?, end?]  (upstream)
+                var open = arr[1]!.Value<double>();
+                var low = arr[2]!.Value<double>();
+                var high = arr[3]!.Value<double>();
+                var close = arr[4]!.Value<double>();
+                // Guard against swapped high/low from wire variants.
+                if (low > high) (low, high) = (high, low);
+                high = Math.Max(high, Math.Max(open, close));
+                low = Math.Min(low, Math.Min(open, close));
                 history.Candles.Add(new CandlestickData
                 {
                     Timestamp = arr[0]!.Value<double>(),
-                    Open = arr[1]!.Value<double>(),
-                    Low = arr[2]!.Value<double>(),
-                    High = arr[3]!.Value<double>(),
-                    Close = arr[4]!.Value<double>(),
+                    Open = open,
+                    Low = low,
+                    High = high,
+                    Close = close,
                     Volume = arr.Count > 5 ? arr[5]?.Value<double?>() : null,
                     EndTimestamp = arr.Count > 6 ? arr[6]?.Value<double?>() : null
                 });

@@ -136,9 +136,16 @@ public sealed class MarketAppService
                     Close: (decimal)c.Close))
                 .ToList();
 
+            var up = candles.Count(c => c.Close > c.Open);
+            var down = candles.Count(c => c.Close < c.Open);
+            var doji = candles.Count(c => c.Close == c.Open);
+            var tail = candles.TakeLast(3).Select(c =>
+                $"{c.Open:F5}/{c.High:F5}/{c.Low:F5}/{c.Close:F5}").ToArray();
+
             _logger.LogInformation(
-                "Market candles for user {UserId} asset={Asset} period={Period} count={Count} elapsedMs={ElapsedMs}",
-                _currentUser.UserId, symbol, period, candles.Count, sw.ElapsedMilliseconds);
+                "Market candles for user {UserId} asset={Asset} period={Period} count={Count} up={Up} down={Down} doji={Doji} sample={Sample} elapsedMs={ElapsedMs}",
+                _currentUser.UserId, symbol, period, candles.Count, up, down, doji,
+                string.Join(" | ", tail), sw.ElapsedMilliseconds);
 
             return new MarketCandlesResponse(symbol, period, candles);
         }
