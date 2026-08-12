@@ -5,6 +5,7 @@ namespace ScarAlpha.Binolla.Transport;
 
 /// <summary>
 /// Production ClientWebSocket transport. Headers match BinollaApiDotNetPro.
+/// Reassembles fragmented text frames before dispatch (Engine.IO packets must be whole).
 /// </summary>
 public sealed class ClientWebSocketTransport : IWebSocketTransport
 {
@@ -33,7 +34,12 @@ public sealed class ClientWebSocketTransport : IWebSocketTransport
         if (headers != null)
         {
             foreach (var h in headers)
+            {
+                // ClientWebSocket forbids setting some restricted headers on some runtimes.
+                if (string.Equals(h.Key, "Host", StringComparison.OrdinalIgnoreCase))
+                    continue;
                 socket.Options.SetRequestHeader(h.Key, h.Value);
+            }
         }
 
         await socket.ConnectAsync(uri, cancellationToken).ConfigureAwait(false);
@@ -69,7 +75,8 @@ public sealed class ClientWebSocketTransport : IWebSocketTransport
 
     private async Task ReceiveLoopAsync(CancellationToken cancellationToken)
     {
-        var buffer = new byte[1024 * 100];
+        var buffer = new byte[1024 * 64];
+        using var messageBuffer = new MemoryStream();
         Exception? error = null;
 
         try
@@ -85,7 +92,19 @@ public sealed class ClientWebSocketTransport : IWebSocketTransport
                 if (result.MessageType == WebSocketMessageType.Close)
                     break;
 
-                var text = Encoding.UTF8.GetString(buffer, 0, result.Count);
+                if (result.MessageType != WebSocketMessageType.Text)
+                {
+                    if (result.EndOfMessage)
+                        messageBuffer.SetLength(0);
+                    continue;
+                }
+
+                messageBuffer.Write(buffer, 0, result.Count);
+                if (!result.EndOfMessage)
+                    continue;
+
+                var text = Encoding.UTF8.GetString(messageBuffer.GetBuffer(), 0, (int)messageBuffer.Length);
+                messageBuffer.SetLength(0);
                 if (!string.IsNullOrWhiteSpace(text))
                     TextMessageReceived?.Invoke(text);
             }

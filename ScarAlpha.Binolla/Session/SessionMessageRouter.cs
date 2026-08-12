@@ -38,9 +38,11 @@ internal sealed class SessionMessageRouter
             return;
         }
 
-        if (message.StartsWith("40") && message.Contains("sid", StringComparison.Ordinal))
+        // Namespace connected — send auth SSID.
+        // Some servers send "40" only; others send 40{"sid":"..."}.
+        if (IsSocketIoNamespaceConnect(message))
         {
-            // Send auth frame (SSID) — never log
+            // Send auth frame (SSID) — never log token contents
             var ssid = _state.Ssid
                        ?? throw new BinollaAuthenticationException("SSID is missing.");
             await _sendAsync(ssid, cancellationToken).ConfigureAwait(false);
@@ -101,6 +103,22 @@ internal sealed class SessionMessageRouter
             await _sendAsync(BinollaFraming.BuildAssetChange(pair, 60), cancellationToken)
                 .ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// Engine.IO MESSAGE + Socket.IO CONNECT → "40" or "40{...}" / "40/ns,{...}".
+    /// Must not match 41–46 (disconnect/event/ack/error/binary).
+    /// </summary>
+    internal static bool IsSocketIoNamespaceConnect(string message)
+    {
+        if (string.IsNullOrEmpty(message) || message[0] != '4')
+            return false;
+        if (message.Length < 2 || message[1] != '0')
+            return false;
+        if (message.Length == 2)
+            return true;
+        var c = message[2];
+        return c is '{' or '/' or ',';
     }
 
     private void HandleBinaryHeader(string message)

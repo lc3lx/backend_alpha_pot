@@ -1,3 +1,4 @@
+using System.Text;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
@@ -188,8 +189,22 @@ static void ValidateProductionSecrets(WebApplication app)
         string.IsNullOrWhiteSpace(value)
         || markers.Any(m => value.Contains(m, StringComparison.OrdinalIgnoreCase));
 
-    if (IsWeak(jwt, "dev-only", "change-me")
-        || IsWeak(enc, "dev-binolla", "change-me")
+    // HS256 requires >= 256 bits (32 bytes) of key material when UTF-8 encoded.
+    var jwtBytes = Encoding.UTF8.GetByteCount(jwt);
+    if (jwtBytes < 32)
+    {
+        throw new InvalidOperationException(
+            $"Production JWT_SECRET is too short for HS256 ({jwtBytes * 8} bits). Use at least 32 UTF-8 bytes (e.g. openssl rand -base64 48).");
+    }
+
+    if (Encoding.UTF8.GetByteCount(enc) < 32)
+    {
+        throw new InvalidOperationException(
+            "Production BINOLLA_TOKEN_ENCRYPTION_KEY must be at least 32 UTF-8 bytes (e.g. openssl rand -base64 48).");
+    }
+
+    if (IsWeak(jwt, "dev-only", "change-me", "REPLACE_WITH")
+        || IsWeak(enc, "dev-binolla", "change-me", "REPLACE_WITH")
         || IsWeak(bot, "REPLACE_ME", "000000000"))
     {
         throw new InvalidOperationException(

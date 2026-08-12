@@ -176,6 +176,13 @@ public sealed class BinollaAppService
         {
             throw new ApiException(ApiErrorCodes.BinollaSessionExpired, "Binolla session token is invalid or expired.", 401);
         }
+        catch (BinollaTimeoutException)
+        {
+            throw new ApiException(
+                ApiErrorCodes.BinollaConnectionFailed,
+                "Binolla WebSocket authentication timed out after login token capture. Retry login.",
+                504);
+        }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Binolla connect failed for user {UserId}", userId);

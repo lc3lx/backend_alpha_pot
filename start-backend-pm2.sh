@@ -91,11 +91,23 @@ load_env() {
     if [[ -z "${DATABASE_CONNECTION_STRING:-}" ]]; then
       die "Production requires DATABASE_CONNECTION_STRING"
     fi
+    # Unquoted ';' in scaralpha.env truncates the value when sourced by bash
+    # (Password= is lost → Npgsql: "No password has been provided").
+    if [[ "${DATABASE_CONNECTION_STRING}" != *"Password="* && "${DATABASE_CONNECTION_STRING}" != *"Password ="* ]]; then
+      die "DATABASE_CONNECTION_STRING missing Password= — quote it in scaralpha.env like: DATABASE_CONNECTION_STRING='Host=...;Password=...'"
+    fi
     if [[ -z "${JWT_SECRET:-}" ]]; then
       die "Production requires JWT_SECRET in scaralpha.env (do not leave empty)"
     fi
+    # HS256 needs >= 256 bits (32 UTF-8 bytes). Short secrets cause IDX10720 at login.
+    if [[ "${#JWT_SECRET}" -lt 32 ]]; then
+      die "JWT_SECRET too short (${#JWT_SECRET} chars). Use: openssl rand -base64 48"
+    fi
     if [[ -z "${BINOLLA_TOKEN_ENCRYPTION_KEY:-}" ]]; then
       die "Production requires BINOLLA_TOKEN_ENCRYPTION_KEY in scaralpha.env"
+    fi
+    if [[ "${#BINOLLA_TOKEN_ENCRYPTION_KEY}" -lt 32 ]]; then
+      die "BINOLLA_TOKEN_ENCRYPTION_KEY too short (${#BINOLLA_TOKEN_ENCRYPTION_KEY} chars). Use: openssl rand -base64 48"
     fi
   else
     # Development convenience only — ephemeral secrets / InMemory allowed
