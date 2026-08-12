@@ -127,7 +127,13 @@ public sealed class MarketAppService
         try
         {
             var history = await client.GetHistoryAsync(symbol, period, ct);
-            var candles = history.Candles
+            var raw = history.Candles;
+            var rawFirstTs = raw.Count > 0 ? raw[0].Timestamp : (double?)null;
+            var rawLastTs = raw.Count > 0 ? raw[^1].Timestamp : (double?)null;
+            var wasNewestFirst = rawFirstTs is not null && rawLastTs is not null && rawFirstTs > rawLastTs;
+
+            var candles = raw
+                .OrderBy(c => c.Timestamp)
                 .Select(c => new MarketCandleDto(
                     Timestamp: DateTimeOffset.FromUnixTimeMilliseconds((long)(c.Timestamp * 1000)),
                     Open: (decimal)c.Open,
@@ -146,6 +152,24 @@ public sealed class MarketAppService
                 "Market candles for user {UserId} asset={Asset} period={Period} count={Count} up={Up} down={Down} doji={Doji} sample={Sample} elapsedMs={ElapsedMs}",
                 _currentUser.UserId, symbol, period, candles.Count, up, down, doji,
                 string.Join(" | ", tail), sw.ElapsedMilliseconds);
+
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
+                "H91",
+                "MarketAppService.GetCandlesAsync",
+                "candle_order",
+                new
+                {
+                    count = candles.Count,
+                    rawFirstTs,
+                    rawLastTs,
+                    wasNewestFirst,
+                    sortedFirstTs = candles.Count > 0 ? candles[0].Timestamp.ToUnixTimeSeconds() : (long?)null,
+                    sortedLastTs = candles.Count > 0 ? candles[^1].Timestamp.ToUnixTimeSeconds() : (long?)null,
+                    period,
+                    symbol
+                });
+            // #endregion
 
             return new MarketCandlesResponse(symbol, period, candles);
         }

@@ -3,7 +3,7 @@ using System.Text.Json;
 namespace ScarAlpha.Binolla.Diagnostics;
 
 /// <summary>Minimal NDJSON breadcrumbs for Binolla login/WS auth. Never logs secrets.</summary>
-internal static class LoginTrace
+public static class LoginTrace
 {
     private const string SessionId = "660ec2";
 
@@ -50,5 +50,6 @@ internal static class LoginTrace
         yield return Path.GetFullPath(Path.Combine(cwd, "logs", "debug-660ec2.log"));
         yield return Path.GetFullPath(Path.Combine(cwd, "debug-660ec2.log"));
         yield return @"d:\work\flul_bot\debug-660ec2.log";
+        yield return @"d:\work\flul_bot\.cursor\debug-660ec2.log";
     }
 }

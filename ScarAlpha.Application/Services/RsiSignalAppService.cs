@@ -46,6 +46,7 @@ public sealed class RsiSignalAppService
             var history = await client.GetHistoryAsync(symbol, periodSeconds, ct);
 
             var candles = history.Candles
+                .OrderBy(c => c.Timestamp)
                 .Select(c => new RsiCandle(
                     Timestamp: DateTimeOffset.FromUnixTimeMilliseconds((long)(c.Timestamp * 1000)),
                     Close: (decimal)c.Close,
