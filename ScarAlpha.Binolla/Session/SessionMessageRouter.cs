@@ -133,31 +133,35 @@ internal sealed class SessionMessageRouter
         });
         // #endregion
 
-        // During initial handshake, unauthorized means the SSID was rejected — fail fast.
-        // Re-auth loops here caused repeated bootstrap and empty quotes/balance in production.
-        if (lifecycle is SessionLifecycleState.Connecting or SessionLifecycleState.Disconnected)
-        {
-            _state.ResetMarketCaches();
-            _state.ClearSubscriptions();
-            _state.SetLifecycle(SessionLifecycleState.AuthenticationFailed, "Binolla unauthorized during connect.");
-            Interlocked.Exchange(ref _authorized, 0);
-            return;
-        }
-
-        // One silent SSID re-send after we were already Connected/Reconnected.
+        // One silent SSID re-send (connect OR live). Immediate fail-fast on the first
+        // unauthorized during Connecting left login in AuthenticationFailed while ConnectAsync
+        // could still return, then ChangeAccount blew up with 502.
         if (Interlocked.CompareExchange(ref _unauthorizedReauthSent, 1, 0) == 0 &&
             !string.IsNullOrEmpty(_state.Ssid))
         {
             Interlocked.Exchange(ref _authorized, 0);
             _state.ResetMarketCaches();
             _state.ClearSubscriptions();
+            // Keep Connecting — do not mark AuthenticationFailed yet.
+            if (lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
+                _state.SetLifecycle(SessionLifecycleState.Connecting, "Binolla unauthorized; re-sending SSID.");
+
+            LoginTrace.Write("H83", "SessionMessageRouter.HandleUnauthorized", "unauthorized_reauth_send", new
+            {
+                ssidLen = _state.Ssid!.Length,
+                fromLifecycle = lifecycle.ToString()
+            });
             await _sendAsync(_state.Ssid, cancellationToken).ConfigureAwait(false);
             return;
         }
 
         _state.ResetMarketCaches();
         _state.ClearSubscriptions();
-        _state.SetLifecycle(SessionLifecycleState.AuthenticationFailed, "Binolla unauthorized.");
+        _state.SetLifecycle(
+            SessionLifecycleState.AuthenticationFailed,
+            lifecycle is SessionLifecycleState.Connecting or SessionLifecycleState.Disconnected
+                ? "Binolla unauthorized during connect."
+                : "Binolla unauthorized.");
         Interlocked.Exchange(ref _authorized, 0);
     }
 

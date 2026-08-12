@@ -145,6 +145,17 @@ public sealed class BinollaAppService
                 request.Ssid.Trim(),
                 ct,
                 cookieHeader);
+
+            if (!client.IsTransportConnected ||
+                client.Lifecycle is SessionLifecycleState.AuthenticationFailed
+                    or SessionLifecycleState.SessionExpired
+                    or SessionLifecycleState.Faulted
+                    or SessionLifecycleState.Disconnected)
+            {
+                throw new BinollaAuthenticationException(
+                    $"Binolla session not ready after connect (state={client.Lifecycle}).");
+            }
+
             await client.ChangeAccountAsync(EngineAccount.Demo, ct);
 
             // Do not block login on a full balance wait (was misreported as auth timeout for ~60s).
@@ -212,6 +223,15 @@ public sealed class BinollaAppService
         catch (BinollaAuthenticationException)
         {
             throw new ApiException(ApiErrorCodes.BinollaSessionExpired, "Binolla session token is invalid or expired.", 401);
+        }
+        catch (BinollaConnectionException ex) when (
+            ex.Message.Contains("AuthenticationFailed", StringComparison.Ordinal) ||
+            ex.Message.Contains("not connected", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ApiException(
+                ApiErrorCodes.BinollaSessionExpired,
+                "Binolla WebSocket rejected the session after login. Retry login.",
+                401);
         }
         catch (BinollaTimeoutException)
         {
