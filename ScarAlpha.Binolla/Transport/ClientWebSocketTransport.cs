@@ -193,12 +193,41 @@ public sealed class ClientWebSocketTransport : IWebSocketTransport
         if (string.IsNullOrWhiteSpace(cookieHeader))
             return;
 
-        // Live evidence: raw Cookie request headers can leave the WS open with zero Engine.IO
-        // frames. Skip attaching browser cookies to the trading socket — SSID auth frame is enough.
-        // Keep the method for an explicit future opt-in; currently a no-op by design.
-        _ = socket;
-        _ = uri;
-        _ = cookieHeader;
+        try
+        {
+            var container = new System.Net.CookieContainer();
+            var added = 0;
+            foreach (var part in cookieHeader.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                var eq = part.IndexOf('=');
+                if (eq <= 0) continue;
+                var name = part[..eq].Trim();
+                var value = part[(eq + 1)..].Trim();
+                if (name.Length == 0) continue;
+                // CookieContainer — NOT raw Cookie request header (raw header blackholed Engine.IO).
+                container.Add(new Uri($"{uri.Scheme}://{uri.Host}/"), new System.Net.Cookie(name, value));
+                added++;
+            }
+
+            if (added == 0)
+                return;
+
+            socket.Options.Cookies = container;
+            // #region agent log
+            ProtocolTrace.Write("H41", "ClientWebSocketTransport.ApplyCookies", "cookie_container_applied", new
+            {
+                added,
+                host = uri.Host
+            });
+            // #endregion
+        }
+        catch (Exception ex)
+        {
+            ProtocolTrace.Write("H41", "ClientWebSocketTransport.ApplyCookies", "cookie_container_failed", new
+            {
+                type = ex.GetType().Name
+            });
+        }
     }
 
     private async Task CloseInternalAsync(CancellationToken cancellationToken)

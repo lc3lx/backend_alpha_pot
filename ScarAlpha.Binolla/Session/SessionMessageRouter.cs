@@ -19,6 +19,7 @@ internal sealed class SessionMessageRouter
     private readonly Action? _onAuthorized;
     private string _upcomingMessageType = string.Empty;
     private int _authorized;
+    private int _unauthorizedReauthSent;
 
     public SessionMessageRouter(
         BinollaSessionState state,
@@ -98,10 +99,11 @@ internal sealed class SessionMessageRouter
         // Complete Socket.IO text events: 42["event", payload]
         if (message.StartsWith("42", StringComparison.Ordinal))
         {
-            if (message.Contains("NotAuthorized", StringComparison.Ordinal))
+            if (IsUnauthorizedMessage(message) ||
+                (TryParseSocketIoEvent(message, out var unauthName, out _) &&
+                 IsUnauthorizedEventName(unauthName)))
             {
-                ProtocolTrace.Write("H13", "SessionMessageRouter", "not_authorized");
-                _state.SetLifecycle(SessionLifecycleState.AuthenticationFailed, "SSID not authorized.");
+                await HandleUnauthorizedAsync(cancellationToken).ConfigureAwait(false);
                 return;
             }
 
@@ -179,6 +181,48 @@ internal sealed class SessionMessageRouter
         }
     }
 
+    private async Task HandleUnauthorizedAsync(CancellationToken cancellationToken)
+    {
+        // #region agent log
+        ProtocolTrace.Write("H40", "SessionMessageRouter.HandleUnauthorizedAsync", "unauthorized_received", new
+        {
+            lifecycle = _state.Lifecycle.ToString(),
+            hadAuth = Volatile.Read(ref _authorized) == 1,
+            reauthSent = Volatile.Read(ref _unauthorizedReauthSent) == 1
+        });
+        // #endregion
+
+        // One silent SSID re-send — live logs show 42["unauthorized"] after subscribe while
+        // Lifecycle still looked Connected (zombie session with cached assets only).
+        if (Interlocked.CompareExchange(ref _unauthorizedReauthSent, 1, 0) == 0 &&
+            !string.IsNullOrEmpty(_state.Ssid))
+        {
+            Interlocked.Exchange(ref _authorized, 0);
+            _state.ResetMarketCaches();
+            _state.ClearSubscriptions();
+            ProtocolTrace.Write("H40", "SessionMessageRouter.HandleUnauthorizedAsync", "unauthorized_reauth_send", new
+            {
+                ssidLen = _state.Ssid!.Length
+            });
+            await _sendAsync(_state.Ssid, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        _state.ResetMarketCaches();
+        _state.ClearSubscriptions();
+        _state.SetLifecycle(SessionLifecycleState.AuthenticationFailed, "Binolla unauthorized.");
+        Interlocked.Exchange(ref _authorized, 0);
+    }
+
+    private static bool IsUnauthorizedMessage(string message) =>
+        message.Contains("NotAuthorized", StringComparison.OrdinalIgnoreCase) ||
+        message.Contains("\"unauthorized\"", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsUnauthorizedEventName(string? eventName) =>
+        !string.IsNullOrEmpty(eventName) &&
+        (eventName.Equals("unauthorized", StringComparison.OrdinalIgnoreCase) ||
+         eventName.Equals("NotAuthorized", StringComparison.OrdinalIgnoreCase));
+
     private static bool LooksLikeEngineIoPacket(string message)
     {
         if (string.IsNullOrEmpty(message)) return true;
@@ -230,6 +274,9 @@ internal sealed class SessionMessageRouter
     {
         if (Interlocked.Exchange(ref _authorized, 1) == 1)
             return;
+
+        // Fresh auth window — allow one unauthorized→reauth cycle again.
+        Interlocked.Exchange(ref _unauthorizedReauthSent, 0);
 
         ProtocolTrace.Write("H15", "SessionMessageRouter", "ensure_authorized_enter", new
         {

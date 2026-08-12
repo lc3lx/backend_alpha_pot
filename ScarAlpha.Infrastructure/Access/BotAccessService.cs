@@ -44,13 +44,13 @@ public sealed class BotAccessService : IBotAccessService
                 ApprovalStatus: approvalStatus);
         }
 
-        // Approved + Connected-in-DB but no live session (API restart / idle eviction):
+        // Approved/pending + Connected-in-DB but no live session (API restart / idle eviction / unauthorized):
         // best-effort lazy restore before reporting BinollaNotConnected.
+        // Pending users still need market browse; only Rejected stays blocked.
         if (!connected &&
             link is not null &&
             link.Status == BinollaLinkStatus.Connected &&
-            link.AdminApproved &&
-            link.ApprovalStatus == AdminApprovalStatus.Approved &&
+            link.ApprovalStatus != AdminApprovalStatus.Rejected &&
             !string.IsNullOrWhiteSpace(link.EncryptedSsid))
         {
             try

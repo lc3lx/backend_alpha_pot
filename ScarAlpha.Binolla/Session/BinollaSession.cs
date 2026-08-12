@@ -573,14 +573,15 @@ public sealed class BinollaSession : IBinollaClient
             ["Origin"] = BinollaWire.Origin,
             ["User-Agent"] = BinollaWire.UserAgent
         };
-        // Intentionally do NOT attach Playwright Cookie header to the trading WS.
-        // Live evidence: with Cookie attached, auth waited with zero Engine.IO frames;
-        // SSID authorization frame is the auth credential for ws3.
+        // Pass Playwright cookies via CookieContainer (not raw Cookie header).
+        // Live unauthorized logs showed SSID-only sessions rejected on asset/change.
+        if (!string.IsNullOrWhiteSpace(State.CookieHeader))
+            headers["Cookie"] = State.CookieHeader;
 
         ProtocolTrace.Write("H14", "BinollaSession.ConnectSocketsAsync", "ws_connect_start", new
         {
             host = tradingUri.Host,
-            hasCookie = false,
+            hasCookie = !string.IsNullOrWhiteSpace(State.CookieHeader),
             cookieCaptured = !string.IsNullOrWhiteSpace(State.CookieHeader),
             queryHasT = tradingUri.Query.Contains("t=", StringComparison.Ordinal)
         });

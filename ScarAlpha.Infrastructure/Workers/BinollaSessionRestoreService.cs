@@ -170,6 +170,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
             Guid linkId = Guid.Empty;
             BinollaLinkStatus linkStatus = BinollaLinkStatus.Disconnected;
             bool approved = false;
+            bool pending = false;
 
             try
             {
@@ -182,6 +183,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                 linkId = link.Id;
                 linkStatus = link.Status;
                 approved = link.AdminApproved && link.ApprovalStatus == AdminApprovalStatus.Approved;
+                pending = link.ApprovalStatus == AdminApprovalStatus.Pending;
                 ciphertext = link.EncryptedSsid;
             }
             catch (Exception ex)
@@ -190,8 +192,12 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                 return false;
             }
 
-            // Only approved, previously-connected links are restored.
-            if (!approved || linkStatus != BinollaLinkStatus.Connected || string.IsNullOrWhiteSpace(ciphertext))
+            // Restore previously-connected links for approved OR pending (market browse).
+            // Rejected accounts stay offline.
+            var eligible = linkStatus == BinollaLinkStatus.Connected &&
+                           !string.IsNullOrWhiteSpace(ciphertext) &&
+                           (approved || pending);
+            if (!eligible)
                 return false;
 
             string ssid;
