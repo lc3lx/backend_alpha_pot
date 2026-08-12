@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using ScarAlpha.Binolla.Abstractions;
+using ScarAlpha.Binolla.Diagnostics;
 using ScarAlpha.Binolla.Models;
 using ScarAlpha.Binolla.Protocol;
 using ScarAlpha.Binolla.Transport;
@@ -55,7 +56,10 @@ public sealed class BinollaSession : IBinollaClient
     public event Action<TradeOutcome>? OnOrderClosed;
     public event Action? OnSessionExpired;
 
-    public async Task ConnectAsync(string ssid, CancellationToken cancellationToken = default)
+    public async Task ConnectAsync(
+        string ssid,
+        CancellationToken cancellationToken = default,
+        string? cookieHeader = null)
     {
         ThrowIfDisposed();
         if (string.IsNullOrWhiteSpace(ssid))
@@ -69,8 +73,16 @@ public sealed class BinollaSession : IBinollaClient
 
             SetLifecycle(SessionLifecycleState.Connecting);
             State.Ssid = ssid;
+            State.CookieHeader = string.IsNullOrWhiteSpace(cookieHeader) ? null : cookieHeader.Trim();
             _sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             _reconnectAttempts = 0;
+
+            ProtocolTrace.Write("H12", "BinollaSession.ConnectAsync", "connecting", new
+            {
+                hasCookie = !string.IsNullOrEmpty(State.CookieHeader),
+                cookieLen = State.CookieHeader?.Length ?? 0,
+                ssidLen = ssid.Length
+            });
 
             await ConnectSocketsAsync(_sessionCts.Token).ConfigureAwait(false);
             await WaitForAuthenticationAsync(cancellationToken).ConfigureAwait(false);
@@ -80,6 +92,11 @@ public sealed class BinollaSession : IBinollaClient
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            ProtocolTrace.Write("H12", "BinollaSession.ConnectAsync", "connect_failed", new
+            {
+                type = ex.GetType().Name,
+                message = ex.Message
+            });
             SetLifecycle(
                 ex is BinollaAuthenticationException
                     ? SessionLifecycleState.AuthenticationFailed
@@ -453,13 +470,22 @@ public sealed class BinollaSession : IBinollaClient
         var tradingUri = _options.TradingSocketUri ?? new Uri(BinollaWire.TradingSocketUri);
         var headers = new Dictionary<string, string>
         {
-            ["Host"] = BinollaWire.HostTrading,
             ["Origin"] = BinollaWire.Origin,
             ["Cache-Control"] = "no-cache",
             ["User-Agent"] = BinollaWire.UserAgent
         };
+        if (!string.IsNullOrWhiteSpace(State.CookieHeader))
+            headers["Cookie"] = State.CookieHeader;
+
+        ProtocolTrace.Write("H14", "BinollaSession.ConnectSocketsAsync", "ws_connect_start", new
+        {
+            host = tradingUri.Host,
+            hasCookie = headers.ContainsKey("Cookie")
+        });
 
         await _trading.ConnectAsync(tradingUri, headers, cancellationToken).ConfigureAwait(false);
+
+        ProtocolTrace.Write("H14", "BinollaSession.ConnectSocketsAsync", "ws_tcp_connected");
 
         if (_options.EnableChartConnection)
         {

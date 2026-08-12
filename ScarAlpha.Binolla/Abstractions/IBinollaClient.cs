@@ -13,7 +13,7 @@ public interface IBinollaClient : IAsyncDisposable
     event Action<TradeOutcome>? OnOrderClosed;
     event Action? OnSessionExpired;
 
-    Task ConnectAsync(string ssid, CancellationToken cancellationToken = default);
+    Task ConnectAsync(string ssid, CancellationToken cancellationToken = default, string? cookieHeader = null);
 
     Task<BalanceInfo> GetBalanceAsync(CancellationToken cancellationToken = default);
 
@@ -50,7 +50,8 @@ public interface IBinollaSessionManager : IAsyncDisposable
     Task<IBinollaClient> GetOrCreateAsync(
         string userId,
         string ssid,
-        CancellationToken cancellationToken = default);
+        CancellationToken cancellationToken = default,
+        string? cookieHeader = null);
 
     IBinollaClient? Get(string userId);
 

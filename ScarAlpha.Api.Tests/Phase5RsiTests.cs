@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using FluentAssertions;
 using ScarAlpha.Application.Abstractions;
 using ScarAlpha.Application.Common;
@@ -229,4 +229,5 @@ public sealed class Phase5RsiTests
         }).ToList();
     }
 }
+
 

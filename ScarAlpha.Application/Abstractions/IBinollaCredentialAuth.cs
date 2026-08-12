@@ -7,9 +7,12 @@ namespace ScarAlpha.Application.Abstractions;
 /// </summary>
 public interface IBinollaCredentialAuth
 {
-    /// <summary>Log into an existing Binolla account and return a full SSID frame.</summary>
-    Task<string> LoginAsync(string email, string password, CancellationToken cancellationToken = default);
+    /// <summary>Log into an existing Binolla account and return SSID + optional cookies.</summary>
+    Task<BinollaCapturedSession> LoginAsync(string email, string password, CancellationToken cancellationToken = default);
 
-    /// <summary>Register a new Binolla account (partner referral) and return a full SSID frame.</summary>
-    Task<string> SignUpAsync(string email, string password, CancellationToken cancellationToken = default);
+    /// <summary>Register a new Binolla account (partner referral) and return SSID + optional cookies.</summary>
+    Task<BinollaCapturedSession> SignUpAsync(string email, string password, CancellationToken cancellationToken = default);
 }
+
+/// <summary>Playwright capture result. CookieHeader must never be logged.</summary>
+public sealed record BinollaCapturedSession(string SsidFrame, string? CookieHeader);

@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
@@ -68,13 +68,13 @@ public sealed class RateLimitedApiFactory : WebApplicationFactory<Program>
             services.RemoveAll<IBinollaCredentialAuth>();
             var credAuth = new Mock<IBinollaCredentialAuth>();
             credAuth.Setup(c => c.LoginAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
-                .ReturnsAsync("""42["authorization",{"isDemo":true,"token":"cred-login-token-abcdef"}]""");
+                .ReturnsAsync(new BinollaCapturedSession("""42["authorization",{"isDemo":true,"token":"cred-login-token-abcdef"}]""", null));
             credAuth.Setup(c => c.SignUpAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
-                .ReturnsAsync("""42["authorization",{"isDemo":true,"token":"cred-signup-token-abcdef"}]""");
+                .ReturnsAsync(new BinollaCapturedSession("""42["authorization",{"isDemo":true,"token":"cred-signup-token-abcdef"}]""", null));
             services.AddSingleton(credAuth.Object);
 
             Client.SetupGet(c => c.Lifecycle).Returns(SessionLifecycleState.Connected);
-            Client.Setup(c => c.ConnectAsync(It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+            Client.Setup(c => c.ConnectAsync(It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>())).Returns(Task.CompletedTask);
             Client.Setup(c => c.ChangeAccountAsync(It.IsAny<AccountType>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
             Client.Setup(c => c.GetBalanceAsync(It.IsAny<CancellationToken>())).ReturnsAsync(new BalanceInfo
             {
@@ -101,8 +101,8 @@ public sealed class RateLimitedApiFactory : WebApplicationFactory<Program>
                 });
 
             var connectedUsers = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
-            SessionManager.Setup(m => m.GetOrCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
-                .ReturnsAsync((string userId, string _, CancellationToken _) =>
+            SessionManager.Setup(m => m.GetOrCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>()))
+                .ReturnsAsync((string userId, string _, CancellationToken _, string? __) =>
                 {
                     connectedUsers[userId] = 1;
                     return Client.Object;
@@ -474,3 +474,4 @@ public sealed class Phase3RateLimitTests : IClassFixture<RateLimitedApiFactory>
         last.Should().Be(HttpStatusCode.TooManyRequests);
     }
 }
+

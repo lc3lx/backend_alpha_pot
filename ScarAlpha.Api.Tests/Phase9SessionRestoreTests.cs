@@ -1,4 +1,4 @@
-using System.Net.Http.Headers;
+﻿using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
 using FluentAssertions;
@@ -110,7 +110,7 @@ public sealed class Phase9SessionRestoreTests : IClassFixture<ApiFactory>
         _factory.SimulateProcessRestart();
 
         _factory.SessionManager
-            .Setup(m => m.GetOrCreateAsync(badUserId, It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Setup(m => m.GetOrCreateAsync(badUserId, It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>()))
             .ThrowsAsync(new BinollaAuthenticationException("SSID expired"));
 
         var restorer = _factory.Services.GetRequiredService<IBinollaSessionRestorer>();
@@ -128,8 +128,8 @@ public sealed class Phase9SessionRestoreTests : IClassFixture<ApiFactory>
 
         // Reset mock for other tests sharing the factory.
         _factory.SessionManager
-            .Setup(m => m.GetOrCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync((string userId, string _, CancellationToken _) =>
+            .Setup(m => m.GetOrCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>()))
+            .ReturnsAsync((string userId, string _, CancellationToken _, string? __) =>
             {
                 _factory.ConnectedUsers[userId] = 1;
                 return _factory.Client.Object;
@@ -148,7 +148,7 @@ public sealed class Phase9SessionRestoreTests : IClassFixture<ApiFactory>
 
         var attempts = 0;
         _factory.SessionManager
-            .Setup(m => m.GetOrCreateAsync(userId, It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Setup(m => m.GetOrCreateAsync(userId, It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>()))
             .Returns(() =>
             {
                 attempts++;
@@ -163,8 +163,8 @@ public sealed class Phase9SessionRestoreTests : IClassFixture<ApiFactory>
         _factory.ConnectedUsers.Should().NotContainKey(userId);
 
         _factory.SessionManager
-            .Setup(m => m.GetOrCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync((string uid, string _, CancellationToken _) =>
+            .Setup(m => m.GetOrCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>()))
+            .ReturnsAsync((string uid, string _, CancellationToken _, string? __) =>
             {
                 _factory.ConnectedUsers[uid] = 1;
                 return _factory.Client.Object;
@@ -238,3 +238,4 @@ public sealed class Phase9SessionRestoreTests : IClassFixture<ApiFactory>
         return req;
     }
 }
+

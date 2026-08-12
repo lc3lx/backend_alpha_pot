@@ -51,6 +51,21 @@ function normalizeToken(raw) {
   return s;
 }
 
+/** Build Cookie header for Binolla domains — never printed to logs. */
+async function buildCookieHeader(context) {
+  try {
+    const cookies = await context.cookies();
+    const relevant = cookies.filter((c) => {
+      const d = (c.domain || '').replace(/^\./, '');
+      return d === 'binolla.com' || d.endsWith('.binolla.com');
+    });
+    if (!relevant.length) return undefined;
+    return relevant.map((c) => `${c.name}=${c.value}`).join('; ');
+  } catch {
+    return undefined;
+  }
+}
+
 function extractToken(text) {
   if (!text || typeof text !== 'string') return null;
 
@@ -593,7 +608,11 @@ async function main() {
       process.exit(1);
     }
 
-    process.stdout.write(JSON.stringify({ ok: true, token }));
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      token,
+      cookies: await buildCookieHeader(context),
+    }));
   } catch (err) {
     process.stdout.write(
       JSON.stringify({

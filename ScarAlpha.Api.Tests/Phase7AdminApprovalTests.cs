@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
@@ -183,3 +183,4 @@ public sealed class Phase7AdminApprovalTests : IClassFixture<ApiFactory>
         return req;
     }
 }
+

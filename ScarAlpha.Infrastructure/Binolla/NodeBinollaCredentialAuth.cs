@@ -52,13 +52,13 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
             : ResolveDefaultToolDirectory(hostEnvironment.ContentRootPath);
     }
 
-    public Task<string> LoginAsync(string email, string password, CancellationToken cancellationToken = default)
+    public Task<BinollaCapturedSession> LoginAsync(string email, string password, CancellationToken cancellationToken = default)
         => CaptureAsync("login", email, password, cancellationToken);
 
-    public Task<string> SignUpAsync(string email, string password, CancellationToken cancellationToken = default)
+    public Task<BinollaCapturedSession> SignUpAsync(string email, string password, CancellationToken cancellationToken = default)
         => CaptureAsync("signup", email, password, cancellationToken);
 
-    private async Task<string> CaptureAsync(
+    private async Task<BinollaCapturedSession> CaptureAsync(
         string mode,
         string email,
         string password,
@@ -86,12 +86,13 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         await _gate.WaitAsync(cancellationToken);
         try
         {
-            var token = await RunNodeCaptureAsync(mode, email.Trim(), password, cancellationToken);
-            token = NormalizeSessionToken(token);
+            var captured = await RunNodeCaptureAsync(mode, email.Trim(), password, cancellationToken);
+            var token = NormalizeSessionToken(captured.Token!);
             // Escape for embedding inside a JSON string literal in the SSID frame.
             var safe = token.Replace("\\", "\\\\", StringComparison.Ordinal)
                 .Replace("\"", "\\\"", StringComparison.Ordinal);
-            return $$"""42["authorization",{"isDemo":true,"token":"{{safe}}"}]""";
+            var frame = $$"""42["authorization",{"isDemo":true,"token":"{{safe}}"}]""";
+            return new BinollaCapturedSession(frame, captured.Cookies);
         }
         finally
         {
@@ -99,7 +100,7 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         }
     }
 
-    private async Task<string> RunNodeCaptureAsync(
+    private async Task<CaptureResult> RunNodeCaptureAsync(
         string mode,
         string email,
         string password,
@@ -188,7 +189,7 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         try
         {
             result = JsonSerializer.Deserialize<CaptureResult>(stdout, JsonOptions)
-                     ?? new CaptureResult(false, null, "Invalid tool response");
+                     ?? new CaptureResult(false, null, null, "Invalid tool response");
         }
         catch (JsonException)
         {
@@ -209,8 +210,11 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
                 400);
         }
 
-        _logger.LogInformation("Binolla credential {Mode} captured session token", mode);
-        return result.Token;
+        _logger.LogInformation(
+            "Binolla credential {Mode} captured session token (cookiesPresent={HasCookies})",
+            mode,
+            !string.IsNullOrWhiteSpace(result.Cookies));
+        return result;
     }
 
     private static void TryKill(Process process)
@@ -343,5 +347,5 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         PropertyNameCaseInsensitive = true
     };
 
-    private sealed record CaptureResult(bool Ok, string? Token, string? Error);
+    private sealed record CaptureResult(bool Ok, string? Token, string? Cookies, string? Error);
 }

@@ -35,7 +35,8 @@ public sealed class BinollaSessionManager : IBinollaSessionManager
     public async Task<IBinollaClient> GetOrCreateAsync(
         string userId,
         string ssid,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? cookieHeader = null)
     {
         ThrowIfDisposed();
         if (string.IsNullOrWhiteSpace(userId))
@@ -46,7 +47,8 @@ public sealed class BinollaSessionManager : IBinollaSessionManager
         if (_sessions.TryGetValue(userId, out var existing))
         {
             existing.Session.State.Touch();
-            await EnsureSessionUsesSsidAsync(existing.Session, ssid, cancellationToken).ConfigureAwait(false);
+            await EnsureSessionUsesSsidAsync(existing.Session, ssid, cancellationToken, cookieHeader)
+                .ConfigureAwait(false);
             return existing.Session;
         }
 
@@ -56,7 +58,8 @@ public sealed class BinollaSessionManager : IBinollaSessionManager
             if (_sessions.TryGetValue(userId, out existing))
             {
                 existing.Session.State.Touch();
-                await EnsureSessionUsesSsidAsync(existing.Session, ssid, cancellationToken).ConfigureAwait(false);
+                await EnsureSessionUsesSsidAsync(existing.Session, ssid, cancellationToken, cookieHeader)
+                    .ConfigureAwait(false);
                 return existing.Session;
             }
 
@@ -70,11 +73,12 @@ public sealed class BinollaSessionManager : IBinollaSessionManager
             {
                 await session.DisposeAsync().ConfigureAwait(false);
                 var raced = _sessions[userId].Session;
-                await EnsureSessionUsesSsidAsync(raced, ssid, cancellationToken).ConfigureAwait(false);
+                await EnsureSessionUsesSsidAsync(raced, ssid, cancellationToken, cookieHeader)
+                    .ConfigureAwait(false);
                 return raced;
             }
 
-            await session.ConnectAsync(ssid, cancellationToken).ConfigureAwait(false);
+            await session.ConnectAsync(ssid, cancellationToken, cookieHeader).ConfigureAwait(false);
             return session;
         }
         finally
@@ -90,7 +94,8 @@ public sealed class BinollaSessionManager : IBinollaSessionManager
     private static async Task EnsureSessionUsesSsidAsync(
         BinollaSession session,
         string ssid,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? cookieHeader = null)
     {
         var lifecycle = session.Lifecycle;
         var needsLifecycleReconnect = lifecycle is SessionLifecycleState.Disconnected
@@ -100,12 +105,16 @@ public sealed class BinollaSessionManager : IBinollaSessionManager
 
         var ssidChanged = !string.Equals(session.State.Ssid, ssid, StringComparison.Ordinal);
         if (!needsLifecycleReconnect && !ssidChanged)
+        {
+            if (!string.IsNullOrWhiteSpace(cookieHeader))
+                session.State.CookieHeader = cookieHeader.Trim();
             return;
+        }
 
         if (!needsLifecycleReconnect && ssidChanged)
             await session.DisconnectAsync(cancellationToken).ConfigureAwait(false);
 
-        await session.ConnectAsync(ssid, cancellationToken).ConfigureAwait(false);
+        await session.ConnectAsync(ssid, cancellationToken, cookieHeader).ConfigureAwait(false);
     }
 
     public IBinollaClient? Get(string userId)

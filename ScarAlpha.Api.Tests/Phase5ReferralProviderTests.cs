@@ -1,4 +1,4 @@
-using FluentAssertions;
+﻿using FluentAssertions;
 using ScarAlpha.Application.Abstractions;
 using ScarAlpha.Binolla.Abstractions;
 using ScarAlpha.Binolla.Models;
@@ -49,3 +49,4 @@ public sealed class Phase5AccessUnitTests
         result.AdminApproved.Should().BeFalse();
     }
 }
+

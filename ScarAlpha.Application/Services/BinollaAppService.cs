@@ -47,10 +47,10 @@ public sealed class BinollaAppService
             throw new ApiException(ApiErrorCodes.ValidationError, "Request body is required.");
         ValidateCredentialRequest(request);
 
-        string ssid;
+        BinollaCapturedSession captured;
         try
         {
-            ssid = await _credentialAuth.LoginAsync(request.Email, request.Password, ct);
+            captured = await _credentialAuth.LoginAsync(request.Email, request.Password, ct);
         }
         catch (ApiException)
         {
@@ -66,7 +66,10 @@ public sealed class BinollaAppService
         }
 
         // Password is never stored — only the resulting SSID is encrypted via ConnectAsync.
-        return await ConnectAsync(new BinollaConnectRequest(ssid, request.AccountType), ct);
+        return await ConnectAsync(
+            new BinollaConnectRequest(captured.SsidFrame, request.AccountType),
+            ct,
+            captured.CookieHeader);
     }
 
     public async Task<BinollaConnectResponse> SignUpWithCredentialsAsync(
@@ -77,10 +80,10 @@ public sealed class BinollaAppService
             throw new ApiException(ApiErrorCodes.ValidationError, "Request body is required.");
         ValidateCredentialRequest(request);
 
-        string ssid;
+        BinollaCapturedSession captured;
         try
         {
-            ssid = await _credentialAuth.SignUpAsync(request.Email, request.Password, ct);
+            captured = await _credentialAuth.SignUpAsync(request.Email, request.Password, ct);
         }
         catch (ApiException)
         {
@@ -95,7 +98,10 @@ public sealed class BinollaAppService
                 400);
         }
 
-        return await ConnectAsync(new BinollaConnectRequest(ssid, request.AccountType), ct);
+        return await ConnectAsync(
+            new BinollaConnectRequest(captured.SsidFrame, request.AccountType),
+            ct,
+            captured.CookieHeader);
     }
 
     private static void ValidateCredentialRequest(BinollaCredentialRequest request)
@@ -108,7 +114,10 @@ public sealed class BinollaAppService
             throw new ApiException(ApiErrorCodes.ValidationError, "Credentials exceed allowed length.");
     }
 
-    public async Task<BinollaConnectResponse> ConnectAsync(BinollaConnectRequest request, CancellationToken ct)
+    public async Task<BinollaConnectResponse> ConnectAsync(
+        BinollaConnectRequest request,
+        CancellationToken ct,
+        string? cookieHeader = null)
     {
         if (string.IsNullOrWhiteSpace(request.Ssid))
             throw new ApiException(ApiErrorCodes.ValidationError, "ssid is required.");
@@ -122,7 +131,11 @@ public sealed class BinollaAppService
 
         try
         {
-            var client = await _sessions.GetOrCreateAsync(userId.ToString(), request.Ssid.Trim(), ct);
+            var client = await _sessions.GetOrCreateAsync(
+                userId.ToString(),
+                request.Ssid.Trim(),
+                ct,
+                cookieHeader);
             await client.ChangeAccountAsync(EngineAccount.Demo, ct);
             var balance = await client.GetBalanceAsync(ct);
 

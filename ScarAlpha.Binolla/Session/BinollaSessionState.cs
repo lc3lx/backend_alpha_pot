@@ -18,6 +18,9 @@ public sealed class BinollaSessionState
     /// <summary>SSID stored in memory only for connection use. Never log.</summary>
     public string? Ssid { get; set; }
 
+    /// <summary>Optional Cookie header from Playwright capture. Never log.</summary>
+    public string? CookieHeader { get; set; }
+
     public SessionLifecycleState Lifecycle
     {
         get { lock (_lifecycleGate) return _lifecycle; }

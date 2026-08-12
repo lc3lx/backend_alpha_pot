@@ -1,4 +1,4 @@
-using System.Net.Http.Headers;
+﻿using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Text;
@@ -61,7 +61,7 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
         builder.ConfigureServices(services =>
         {
             // Replace DB with a stable InMemory database for this factory instance.
-            // Guid must be captured once — evaluating NewGuid() inside the options lambda
+            // Guid must be captured once â€” evaluating NewGuid() inside the options lambda
             // would create a new empty database per DbContext scope.
             var dbName = "ScarAlphaApiTests_" + Guid.NewGuid().ToString("N");
 
@@ -82,7 +82,7 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
 
             Client.SetupGet(c => c.UserId).Returns("mock");
             Client.SetupGet(c => c.Lifecycle).Returns(SessionLifecycleState.Connected);
-            Client.Setup(c => c.ConnectAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            Client.Setup(c => c.ConnectAsync(It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>()))
                 .Returns(Task.CompletedTask);
             Client.Setup(c => c.ChangeAccountAsync(It.IsAny<AccountType>(), It.IsAny<CancellationToken>()))
                 .Returns(Task.CompletedTask);
@@ -128,10 +128,10 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
             var credAuth = new Mock<IBinollaCredentialAuth>();
             credAuth
                 .Setup(c => c.LoginAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
-                .ReturnsAsync("""42["authorization",{"isDemo":true,"token":"cred-login-token-abcdef"}]""");
+                .ReturnsAsync(new BinollaCapturedSession("""42["authorization",{"isDemo":true,"token":"cred-login-token-abcdef"}]""", null));
             credAuth
                 .Setup(c => c.SignUpAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
-                .ReturnsAsync("""42["authorization",{"isDemo":true,"token":"cred-signup-token-abcdef"}]""");
+                .ReturnsAsync(new BinollaCapturedSession("""42["authorization",{"isDemo":true,"token":"cred-signup-token-abcdef"}]""", null));
             services.AddSingleton(credAuth.Object);
 
             Client.Setup(c => c.PlaceOrderAsync(
@@ -162,8 +162,8 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
                     ClosedAt = DateTimeOffset.UtcNow
                 });
 
-            SessionManager.Setup(m => m.GetOrCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
-                .ReturnsAsync((string userId, string _, CancellationToken _) =>
+            SessionManager.Setup(m => m.GetOrCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>()))
+                .ReturnsAsync((string userId, string _, CancellationToken _, string? __) =>
                 {
                     ConnectedUsers[userId] = 1;
                     return Client.Object;
@@ -482,7 +482,7 @@ public sealed class TradeApiTests : IClassFixture<ApiFactory>
     [Fact]
     public async Task Disconnected_session_returns_controlled_error()
     {
-        // Login without connect → no BinollaLink / no session
+        // Login without connect â†’ no BinollaLink / no session
         var token = await LoginAsync(6003);
 
         using var req = new HttpRequestMessage(HttpMethod.Post, "/api/trades")
@@ -594,3 +594,4 @@ public sealed class TradeApiTests : IClassFixture<ApiFactory>
         return (await res.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("accessToken").GetString()!;
     }
 }
+

@@ -1,5 +1,6 @@
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using ScarAlpha.Binolla.Diagnostics;
 using ScarAlpha.Binolla.Models;
 using ScarAlpha.Binolla.Protocol;
 
@@ -31,9 +32,16 @@ internal sealed class SessionMessageRouter
 
     public async Task HandleRawAsync(string message, CancellationToken cancellationToken)
     {
-        // Engine.IO / Socket.IO control plane
-        if (message.StartsWith('0') && message.Contains("sid", StringComparison.Ordinal))
+        ProtocolTrace.Write("H12", "SessionMessageRouter.HandleRawAsync", "inbound", new
         {
+            kind = ProtocolTrace.Classify(message),
+            detail = ProtocolTrace.SafePrefix(message)
+        });
+
+        // Engine.IO OPEN — do not require "sid" substring (packet may vary).
+        if (message.StartsWith('0'))
+        {
+            ProtocolTrace.Write("H12", "SessionMessageRouter", "sending_ns_connect_40");
             await _sendAsync("40", cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -42,15 +50,20 @@ internal sealed class SessionMessageRouter
         // Some servers send "40" only; others send 40{"sid":"..."}.
         if (IsSocketIoNamespaceConnect(message))
         {
-            // Send auth frame (SSID) — never log token contents
             var ssid = _state.Ssid
                        ?? throw new BinollaAuthenticationException("SSID is missing.");
+            ProtocolTrace.Write("H12", "SessionMessageRouter", "sending_auth_frame", new
+            {
+                ssidLen = ssid.Length,
+                hasTokenField = ssid.Contains("\"token\"", StringComparison.Ordinal)
+            });
             await _sendAsync(ssid, cancellationToken).ConfigureAwait(false);
             return;
         }
 
         if (message.StartsWith("42") && message.Contains(BinollaWire.EvAuthorization, StringComparison.Ordinal))
         {
+            ProtocolTrace.Write("H12", "SessionMessageRouter", "s_authorization_text");
             await HandleAuthorizedAsync(cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -64,11 +77,16 @@ internal sealed class SessionMessageRouter
         if (message.StartsWith("451-[", StringComparison.Ordinal))
         {
             HandleBinaryHeader(message);
+            ProtocolTrace.Write("H12", "SessionMessageRouter", "binary_header", new
+            {
+                upcoming = _upcomingMessageType
+            });
             return;
         }
 
         if (message.StartsWith("42") && message.Contains("NotAuthorized", StringComparison.Ordinal))
         {
+            ProtocolTrace.Write("H13", "SessionMessageRouter", "not_authorized");
             _state.SetLifecycle(SessionLifecycleState.AuthenticationFailed, "SSID not authorized.");
             return;
         }
@@ -78,6 +96,13 @@ internal sealed class SessionMessageRouter
         {
             var type = _upcomingMessageType;
             _upcomingMessageType = string.Empty;
+            if (string.Equals(type, BinollaWire.EvAuthorization, StringComparison.Ordinal))
+            {
+                ProtocolTrace.Write("H12", "SessionMessageRouter", "s_authorization_binary");
+                await HandleAuthorizedAsync(cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
             await ProcessEventPayloadAsync(type, message).ConfigureAwait(false);
         }
     }
