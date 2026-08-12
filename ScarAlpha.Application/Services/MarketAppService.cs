@@ -113,8 +113,8 @@ public sealed class MarketAppService
     {
         if (string.IsNullOrWhiteSpace(asset))
             throw new ApiException(ApiErrorCodes.ValidationError, "asset is required.");
-        if (period is < 1 or > 3600)
-            throw new ApiException(ApiErrorCodes.ValidationError, "period must be between 1 and 3600 seconds.");
+        if (period is < 1 or > 14400)
+            throw new ApiException(ApiErrorCodes.ValidationError, "period must be between 1 and 14400 seconds.");
 
         await EnsureBotAccessAsync(ct);
         var client = RequireConnectedClient();

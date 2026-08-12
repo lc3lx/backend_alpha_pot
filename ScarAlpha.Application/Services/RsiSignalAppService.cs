@@ -32,8 +32,8 @@ public sealed class RsiSignalAppService
     {
         if (string.IsNullOrWhiteSpace(asset))
             throw new ApiException(ApiErrorCodes.ValidationError, "asset is required.");
-        if (periodSeconds is < 1 or > 3600)
-            throw new ApiException(ApiErrorCodes.ValidationError, "period must be between 1 and 3600 seconds.");
+        if (periodSeconds is < 1 or > 14400)
+            throw new ApiException(ApiErrorCodes.ValidationError, "period must be between 1 and 14400 seconds.");
 
         var access = await _botAccess.CheckAsync(_currentUser.UserId, ct);
         AccountAppService.EnsureConnectedForMarket(access);
