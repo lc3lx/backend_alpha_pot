@@ -33,8 +33,42 @@ public sealed class BotAccessService : IBotAccessService
         var approvalStatus = (link?.ApprovalStatus ?? AdminApprovalStatus.Pending).ToString();
         var adminApproved = link?.AdminApproved == true;
 
-        if (client is not null &&
-            client.Lifecycle is SessionLifecycleState.AuthenticationFailed or SessionLifecycleState.SessionExpired)
+        var deadSession = client is not null &&
+                          client.Lifecycle is SessionLifecycleState.AuthenticationFailed
+                              or SessionLifecycleState.SessionExpired;
+
+        // Approved/pending + Connected-in-DB but no live session (API restart / idle eviction / unauthorized):
+        // best-effort lazy restore before reporting disconnect / session expired.
+        // Do NOT sticky-return SessionExpired on a dead in-memory session — try restore first.
+        if ((!connected || deadSession) &&
+            link is not null &&
+            link.Status == BinollaLinkStatus.Connected &&
+            link.ApprovalStatus != AdminApprovalStatus.Rejected &&
+            !string.IsNullOrWhiteSpace(link.EncryptedSsid))
+        {
+            try
+            {
+                if (deadSession)
+                    _restorer.ClearAuthFailure(userId);
+
+                connected = await _restorer.TryRestoreUserAsync(userId, ct);
+                if (connected)
+                {
+                    client = _sessions.Get(userId.ToString());
+                    link = await _links.GetByUserIdAsync(userId, ct) ?? link;
+                    accountType = link.AccountType.ToString();
+                    approvalStatus = link.ApprovalStatus.ToString();
+                    adminApproved = link.AdminApproved;
+                    deadSession = false;
+                }
+            }
+            catch
+            {
+                connected = false;
+            }
+        }
+
+        if (deadSession && !connected)
         {
             return new BotAccessResult(
                 BotAccessState.SessionExpired,
@@ -44,45 +78,18 @@ public sealed class BotAccessService : IBotAccessService
                 ApprovalStatus: approvalStatus);
         }
 
-        // Approved/pending + Connected-in-DB but no live session (API restart / idle eviction / unauthorized):
-        // best-effort lazy restore before reporting BinollaNotConnected.
-        // Pending users still need market browse; only Rejected stays blocked.
-        if (!connected &&
-            link is not null &&
-            link.Status == BinollaLinkStatus.Connected &&
-            link.ApprovalStatus != AdminApprovalStatus.Rejected &&
-            !string.IsNullOrWhiteSpace(link.EncryptedSsid))
-        {
-            try
-            {
-                connected = await _restorer.TryRestoreUserAsync(userId, ct);
-                if (connected)
-                {
-                    client = _sessions.Get(userId.ToString());
-                    link = await _links.GetByUserIdAsync(userId, ct) ?? link;
-                    accountType = (link.AccountType).ToString();
-                    approvalStatus = link.ApprovalStatus.ToString();
-                    adminApproved = link.AdminApproved;
-                }
-            }
-            catch
-            {
-                connected = false;
-            }
-        }
-
         if (link is null || link.Status != BinollaLinkStatus.Connected || !connected)
         {
-            // After failed restore of an expired SSID, Status may be Disconnected while still Approved.
+            // After failed restore of an expired SSID, Status may be Disconnected while still linked.
             if (link is not null &&
-                link.AdminApproved &&
-                link.ApprovalStatus == AdminApprovalStatus.Approved &&
-                link.Status == BinollaLinkStatus.Disconnected)
+                link.Status == BinollaLinkStatus.Disconnected &&
+                link.ApprovalStatus != AdminApprovalStatus.Rejected &&
+                !string.IsNullOrWhiteSpace(link.EncryptedSsid))
             {
                 return new BotAccessResult(
                     BotAccessState.SessionExpired,
                     BinollaConnected: false,
-                    AdminApproved: true,
+                    AdminApproved: adminApproved,
                     AccountType: accountType,
                     ApprovalStatus: approvalStatus);
             }

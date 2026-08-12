@@ -147,6 +147,8 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
             .ConfigureAwait(false);
     }
 
+    public void ClearAuthFailure(Guid userId) => _authFailed.TryRemove(userId, out _);
+
     private bool IsLive(Guid userId)
     {
         var client = _sessions.Get(userId.ToString());

@@ -39,10 +39,15 @@ public interface IBinollaSessionRestorer
     Task RestoreApprovedSessionsAsync(CancellationToken ct = default);
 
     /// <summary>
-    /// Best-effort restore for a single approved user (lazy path after idle eviction / mid-restore).
+    /// Best-effort restore for a single approved/pending user (lazy path after idle eviction / mid-restore).
     /// Returns true when a live Connected/Reconnected session exists afterwards.
     /// </summary>
     Task<bool> TryRestoreUserAsync(Guid userId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Clears the sticky auth-failure skip so a fresh credential login can restore again.
+    /// </summary>
+    void ClearAuthFailure(Guid userId);
 }
 
 public enum StrategyCatalogStatus

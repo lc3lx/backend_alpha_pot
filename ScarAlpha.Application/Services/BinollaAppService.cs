@@ -19,6 +19,7 @@ public sealed class BinollaAppService
     private readonly IBinollaSessionManager _sessions;
     private readonly IBotAccessService _access;
     private readonly IBinollaCredentialAuth _credentialAuth;
+    private readonly IBinollaSessionRestorer _restorer;
     private readonly ILogger<BinollaAppService> _logger;
 
     public BinollaAppService(
@@ -28,6 +29,7 @@ public sealed class BinollaAppService
         IBinollaSessionManager sessions,
         IBotAccessService access,
         IBinollaCredentialAuth credentialAuth,
+        IBinollaSessionRestorer restorer,
         ILogger<BinollaAppService> logger)
     {
         _currentUser = currentUser;
@@ -36,6 +38,7 @@ public sealed class BinollaAppService
         _sessions = sessions;
         _access = access;
         _credentialAuth = credentialAuth;
+        _restorer = restorer;
         _logger = logger;
     }
 
@@ -131,6 +134,9 @@ public sealed class BinollaAppService
 
         try
         {
+            // Allow reconnect after a prior SSID auth failure / unauthorized drop.
+            _restorer.ClearAuthFailure(userId);
+
             var client = await _sessions.GetOrCreateAsync(
                 userId.ToString(),
                 request.Ssid.Trim(),
