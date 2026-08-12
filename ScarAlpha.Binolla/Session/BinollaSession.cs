@@ -134,35 +134,11 @@ public sealed class BinollaSession : IBinollaClient
             // best effort
         }
 
-        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        Volatile.Write(ref _balanceTcs, tcs);
-
-        if (State.BalanceUpdatedAt is not null)
-            tcs.TrySetResult(true);
-
-        try
-        {
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeoutCts.CancelAfter(_options.MarketDataTimeout);
-
-            await using var reg = timeoutCts.Token.Register(() =>
-            {
-                if (cancellationToken.IsCancellationRequested)
-                    tcs.TrySetCanceled(cancellationToken);
-                else
-                    tcs.TrySetException(new BinollaTimeoutException("Balance wait timed out."));
-            });
-
-            await tcs.Task.ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-        {
-            throw new BinollaTimeoutException("Balance wait timed out.");
-        }
-        finally
-        {
-            Interlocked.CompareExchange(ref _balanceTcs, null, tcs);
-        }
+        await WaitForConditionAsync(
+                () => State.BalanceUpdatedAt is not null,
+                _options.MarketDataTimeout,
+                cancellationToken)
+            .ConfigureAwait(false);
 
         if (State.BalanceUpdatedAt is null)
             throw new BinollaTimeoutException("Balance was not received in time.");
@@ -323,8 +299,8 @@ public sealed class BinollaSession : IBinollaClient
                 historyCount = State.HistoricalData.Count
             });
             // #endregion
-            await transport.SendAsync(BinollaFraming.BuildAlertList(), cancellationToken).ConfigureAwait(false);
-            await transport.SendAsync(BinollaFraming.BuildAlertClosedList(), cancellationToken).ConfigureAwait(false);
+            // Only asset/change — alert/list on every quote tick flooded the socket and
+            // interleaved with binary history/quote attachments.
             await transport.SendAsync(BinollaFraming.BuildAssetChange(pair, period), cancellationToken).ConfigureAwait(false);
             State.RememberSubscription(pair);
         }

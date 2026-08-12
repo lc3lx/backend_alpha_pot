@@ -40,7 +40,8 @@ internal sealed class SessionMessageRouter
         {
             kind = ProtocolTrace.Classify(message),
             detail = ProtocolTrace.SafePrefix(message),
-            lifecycle = _state.Lifecycle.ToString()
+            lifecycle = _state.Lifecycle.ToString(),
+            hasUpcoming = !string.IsNullOrEmpty(_upcomingMessageType)
         });
 
         // Engine.IO OPEN — do not require "sid" substring (packet may vary).
@@ -64,24 +65,6 @@ internal sealed class SessionMessageRouter
             });
             await _sendAsync(ssid, cancellationToken).ConfigureAwait(false);
             return;
-        }
-
-        if (message.StartsWith("42") && message.Contains(BinollaWire.EvAuthorization, StringComparison.Ordinal))
-        {
-            ProtocolTrace.Write("H15", "SessionMessageRouter", "s_authorization_text");
-            await EnsureAuthorizedAsync(cancellationToken).ConfigureAwait(false);
-            return;
-        }
-
-        // Live evidence: Binolla may omit text s_authorization and still push post-auth events.
-        if (message.StartsWith("42") && IsPostAuthSignal(message))
-        {
-            ProtocolTrace.Write("H15", "SessionMessageRouter", "post_auth_text_signal", new
-            {
-                kind = ProtocolTrace.Classify(message)
-            });
-            await EnsureAuthorizedAsync(cancellationToken).ConfigureAwait(false);
-            // continue — may still be a normal event with no payload
         }
 
         if (message == "2")
@@ -112,15 +95,58 @@ internal sealed class SessionMessageRouter
             return;
         }
 
-        if (message.StartsWith("42") && message.Contains("NotAuthorized", StringComparison.Ordinal))
+        // Complete Socket.IO text events: 42["event", payload]
+        if (message.StartsWith("42", StringComparison.Ordinal))
         {
-            ProtocolTrace.Write("H13", "SessionMessageRouter", "not_authorized");
-            _state.SetLifecycle(SessionLifecycleState.AuthenticationFailed, "SSID not authorized.");
+            if (message.Contains("NotAuthorized", StringComparison.Ordinal))
+            {
+                ProtocolTrace.Write("H13", "SessionMessageRouter", "not_authorized");
+                _state.SetLifecycle(SessionLifecycleState.AuthenticationFailed, "SSID not authorized.");
+                return;
+            }
+
+            if (TryParseSocketIoEvent(message, out var eventName, out var payload))
+            {
+                if (string.Equals(eventName, BinollaWire.EvAuthorization, StringComparison.Ordinal) ||
+                    IsPostAuthSignal(eventName))
+                {
+                    ProtocolTrace.Write("H15", "SessionMessageRouter", "post_auth_text_event", new
+                    {
+                        eventName
+                    });
+                    await EnsureAuthorizedAsync(cancellationToken).ConfigureAwait(false);
+                }
+
+                // #region agent log
+                ProtocolTrace.Write("H30", "SessionMessageRouter.HandleRawAsync", "text_event", new
+                {
+                    eventName,
+                    payloadLen = payload.Length
+                });
+                // #endregion
+
+                await ProcessEventPayloadAsync(eventName, payload).ConfigureAwait(false);
+                return;
+            }
+
+            // Auth-only text frames without a parseable payload array.
+            if (message.Contains(BinollaWire.EvAuthorization, StringComparison.Ordinal) ||
+                IsPostAuthSignal(message))
+            {
+                ProtocolTrace.Write("H15", "SessionMessageRouter", "post_auth_text_signal", new
+                {
+                    kind = ProtocolTrace.Classify(message)
+                });
+                await EnsureAuthorizedAsync(cancellationToken).ConfigureAwait(false);
+            }
+
             return;
         }
 
-        // Binary payload following 451-[type] (may arrive as WS binary decoded to UTF-8 text)
-        if (!string.IsNullOrEmpty(_upcomingMessageType))
+        // Binary payload following 451-[type] (WS binary decoded to UTF-8).
+        // Never treat Engine.IO / Socket.IO control or event frames as attachment payloads —
+        // that previously corrupted balances/quotes/history waits.
+        if (!string.IsNullOrEmpty(_upcomingMessageType) && !LooksLikeEngineIoPacket(message))
         {
             var type = _upcomingMessageType;
             _upcomingMessageType = string.Empty;
@@ -131,7 +157,72 @@ internal sealed class SessionMessageRouter
                 await EnsureAuthorizedAsync(cancellationToken).ConfigureAwait(false);
             }
 
+            // #region agent log
+            ProtocolTrace.Write("H30", "SessionMessageRouter.HandleRawAsync", "binary_payload", new
+            {
+                type,
+                payloadLen = message.Length
+            });
+            // #endregion
+
             await ProcessEventPayloadAsync(type, message).ConfigureAwait(false);
+        }
+        else if (!string.IsNullOrEmpty(_upcomingMessageType))
+        {
+            // #region agent log
+            ProtocolTrace.Write("H30", "SessionMessageRouter.HandleRawAsync", "binary_payload_skipped_control", new
+            {
+                upcoming = _upcomingMessageType,
+                kind = ProtocolTrace.Classify(message)
+            });
+            // #endregion
+        }
+    }
+
+    private static bool LooksLikeEngineIoPacket(string message)
+    {
+        if (string.IsNullOrEmpty(message)) return true;
+        if (message is "2" or "3") return true;
+        if (message.StartsWith('0')) return true;
+        if (message.StartsWith('4')) return true; // 40/41/42/451…
+        return false;
+    }
+
+    /// <summary>Parse <c>42["eventName", payload]</c> into name + JSON payload text.</summary>
+    internal static bool TryParseSocketIoEvent(string message, out string eventName, out string payload)
+    {
+        eventName = string.Empty;
+        payload = string.Empty;
+        if (!message.StartsWith("42[", StringComparison.Ordinal))
+            return false;
+
+        try
+        {
+            var arr = JsonConvert.DeserializeObject<JArray>(message[2..]);
+            if (arr is null || arr.Count < 1)
+                return false;
+
+            eventName = arr[0]?.ToString() ?? string.Empty;
+            if (string.IsNullOrEmpty(eventName))
+                return false;
+
+            if (arr.Count == 1)
+            {
+                payload = "{}";
+                return true;
+            }
+
+            var token = arr[1];
+            payload = token is null || token.Type == JTokenType.Null
+                ? "null"
+                : token.Type is JTokenType.String or JTokenType.Integer or JTokenType.Float or JTokenType.Boolean
+                    ? token.ToString(Formatting.None)
+                    : token.ToString(Formatting.None);
+            return true;
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -265,12 +356,32 @@ internal sealed class SessionMessageRouter
 
     private void ProcessBalanceList(string content)
     {
-        var balanceData = JsonConvert.DeserializeObject<Dictionary<string, object>>(content);
-        if (balanceData is null) return;
+        try
+        {
+            var balanceData = JsonConvert.DeserializeObject<JObject>(content);
+            if (balanceData is null) return;
 
-        decimal? demo = balanceData.TryGetValue("demoBalance", out var d) ? Convert.ToDecimal(d) : null;
-        decimal? real = balanceData.TryGetValue("liveBalance", out var r) ? Convert.ToDecimal(r) : null;
-        _state.UpdateBalance(demo, real);
+            decimal? demo = balanceData["demoBalance"]?.Value<decimal?>()
+                            ?? balanceData["demo"]?.Value<decimal?>();
+            decimal? real = balanceData["liveBalance"]?.Value<decimal?>()
+                            ?? balanceData["realBalance"]?.Value<decimal?>()
+                            ?? balanceData["live"]?.Value<decimal?>();
+
+            // #region agent log
+            ProtocolTrace.Write("H31", "SessionMessageRouter.ProcessBalanceList", "balance_list", new
+            {
+                hasDemo = demo.HasValue,
+                hasReal = real.HasValue
+            });
+            // #endregion
+
+            if (demo is null && real is null) return;
+            _state.UpdateBalance(demo, real);
+        }
+        catch
+        {
+            // ignore malformed balance payloads
+        }
     }
 
     private void ProcessOrderOpen(string content)
