@@ -1,6 +1,5 @@
 using System.Net.WebSockets;
 using System.Text;
-using ScarAlpha.Binolla.Diagnostics;
 
 namespace ScarAlpha.Binolla.Transport;
 
@@ -15,7 +14,6 @@ public sealed class ClientWebSocketTransport : IWebSocketTransport
     private CancellationTokenSource? _receiveCts;
     private Task? _receiveTask;
     private int _connected;
-    private int _frameCount;
 
     public bool IsConnected => Interlocked.CompareExchange(ref _connected, 0, 0) == 1
                                && _socket?.State == WebSocketState.Open;
@@ -60,13 +58,6 @@ public sealed class ClientWebSocketTransport : IWebSocketTransport
         // Prefer CookieContainer over raw Cookie header (raw Cookie often breaks/blackholes Engine.IO on Linux).
         ApplyCookies(socket, uri, cookieHeader);
 
-        ProtocolTrace.Write("H17", "ClientWebSocketTransport.ConnectAsync", "ws_handshake_start", new
-        {
-            host = uri.Host,
-            hasCookieContainer = socket.Options.Cookies is not null,
-            cookieLen = cookieHeader?.Length ?? 0
-        });
-
         await socket.ConnectAsync(uri, cancellationToken).ConfigureAwait(false);
 
         lock (_gate)
@@ -75,14 +66,8 @@ public sealed class ClientWebSocketTransport : IWebSocketTransport
             // Independent CTS — must NOT die when the connect caller's token is replaced/completed.
             _receiveCts = new CancellationTokenSource();
             Interlocked.Exchange(ref _connected, 1);
-            Interlocked.Exchange(ref _frameCount, 0);
             _receiveTask = Task.Run(() => ReceiveLoopAsync(_receiveCts.Token), CancellationToken.None);
         }
-
-        ProtocolTrace.Write("H17", "ClientWebSocketTransport.ConnectAsync", "ws_handshake_ok", new
-        {
-            state = socket.State.ToString()
-        });
     }
 
     public async Task SendAsync(string message, CancellationToken cancellationToken)
@@ -110,9 +95,6 @@ public sealed class ClientWebSocketTransport : IWebSocketTransport
         var buffer = new byte[1024 * 64];
         using var messageBuffer = new MemoryStream();
         Exception? error = null;
-        WebSocketCloseStatus? closeStatus = null;
-
-        ProtocolTrace.Write("H17", "ClientWebSocketTransport.ReceiveLoopAsync", "receive_loop_start");
 
         try
         {
@@ -125,15 +107,7 @@ public sealed class ClientWebSocketTransport : IWebSocketTransport
 
                 var result = await socket.ReceiveAsync(buffer, cancellationToken).ConfigureAwait(false);
                 if (result.MessageType == WebSocketMessageType.Close)
-                {
-                    closeStatus = result.CloseStatus;
-                    ProtocolTrace.Write("H17", "ClientWebSocketTransport.ReceiveLoopAsync", "ws_close_frame", new
-                    {
-                        status = result.CloseStatus?.ToString(),
-                        descLen = result.CloseStatusDescription?.Length ?? 0
-                    });
                     break;
-                }
 
                 if (result.MessageType is WebSocketMessageType.Text or WebSocketMessageType.Binary)
                 {
@@ -146,44 +120,20 @@ public sealed class ClientWebSocketTransport : IWebSocketTransport
                     if (string.IsNullOrWhiteSpace(text))
                         continue;
 
-                    var n = Interlocked.Increment(ref _frameCount);
-                    if (n <= 3)
-                    {
-                        ProtocolTrace.Write("H17", "ClientWebSocketTransport.ReceiveLoopAsync", "ws_frame", new
-                        {
-                            n,
-                            kind = result.MessageType.ToString(),
-                            len = text.Length,
-                            prefix = text.Length <= 24 ? text : text[..24]
-                        });
-                    }
-
                     TextMessageReceived?.Invoke(text);
                 }
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            ProtocolTrace.Write("H17", "ClientWebSocketTransport.ReceiveLoopAsync", "receive_canceled");
         }
         catch (Exception ex)
         {
             error = ex;
-            ProtocolTrace.Write("H17", "ClientWebSocketTransport.ReceiveLoopAsync", "receive_error", new
-            {
-                type = ex.GetType().Name,
-                message = ex.Message.Length > 120 ? ex.Message[..120] : ex.Message
-            });
         }
         finally
         {
             Interlocked.Exchange(ref _connected, 0);
-            ProtocolTrace.Write("H17", "ClientWebSocketTransport.ReceiveLoopAsync", "receive_loop_end", new
-            {
-                frames = Volatile.Read(ref _frameCount),
-                closeStatus = closeStatus?.ToString(),
-                err = error?.GetType().Name
-            });
             Closed?.Invoke(error);
         }
     }
@@ -213,20 +163,10 @@ public sealed class ClientWebSocketTransport : IWebSocketTransport
                 return;
 
             socket.Options.Cookies = container;
-            // #region agent log
-            ProtocolTrace.Write("H41", "ClientWebSocketTransport.ApplyCookies", "cookie_container_applied", new
-            {
-                added,
-                host = uri.Host
-            });
-            // #endregion
         }
-        catch (Exception ex)
+        catch
         {
-            ProtocolTrace.Write("H41", "ClientWebSocketTransport.ApplyCookies", "cookie_container_failed", new
-            {
-                type = ex.GetType().Name
-            });
+            // Cookie parse/apply failures are non-fatal; connect proceeds without cookies.
         }
     }
 

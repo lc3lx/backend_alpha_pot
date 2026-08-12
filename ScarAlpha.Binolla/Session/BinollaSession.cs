@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using ScarAlpha.Binolla.Abstractions;
-using ScarAlpha.Binolla.Diagnostics;
 using ScarAlpha.Binolla.Models;
 using ScarAlpha.Binolla.Protocol;
 using ScarAlpha.Binolla.Transport;
@@ -78,13 +77,6 @@ public sealed class BinollaSession : IBinollaClient
             _sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             _reconnectAttempts = 0;
 
-            ProtocolTrace.Write("H12", "BinollaSession.ConnectAsync", "connecting", new
-            {
-                hasCookie = !string.IsNullOrEmpty(State.CookieHeader),
-                cookieLen = State.CookieHeader?.Length ?? 0,
-                ssidLen = ssid.Length
-            });
-
             await ConnectSocketsAsync(_sessionCts.Token).ConfigureAwait(false);
             await WaitForAuthenticationAsync(cancellationToken).ConfigureAwait(false);
 
@@ -93,11 +85,6 @@ public sealed class BinollaSession : IBinollaClient
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            ProtocolTrace.Write("H12", "BinollaSession.ConnectAsync", "connect_failed", new
-            {
-                type = ex.GetType().Name,
-                message = ex.Message
-            });
             SetLifecycle(
                 ex is BinollaAuthenticationException
                     ? SessionLifecycleState.AuthenticationFailed
@@ -134,28 +121,11 @@ public sealed class BinollaSession : IBinollaClient
             // best effort
         }
 
-        try
-        {
-            await WaitForConditionAsync(
-                    () => State.BalanceUpdatedAt is not null,
-                    _options.MarketDataTimeout,
-                    cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            // #region agent log
-            ProtocolTrace.Write("H42", "BinollaSession.GetBalanceAsync", "balance_wait_fail", new
-            {
-                exType = ex.GetType().Name,
-                clientAbort = cancellationToken.IsCancellationRequested,
-                lifecycle = State.Lifecycle.ToString(),
-                hasBalance = State.BalanceUpdatedAt is not null,
-                hasCookie = !string.IsNullOrEmpty(State.CookieHeader)
-            });
-            // #endregion
-            throw;
-        }
+        await WaitForConditionAsync(
+                () => State.BalanceUpdatedAt is not null,
+                _options.MarketDataTimeout,
+                cancellationToken)
+            .ConfigureAwait(false);
 
         if (State.BalanceUpdatedAt is null)
             throw new BinollaTimeoutException("Balance was not received in time.");
@@ -305,17 +275,6 @@ public sealed class BinollaSession : IBinollaClient
         await _subscribeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            // #region agent log
-            ProtocolTrace.Write("H18", "BinollaSession.SubscribePairAsync", "subscribe_send", new
-            {
-                pair,
-                period,
-                quoteCached = State.LatestQuotes.ContainsKey(pair.Trim()),
-                historyCached = State.HistoricalData.ContainsKey($"{pair.Trim()}:{period}"),
-                quoteCount = State.LatestQuotes.Count,
-                historyCount = State.HistoricalData.Count
-            });
-            // #endregion
             // Only asset/change — alert/list on every quote tick flooded the socket and
             // interleaved with binary history/quote attachments.
             await transport.SendAsync(BinollaFraming.BuildAssetChange(pair, period), cancellationToken).ConfigureAwait(false);
@@ -376,44 +335,17 @@ public sealed class BinollaSession : IBinollaClient
         await SubscribePairAsync(key, 60, cancellationToken).ConfigureAwait(false);
 
         if (State.LatestQuotes.TryGetValue(key, out var existing))
-        {
-            // #region agent log
-            ProtocolTrace.Write("H18", "BinollaSession.GetLatestQuoteAsync", "quote_cache_hit", new { key, price = existing.Price });
-            // #endregion
             return existing;
-        }
 
-        try
-        {
-            await WaitForConditionAsync(
-                    () => State.LatestQuotes.ContainsKey(key),
-                    _options.MarketDataTimeout,
-                    cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            // #region agent log
-            ProtocolTrace.Write("H19", "BinollaSession.GetLatestQuoteAsync", "quote_wait_fail", new
-            {
-                key,
-                exType = ex.GetType().Name,
-                clientAbort = cancellationToken.IsCancellationRequested,
-                quoteKeys = State.LatestQuotes.Keys.Take(8).ToArray(),
-                quoteCount = State.LatestQuotes.Count,
-                lifecycle = State.Lifecycle.ToString(),
-                runId = "post-fix"
-            });
-            // #endregion
-            throw;
-        }
+        await WaitForConditionAsync(
+                () => State.LatestQuotes.ContainsKey(key),
+                _options.MarketDataTimeout,
+                cancellationToken)
+            .ConfigureAwait(false);
 
         if (!State.LatestQuotes.TryGetValue(key, out var quote))
             throw new BinollaTimeoutException("Quote not available for asset.");
 
-        // #region agent log
-        ProtocolTrace.Write("H18", "BinollaSession.GetLatestQuoteAsync", "quote_ok", new { key, price = quote.Price });
-        // #endregion
         return quote;
     }
 
@@ -432,52 +364,17 @@ public sealed class BinollaSession : IBinollaClient
         await SubscribePairAsync(key, period, cancellationToken).ConfigureAwait(false);
 
         if (State.HistoricalData.TryGetValue(historyKey, out var existing))
-        {
-            // #region agent log
-            ProtocolTrace.Write("H20", "BinollaSession.GetHistoryAsync", "history_cache_hit", new
-            {
-                historyKey,
-                candles = existing.Candles.Count
-            });
-            // #endregion
             return existing;
-        }
 
-        try
-        {
-            await WaitForConditionAsync(
-                    () => State.HistoricalData.ContainsKey(historyKey),
-                    _options.MarketDataTimeout,
-                    cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            // #region agent log
-            ProtocolTrace.Write("H20", "BinollaSession.GetHistoryAsync", "history_wait_fail", new
-            {
-                historyKey,
-                period,
-                exType = ex.GetType().Name,
-                clientAbort = cancellationToken.IsCancellationRequested,
-                historyKeys = State.HistoricalData.Keys.Take(8).ToArray(),
-                historyCount = State.HistoricalData.Count,
-                lifecycle = State.Lifecycle.ToString()
-            });
-            // #endregion
-            throw;
-        }
+        await WaitForConditionAsync(
+                () => State.HistoricalData.ContainsKey(historyKey),
+                _options.MarketDataTimeout,
+                cancellationToken)
+            .ConfigureAwait(false);
 
         if (!State.HistoricalData.TryGetValue(historyKey, out var history))
             throw new BinollaTimeoutException("History not available for asset/period.");
 
-        // #region agent log
-        ProtocolTrace.Write("H20", "BinollaSession.GetHistoryAsync", "history_ok", new
-        {
-            historyKey,
-            candles = history.Candles.Count
-        });
-        // #endregion
         return history;
     }
 
@@ -563,7 +460,6 @@ public sealed class BinollaSession : IBinollaClient
             outcome => OnOrderClosed?.Invoke(outcome),
             onAuthorized: () =>
             {
-                ProtocolTrace.Write("H16", "BinollaSession", "auth_signal_early");
                 _authTcs?.TrySetResult(true);
             });
 
@@ -597,17 +493,7 @@ public sealed class BinollaSession : IBinollaClient
         if (!string.IsNullOrWhiteSpace(State.CookieHeader))
             headers["Cookie"] = State.CookieHeader;
 
-        ProtocolTrace.Write("H14", "BinollaSession.ConnectSocketsAsync", "ws_connect_start", new
-        {
-            host = tradingUri.Host,
-            hasCookie = !string.IsNullOrWhiteSpace(State.CookieHeader),
-            cookieCaptured = !string.IsNullOrWhiteSpace(State.CookieHeader),
-            queryHasT = tradingUri.Query.Contains("t=", StringComparison.Ordinal)
-        });
-
         await _trading.ConnectAsync(tradingUri, headers, cancellationToken).ConfigureAwait(false);
-
-        ProtocolTrace.Write("H14", "BinollaSession.ConnectSocketsAsync", "ws_tcp_connected");
 
         if (_options.EnableChartConnection)
         {
@@ -679,10 +565,6 @@ public sealed class BinollaSession : IBinollaClient
         // Previously ignored closes during Connecting — auth then hung until timeout with zero frames.
         if (Lifecycle is SessionLifecycleState.Connecting)
         {
-            ProtocolTrace.Write("H17", "BinollaSession.OnTradingClosed", "closed_during_auth", new
-            {
-                err = error?.GetType().Name
-            });
             var authFail = new BinollaConnectionException(
                 error is null ? "WebSocket closed during authentication." : "WebSocket lost during authentication.");
             _authTcs?.TrySetException(authFail);
@@ -762,12 +644,6 @@ public sealed class BinollaSession : IBinollaClient
     {
         var tcs = _authTcs ?? throw new InvalidOperationException("Auth waiter missing.");
 
-        ProtocolTrace.Write("H16", "BinollaSession.WaitForAuthenticationAsync", "auth_wait_start", new
-        {
-            timeoutSec = _options.AuthenticationTimeout.TotalSeconds,
-            lifecycle = State.Lifecycle.ToString()
-        });
-
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeoutCts.CancelAfter(_options.AuthenticationTimeout);
 
@@ -785,17 +661,8 @@ public sealed class BinollaSession : IBinollaClient
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            ProtocolTrace.Write("H16", "BinollaSession.WaitForAuthenticationAsync", "auth_wait_timeout", new
-            {
-                lifecycle = State.Lifecycle.ToString()
-            });
             throw new BinollaTimeoutException("Authentication timed out.");
         }
-
-        ProtocolTrace.Write("H16", "BinollaSession.WaitForAuthenticationAsync", "auth_wait_done", new
-        {
-            lifecycle = State.Lifecycle.ToString()
-        });
 
         if (State.Lifecycle == SessionLifecycleState.AuthenticationFailed)
             throw new BinollaAuthenticationException("SSID not authorized.");

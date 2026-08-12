@@ -1,6 +1,5 @@
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
-using ScarAlpha.Binolla.Diagnostics;
 using ScarAlpha.Binolla.Models;
 using ScarAlpha.Binolla.Protocol;
 
@@ -37,18 +36,9 @@ internal sealed class SessionMessageRouter
 
     public async Task HandleRawAsync(string message, CancellationToken cancellationToken)
     {
-        ProtocolTrace.Write("H12", "SessionMessageRouter.HandleRawAsync", "inbound", new
-        {
-            kind = ProtocolTrace.Classify(message),
-            detail = ProtocolTrace.SafePrefix(message),
-            lifecycle = _state.Lifecycle.ToString(),
-            hasUpcoming = !string.IsNullOrEmpty(_upcomingMessageType)
-        });
-
         // Engine.IO OPEN — do not require "sid" substring (packet may vary).
         if (message.StartsWith('0'))
         {
-            ProtocolTrace.Write("H12", "SessionMessageRouter", "sending_ns_connect_40");
             await _sendAsync("40", cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -59,11 +49,6 @@ internal sealed class SessionMessageRouter
         {
             var ssid = _state.Ssid
                        ?? throw new BinollaAuthenticationException("SSID is missing.");
-            ProtocolTrace.Write("H12", "SessionMessageRouter", "sending_auth_frame", new
-            {
-                ssidLen = ssid.Length,
-                hasTokenField = ssid.Contains("\"token\"", StringComparison.Ordinal)
-            });
             await _sendAsync(ssid, cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -77,20 +62,10 @@ internal sealed class SessionMessageRouter
         if (message.StartsWith("451-[", StringComparison.Ordinal))
         {
             HandleBinaryHeader(message);
-            ProtocolTrace.Write("H12", "SessionMessageRouter", "binary_header", new
-            {
-                upcoming = _upcomingMessageType
-            });
 
             // Auth success payload — do not bootstrap on the 451 header alone (that raced
             // bootstrap commands and produced live 42["unauthorized"] storms).
-            if (string.Equals(_upcomingMessageType, BinollaWire.EvAuthorization, StringComparison.Ordinal))
-            {
-                ProtocolTrace.Write("H15", "SessionMessageRouter", "post_auth_binary_header", new
-                {
-                    upcoming = _upcomingMessageType
-                });
-            }
+            // Authorization is completed when the binary attachment arrives.
 
             return;
         }
@@ -111,20 +86,8 @@ internal sealed class SessionMessageRouter
                 if (string.Equals(eventName, BinollaWire.EvAuthorization, StringComparison.Ordinal) ||
                     IsPostAuthSignal(eventName))
                 {
-                    ProtocolTrace.Write("H15", "SessionMessageRouter", "post_auth_text_event", new
-                    {
-                        eventName
-                    });
                     await EnsureAuthorizedAsync(cancellationToken).ConfigureAwait(false);
                 }
-
-                // #region agent log
-                ProtocolTrace.Write("H30", "SessionMessageRouter.HandleRawAsync", "text_event", new
-                {
-                    eventName,
-                    payloadLen = payload.Length
-                });
-                // #endregion
 
                 await ProcessEventPayloadAsync(eventName, payload).ConfigureAwait(false);
                 return;
@@ -134,10 +97,6 @@ internal sealed class SessionMessageRouter
             if (message.Contains(BinollaWire.EvAuthorization, StringComparison.Ordinal) ||
                 IsPostAuthSignal(message))
             {
-                ProtocolTrace.Write("H15", "SessionMessageRouter", "post_auth_text_signal", new
-                {
-                    kind = ProtocolTrace.Classify(message)
-                });
                 await EnsureAuthorizedAsync(cancellationToken).ConfigureAwait(false);
             }
 
@@ -154,43 +113,16 @@ internal sealed class SessionMessageRouter
             if (string.Equals(type, BinollaWire.EvAuthorization, StringComparison.Ordinal) ||
                 IsPostAuthSignal(type))
             {
-                ProtocolTrace.Write("H15", "SessionMessageRouter", "post_auth_payload", new { type });
                 await EnsureAuthorizedAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            // #region agent log
-            ProtocolTrace.Write("H30", "SessionMessageRouter.HandleRawAsync", "binary_payload", new
-            {
-                type,
-                payloadLen = message.Length
-            });
-            // #endregion
-
             await ProcessEventPayloadAsync(type, message).ConfigureAwait(false);
-        }
-        else if (!string.IsNullOrEmpty(_upcomingMessageType))
-        {
-            // #region agent log
-            ProtocolTrace.Write("H30", "SessionMessageRouter.HandleRawAsync", "binary_payload_skipped_control", new
-            {
-                upcoming = _upcomingMessageType,
-                kind = ProtocolTrace.Classify(message)
-            });
-            // #endregion
         }
     }
 
     private async Task HandleUnauthorizedAsync(CancellationToken cancellationToken)
     {
         var lifecycle = _state.Lifecycle;
-        // #region agent log
-        ProtocolTrace.Write("H40", "SessionMessageRouter.HandleUnauthorizedAsync", "unauthorized_received", new
-        {
-            lifecycle = lifecycle.ToString(),
-            hadAuth = Volatile.Read(ref _authorized) == 1,
-            reauthSent = Volatile.Read(ref _unauthorizedReauthSent) == 1
-        });
-        // #endregion
 
         // During initial handshake, unauthorized means the SSID was rejected — fail fast.
         // Re-auth loops here caused repeated bootstrap and empty quotes/balance in production.
@@ -210,10 +142,6 @@ internal sealed class SessionMessageRouter
             Interlocked.Exchange(ref _authorized, 0);
             _state.ResetMarketCaches();
             _state.ClearSubscriptions();
-            ProtocolTrace.Write("H40", "SessionMessageRouter.HandleUnauthorizedAsync", "unauthorized_reauth_send", new
-            {
-                ssidLen = _state.Ssid!.Length
-            });
             await _sendAsync(_state.Ssid, cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -287,11 +215,6 @@ internal sealed class SessionMessageRouter
 
         // Do NOT reset unauthorizedReauthSent here — that re-enabled infinite
         // unauthorized → reauth → bootstrap loops in production.
-
-        ProtocolTrace.Write("H15", "SessionMessageRouter", "ensure_authorized_enter", new
-        {
-            priorLifecycle = _state.Lifecycle.ToString()
-        });
 
         // Mark Connected + unblock WaitForAuthentication BEFORE bootstrap sends.
         _state.SetLifecycle(
@@ -424,14 +347,6 @@ internal sealed class SessionMessageRouter
                             ?? balanceData["realBalance"]?.Value<decimal?>()
                             ?? balanceData["live"]?.Value<decimal?>();
 
-            // #region agent log
-            ProtocolTrace.Write("H31", "SessionMessageRouter.ProcessBalanceList", "balance_list", new
-            {
-                hasDemo = demo.HasValue,
-                hasReal = real.HasValue
-            });
-            // #endregion
-
             if (demo is null && real is null) return;
             _state.UpdateBalance(demo, real);
         }
@@ -553,7 +468,6 @@ internal sealed class SessionMessageRouter
         var quotesData = JsonConvert.DeserializeObject<List<List<object>>>(content);
         if (quotesData is null) return;
 
-        var received = new List<string>(4);
         foreach (var quoteArray in quotesData)
         {
             try
@@ -573,25 +487,12 @@ internal sealed class SessionMessageRouter
                     AdditionalData = additional,
                     ReceivedAt = DateTimeOffset.UtcNow
                 };
-                if (received.Count < 4) received.Add(pair);
             }
             catch
             {
                 // skip
             }
         }
-
-        // #region agent log
-        if (received.Count > 0)
-        {
-            ProtocolTrace.Write("H21", "SessionMessageRouter.ProcessQuotesList", "quotes_received", new
-            {
-                sample = received.ToArray(),
-                batch = quotesData.Count,
-                totalCached = _state.LatestQuotes.Count
-            });
-        }
-        // #endregion
     }
 
     private void ProcessHistoryLast(string content)
@@ -646,15 +547,5 @@ internal sealed class SessionMessageRouter
         }
 
         _state.HistoricalData[$"{asset}:{period}"] = history;
-
-        // #region agent log
-        ProtocolTrace.Write("H21", "SessionMessageRouter.ProcessHistoryLast", "history_received", new
-        {
-            asset,
-            period,
-            candles = history.Candles.Count,
-            ticks = history.TickHistory.Count
-        });
-        // #endregion
     }
 }
