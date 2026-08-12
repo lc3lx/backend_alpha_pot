@@ -15,6 +15,9 @@ public interface IBinollaClient : IAsyncDisposable
 
     Task ConnectAsync(string ssid, CancellationToken cancellationToken = default, string? cookieHeader = null);
 
+    /// <summary>True when the trading WebSocket is open (not just Lifecycle.Connected).</summary>
+    bool IsTransportConnected { get; }
+
     Task<BalanceInfo> GetBalanceAsync(CancellationToken cancellationToken = default);
 
     Task ChangeAccountAsync(AccountType accountType, CancellationToken cancellationToken = default);

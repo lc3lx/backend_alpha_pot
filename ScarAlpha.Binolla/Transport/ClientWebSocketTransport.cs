@@ -1,5 +1,6 @@
 using System.Net.WebSockets;
 using System.Text;
+using ScarAlpha.Binolla.Diagnostics;
 
 namespace ScarAlpha.Binolla.Transport;
 
@@ -147,6 +148,14 @@ public sealed class ClientWebSocketTransport : IWebSocketTransport
         {
             var container = new System.Net.CookieContainer();
             var added = 0;
+            // Attach to WS host AND site origin — Playwright cookies are usually for binolla.com.
+            var scopes = new[]
+            {
+                new Uri($"{uri.Scheme}://{uri.Host}/"),
+                new Uri("https://binolla.com/"),
+                new Uri("https://www.binolla.com/")
+            };
+
             foreach (var part in cookieHeader.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
             {
                 var eq = part.IndexOf('=');
@@ -154,19 +163,48 @@ public sealed class ClientWebSocketTransport : IWebSocketTransport
                 var name = part[..eq].Trim();
                 var value = part[(eq + 1)..].Trim();
                 if (name.Length == 0) continue;
-                // CookieContainer — NOT raw Cookie request header (raw header blackholed Engine.IO).
-                container.Add(new Uri($"{uri.Scheme}://{uri.Host}/"), new System.Net.Cookie(name, value));
-                added++;
+
+                foreach (var scope in scopes)
+                {
+                    try
+                    {
+                        container.Add(scope, new System.Net.Cookie(name, value));
+                        added++;
+                    }
+                    catch
+                    {
+                        // invalid cookie for this scope — try next
+                    }
+                }
             }
 
             if (added == 0)
+            {
+                // #region agent log
+                ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H82", "ClientWebSocketTransport.ApplyCookies", "cookie_none_added", new
+                {
+                    headerLen = cookieHeader.Length,
+                    host = uri.Host
+                });
+                // #endregion
                 return;
+            }
 
             socket.Options.Cookies = container;
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H82", "ClientWebSocketTransport.ApplyCookies", "cookie_container_applied", new
+            {
+                added,
+                host = uri.Host
+            });
+            // #endregion
         }
-        catch
+        catch (Exception ex)
         {
-            // Cookie parse/apply failures are non-fatal; connect proceeds without cookies.
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H82", "ClientWebSocketTransport.ApplyCookies", "cookie_container_failed", new
+            {
+                type = ex.GetType().Name
+            });
         }
     }
 

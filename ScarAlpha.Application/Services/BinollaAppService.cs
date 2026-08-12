@@ -137,6 +137,9 @@ public sealed class BinollaAppService
             // Allow reconnect after a prior SSID auth failure / unauthorized drop.
             _restorer.ClearAuthFailure(userId);
 
+            // Drop any zombie in-memory session so cookie+SSID attach on a fresh socket.
+            await _sessions.RemoveAsync(userId.ToString(), ct);
+
             var client = await _sessions.GetOrCreateAsync(
                 userId.ToString(),
                 request.Ssid.Trim(),

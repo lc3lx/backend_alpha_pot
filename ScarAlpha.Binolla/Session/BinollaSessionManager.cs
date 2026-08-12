@@ -98,12 +98,27 @@ public sealed class BinollaSessionManager : IBinollaSessionManager
         string? cookieHeader = null)
     {
         var lifecycle = session.Lifecycle;
-        var needsLifecycleReconnect = lifecycle is SessionLifecycleState.Disconnected
-            or SessionLifecycleState.Faulted
-            or SessionLifecycleState.AuthenticationFailed
-            or SessionLifecycleState.SessionExpired;
+        var transportDead = !session.IsTransportConnected;
+        var needsLifecycleReconnect = transportDead
+            || lifecycle is SessionLifecycleState.Disconnected
+                or SessionLifecycleState.Faulted
+                or SessionLifecycleState.AuthenticationFailed
+                or SessionLifecycleState.SessionExpired
+                or SessionLifecycleState.Connecting;
 
         var ssidChanged = !string.Equals(session.State.Ssid, ssid, StringComparison.Ordinal);
+
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H81", "BinollaSessionManager.EnsureSessionUsesSsid", "check", new
+        {
+            lifecycle = lifecycle.ToString(),
+            transportDead,
+            ssidChanged,
+            needsLifecycleReconnect,
+            hasCookie = !string.IsNullOrWhiteSpace(cookieHeader)
+        });
+        // #endregion
+
         if (!needsLifecycleReconnect && !ssidChanged)
         {
             if (!string.IsNullOrWhiteSpace(cookieHeader))
@@ -112,6 +127,10 @@ public sealed class BinollaSessionManager : IBinollaSessionManager
         }
 
         if (!needsLifecycleReconnect && ssidChanged)
+            await session.DisconnectAsync(cancellationToken).ConfigureAwait(false);
+
+        // Force a clean reconnect when the previous socket is dead but Lifecycle lied.
+        if (transportDead && lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
             await session.DisconnectAsync(cancellationToken).ConfigureAwait(false);
 
         await session.ConnectAsync(ssid, cancellationToken, cookieHeader).ConfigureAwait(false);

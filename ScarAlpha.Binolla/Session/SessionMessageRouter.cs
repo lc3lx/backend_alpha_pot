@@ -1,5 +1,6 @@
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using ScarAlpha.Binolla.Diagnostics;
 using ScarAlpha.Binolla.Models;
 using ScarAlpha.Binolla.Protocol;
 
@@ -123,6 +124,14 @@ internal sealed class SessionMessageRouter
     private async Task HandleUnauthorizedAsync(CancellationToken cancellationToken)
     {
         var lifecycle = _state.Lifecycle;
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H83", "SessionMessageRouter.HandleUnauthorized", "unauthorized_received", new
+        {
+            lifecycle = lifecycle.ToString(),
+            hadAuth = Volatile.Read(ref _authorized) == 1,
+            reauthSent = Volatile.Read(ref _unauthorizedReauthSent) == 1
+        });
+        // #endregion
 
         // During initial handshake, unauthorized means the SSID was rejected — fail fast.
         // Re-auth loops here caused repeated bootstrap and empty quotes/balance in production.
@@ -154,6 +163,7 @@ internal sealed class SessionMessageRouter
 
     private static bool IsUnauthorizedMessage(string message) =>
         message.Contains("NotAuthorized", StringComparison.OrdinalIgnoreCase) ||
+        // Exact-ish Socket.IO unauthorized event — avoid matching unrelated payloads.
         message.Contains("\"unauthorized\"", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsUnauthorizedEventName(string? eventName) =>
@@ -235,6 +245,7 @@ internal sealed class SessionMessageRouter
         // s_orders alone previously triggered early bootstrap and unauthorized storms.
         return value.Contains("s_balances/", StringComparison.Ordinal)
                || value.Contains("s_assets/", StringComparison.Ordinal)
+               || value.Contains("s_account/", StringComparison.Ordinal)
                || value.Contains(BinollaWire.EvAuthorization, StringComparison.Ordinal);
     }
 

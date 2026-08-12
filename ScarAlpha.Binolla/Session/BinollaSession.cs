@@ -50,6 +50,8 @@ public sealed class BinollaSession : IBinollaClient
 
     public SessionLifecycleState Lifecycle => State.Lifecycle;
 
+    public bool IsTransportConnected => _trading?.IsConnected == true;
+
     public event Action<SessionLifecycleState, string?>? LifecycleChanged;
     public event Action? OnConnectionLost;
     public event Action? OnReconnected;
@@ -69,7 +71,11 @@ public sealed class BinollaSession : IBinollaClient
         try
         {
             if (Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
-                return;
+            {
+                // Zombie guard: Lifecycle can stay Connected after the socket died.
+                if (_trading?.IsConnected == true)
+                    return;
+            }
 
             SetLifecycle(SessionLifecycleState.Connecting);
             State.Ssid = ssid;
@@ -77,14 +83,41 @@ public sealed class BinollaSession : IBinollaClient
             _sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             _reconnectAttempts = 0;
 
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H80", "BinollaSession.ConnectAsync", "connecting", new
+            {
+                hasCookie = !string.IsNullOrEmpty(State.CookieHeader),
+                cookieLen = State.CookieHeader?.Length ?? 0,
+                ssidLen = ssid.Length,
+                priorLifecycle = Lifecycle.ToString()
+            });
+            // #endregion
+
             await ConnectSocketsAsync(_sessionCts.Token).ConfigureAwait(false);
             await WaitForAuthenticationAsync(cancellationToken).ConfigureAwait(false);
+
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H80", "BinollaSession.ConnectAsync", "auth_ok", new
+            {
+                lifecycle = Lifecycle.ToString(),
+                transportUp = _trading?.IsConnected == true
+            });
+            // #endregion
 
             // Balance list is bootstrap-driven; wait briefly for first balance event if possible
             await WaitForBalanceHintAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H80", "BinollaSession.ConnectAsync", "connect_failed", new
+            {
+                type = ex.GetType().Name,
+                message = ex.Message.Length > 120 ? ex.Message[..120] : ex.Message,
+                lifecycle = Lifecycle.ToString()
+            });
+            // #endregion
+
             SetLifecycle(
                 ex is BinollaAuthenticationException
                     ? SessionLifecycleState.AuthenticationFailed
