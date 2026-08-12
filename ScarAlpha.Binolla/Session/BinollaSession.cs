@@ -111,12 +111,13 @@ public sealed class BinollaSession : IBinollaClient
             // while ConnectAsync would otherwise return successfully (login then 502 on ChangeAccount).
             if (Lifecycle == SessionLifecycleState.AuthenticationFailed)
                 throw new BinollaAuthenticationException("SSID not authorized.");
-            if (Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
-                || _trading?.IsConnected != true)
+            if (Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected) ||
+                _trading?.IsConnected != true)
             {
                 throw new BinollaAuthenticationException(
                     $"Authentication did not complete (state={Lifecycle}).");
             }
+        }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // #region agent log
