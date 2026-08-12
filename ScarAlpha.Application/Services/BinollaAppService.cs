@@ -234,7 +234,7 @@ public sealed class BinollaAppService
     public async Task<BinollaBalanceDto> GetBalanceAsync(CancellationToken ct)
     {
         var access = await _access.CheckAsync(_currentUser.UserId, ct);
-        AccountAppService.EnsureAllowed(access);
+        AccountAppService.EnsureConnectedForMarket(access);
 
         var client = RequireConnectedClient();
         try

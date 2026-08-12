@@ -28,19 +28,22 @@ public sealed class Phase8SecurityTests : IClassFixture<ApiFactory>
     }
 
     [Fact]
-    public async Task Access_matrix_pending_blocks_market_rsi_balance_and_trades()
+    public async Task Access_matrix_pending_allows_market_blocks_trades()
     {
         var token = await LoginAsync(9801);
         await ConnectOnlyAsync(token);
 
         (await StatusAccess(token)).Should().Be("AdminApprovalRequired");
 
-        (await _client.SendAsync(Authed(HttpMethod.Get, "/api/market/assets", token))).StatusCode
-            .Should().Be(HttpStatusCode.Forbidden);
-        (await _client.SendAsync(Authed(HttpMethod.Get, "/api/strategies/rsi/signal/EURUSD_otc", token))).StatusCode
-            .Should().Be(HttpStatusCode.Forbidden);
-        (await _client.SendAsync(Authed(HttpMethod.Get, "/api/binolla/balance", token))).StatusCode
-            .Should().Be(HttpStatusCode.Forbidden);
+        // Pending users can browse market / balance; only trading stays locked.
+        (await _client.SendAsync(Authed(HttpMethod.Get, "/api/market/assets", token))).EnsureSuccessStatusCode();
+        (await _client.SendAsync(Authed(HttpMethod.Get, "/api/binolla/balance", token))).EnsureSuccessStatusCode();
+
+        // RSI may return 4xx/5xx without live candle history, but must not be approval-blocked.
+        var rsiRes = await _client.SendAsync(Authed(HttpMethod.Get, "/api/strategies/rsi/signal/EURUSD_otc", token));
+        rsiRes.StatusCode.Should().NotBe(HttpStatusCode.Forbidden);
+        var rsiBody = await rsiRes.Content.ReadAsStringAsync();
+        rsiBody.Should().NotContain("ADMIN_APPROVAL_REQUIRED");
 
         using var trade = Authed(HttpMethod.Post, "/api/trades", token);
         trade.Content = JsonContent.Create(ValidTrade());

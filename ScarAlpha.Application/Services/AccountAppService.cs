@@ -36,6 +36,9 @@ public sealed class AccountAppService
         _ => "BinollaNotConnected"
     };
 
+    /// <summary>
+    /// Full bot access including Demo trading — requires admin approval.
+    /// </summary>
     internal static void EnsureAllowed(BotAccessResult access)
     {
         switch (access.Access)
@@ -48,7 +51,27 @@ public sealed class AccountAppService
                 throw new ApiException(ApiErrorCodes.NotEligible, "Account was rejected by an administrator.", 403);
             case BotAccessState.AdminApprovalRequired:
                 throw new ApiException(ApiErrorCodes.AdminApprovalRequired,
-                    "Your Binolla account is waiting for administrator approval.", 403);
+                    "Administrator has not approved your account yet. Trading is locked until approval.", 403);
+            default:
+                throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Connect your Binolla account first.", 409);
+        }
+    }
+
+    /// <summary>
+    /// Market / RSI / balance: connected Binolla is enough; pending admin approval is allowed.
+    /// Trading still uses <see cref="EnsureAllowed"/>.
+    /// </summary>
+    internal static void EnsureConnectedForMarket(BotAccessResult access)
+    {
+        switch (access.Access)
+        {
+            case BotAccessState.Allowed:
+            case BotAccessState.AdminApprovalRequired:
+                return;
+            case BotAccessState.SessionExpired:
+                throw new ApiException(ApiErrorCodes.BinollaSessionExpired, "Binolla session expired.", 401);
+            case BotAccessState.NotEligible:
+                throw new ApiException(ApiErrorCodes.NotEligible, "Account was rejected by an administrator.", 403);
             default:
                 throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Connect your Binolla account first.", 409);
         }

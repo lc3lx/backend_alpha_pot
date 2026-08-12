@@ -285,14 +285,6 @@ async function tryInPageAuthApi(page, { isSignup, email, password, lid }) {
               isNotUsCitizen: true,
               lid: String(lid),
             },
-            {
-              email,
-              password,
-              agreement: true,
-              isNotUsCitizen: true,
-              lid,
-            },
-            { email, password, agreement: true, isNotUsCitizen: true },
           ]
         : [{ email, password }, { email, password, remember: true }];
 
@@ -351,7 +343,8 @@ async function main() {
   const signupUrl = arg('signupUrl', 'https://binolla.com/signup/?lid=15968');
   const timeoutMs = Number(arg('timeoutMs', '45000')) || 45000;
   // Leave headroom so C# WaitForExit (timeoutMs+15s) does not kill us mid-exit.
-  const waitBudgetMs = Math.max(12_000, Math.min(timeoutMs - 20_000, 45_000));
+  // Keep poll short: exit as soon as token appears; do not burn 45s after failed API.
+  const waitBudgetMs = Math.max(8_000, Math.min(timeoutMs - 15_000, 12_000));
   const proxyServer =
     arg('proxy') || process.env.BINOLLA_AUTH_PROXY || process.env.Binolla__CredentialLogin__ProxyServer || '';
 
@@ -473,9 +466,9 @@ async function main() {
     });
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
-    // Give Cloudflare JS challenge a moment if present.
+    // Brief settle for Cloudflare cookies — avoid long networkidle stalls.
     try {
-      await page.waitForLoadState('networkidle', { timeout: 8000 });
+      await page.waitForLoadState('networkidle', { timeout: 3000 });
     } catch {
       /* best effort */
     }
@@ -485,6 +478,15 @@ async function main() {
     const apiResult = await tryInPageAuthApi(page, { isSignup, email, password, lid });
     for (const attempt of apiResult.attempts || []) {
       if (attempt.body) tryCapture(extractToken(attempt.body), `api:${attempt.path}:${attempt.status}`);
+    }
+
+    // API may set cookies/storage without putting token in the JSON body.
+    if (!token && apiResult.okStatus) {
+      const started = Date.now();
+      while (!token && Date.now() - started < 4000) {
+        await page.waitForTimeout(200);
+        tryCapture(await scanStorage(page), 'storage-after-api');
+      }
     }
 
     if (!token) {
@@ -552,14 +554,14 @@ async function main() {
       const clicked = await clickSubmit(page, isSignup);
 
       try {
-        await page.waitForLoadState('networkidle', { timeout: Math.min(12000, waitBudgetMs) });
+        await page.waitForLoadState('networkidle', { timeout: Math.min(3000, waitBudgetMs) });
       } catch {
         /* best effort */
       }
 
       const started = Date.now();
       while (!token && Date.now() - started < waitBudgetMs) {
-        await page.waitForTimeout(400);
+        await page.waitForTimeout(250);
         if (!token) tryCapture(await scanStorage(page), 'storage-poll');
       }
     }

@@ -661,7 +661,7 @@ public sealed class BinollaSession : IBinollaClient
         try
         {
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            cts.CancelAfter(TimeSpan.FromSeconds(5));
+            cts.CancelAfter(TimeSpan.FromSeconds(2));
             if (_balanceTcs is not null)
                 await _balanceTcs.Task.WaitAsync(cts.Token).ConfigureAwait(false);
         }

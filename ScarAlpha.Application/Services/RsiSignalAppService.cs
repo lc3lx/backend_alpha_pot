@@ -36,7 +36,7 @@ public sealed class RsiSignalAppService
             throw new ApiException(ApiErrorCodes.ValidationError, "period must be between 1 and 3600 seconds.");
 
         var access = await _botAccess.CheckAsync(_currentUser.UserId, ct);
-        AccountAppService.EnsureAllowed(access);
+        AccountAppService.EnsureConnectedForMarket(access);
 
         var client = RequireConnectedClient();
 

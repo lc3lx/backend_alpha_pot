@@ -165,7 +165,7 @@ public sealed class MarketAppService
     private async Task EnsureBotAccessAsync(CancellationToken ct)
     {
         var access = await _botAccess.CheckAsync(_currentUser.UserId, ct);
-        AccountAppService.EnsureAllowed(access);
+        AccountAppService.EnsureConnectedForMarket(access);
     }
 
     private IBinollaClient RequireConnectedClient()
