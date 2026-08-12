@@ -34,6 +34,7 @@ public static class BinollaWire
     public static readonly string[] PostAuthBootstrapCommands =
     {
         "42[\"account/change\",{\"demo\":1}]",
+        "42[\"balances/list\"]",
         "42[\"orders/opened/list\"]",
         "42[\"orders/closed/list\"]",
         "42[\"assets/list\"]",

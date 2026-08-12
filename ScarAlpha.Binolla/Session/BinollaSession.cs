@@ -121,6 +121,18 @@ public sealed class BinollaSession : IBinollaClient
         if (State.BalanceUpdatedAt is not null)
             return State.GetBalanceInfo();
 
+        // Nudge server for balances if none received yet after auth.
+        try
+        {
+            var transport = _trading;
+            if (transport is not null && transport.IsConnected)
+                await transport.SendAsync("42[\"balances/list\"]", cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            // best effort
+        }
+
         var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         Volatile.Write(ref _balanceTcs, tcs);
 
@@ -130,7 +142,7 @@ public sealed class BinollaSession : IBinollaClient
         try
         {
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeoutCts.CancelAfter(_options.DefaultOperationTimeout);
+            timeoutCts.CancelAfter(_options.MarketDataTimeout);
 
             await using var reg = timeoutCts.Token.Register(() =>
             {

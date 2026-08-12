@@ -254,7 +254,9 @@ public sealed class BinollaAppService
         var client = RequireConnectedClient();
         try
         {
-            var balance = await client.GetBalanceAsync(ct);
+            using var balCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            balCts.CancelAfter(TimeSpan.FromSeconds(8));
+            var balance = await client.GetBalanceAsync(balCts.Token);
             // Real trading is disabled: never surface Real balance as actionable funds.
             return new BinollaBalanceDto(
                 Connected: true,
@@ -266,6 +268,19 @@ public sealed class BinollaAppService
         catch (BinollaAuthenticationException)
         {
             throw new ApiException(ApiErrorCodes.BinollaSessionExpired, "Binolla session expired.", 401);
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or BinollaTimeoutException)
+        {
+            // Do not block Home/Trading for a missing balance push — return a connected empty Demo snapshot.
+            _logger.LogInformation(
+                "Binolla balance not ready for user {UserId}; returning placeholder ({Error})",
+                _currentUser.UserId, ex.GetType().Name);
+            return new BinollaBalanceDto(
+                Connected: true,
+                AccountType: "Demo",
+                DemoBalance: 0m,
+                RealBalance: 0m,
+                CurrentBalance: 0m);
         }
         catch (Exception ex)
         {
