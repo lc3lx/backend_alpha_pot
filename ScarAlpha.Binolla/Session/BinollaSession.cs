@@ -461,6 +461,9 @@ public sealed class BinollaSession : IBinollaClient
             },
             outcome => OnOrderClosed?.Invoke(outcome));
 
+        // Fresh transport each connect — still unsubscribe first so reconnect never double-fires.
+        _trading.TextMessageReceived -= OnTradingMessage;
+        _trading.Closed -= OnTradingClosed;
         _trading.TextMessageReceived += OnTradingMessage;
         _trading.Closed += OnTradingClosed;
 

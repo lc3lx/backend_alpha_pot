@@ -92,21 +92,18 @@ public sealed class ClientWebSocketTransport : IWebSocketTransport
                 if (result.MessageType == WebSocketMessageType.Close)
                     break;
 
-                if (result.MessageType != WebSocketMessageType.Text)
+                // Engine.IO binary attachments arrive as WS binary frames; decode as UTF-8 JSON when possible.
+                if (result.MessageType is WebSocketMessageType.Text or WebSocketMessageType.Binary)
                 {
-                    if (result.EndOfMessage)
-                        messageBuffer.SetLength(0);
-                    continue;
+                    messageBuffer.Write(buffer, 0, result.Count);
+                    if (!result.EndOfMessage)
+                        continue;
+
+                    var text = Encoding.UTF8.GetString(messageBuffer.GetBuffer(), 0, (int)messageBuffer.Length);
+                    messageBuffer.SetLength(0);
+                    if (!string.IsNullOrWhiteSpace(text))
+                        TextMessageReceived?.Invoke(text);
                 }
-
-                messageBuffer.Write(buffer, 0, result.Count);
-                if (!result.EndOfMessage)
-                    continue;
-
-                var text = Encoding.UTF8.GetString(messageBuffer.GetBuffer(), 0, (int)messageBuffer.Length);
-                messageBuffer.SetLength(0);
-                if (!string.IsNullOrWhiteSpace(text))
-                    TextMessageReceived?.Invoke(text);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)

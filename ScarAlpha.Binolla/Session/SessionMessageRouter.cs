@@ -17,6 +17,7 @@ internal sealed class SessionMessageRouter
     private readonly Func<string, CancellationToken, Task> _sendAsync;
     private readonly Action<TradeOutcome>? _onOrderClosed;
     private string _upcomingMessageType = string.Empty;
+    private int _authorized;
 
     public SessionMessageRouter(
         BinollaSessionState state,
@@ -35,7 +36,8 @@ internal sealed class SessionMessageRouter
         ProtocolTrace.Write("H12", "SessionMessageRouter.HandleRawAsync", "inbound", new
         {
             kind = ProtocolTrace.Classify(message),
-            detail = ProtocolTrace.SafePrefix(message)
+            detail = ProtocolTrace.SafePrefix(message),
+            lifecycle = _state.Lifecycle.ToString()
         });
 
         // Engine.IO OPEN — do not require "sid" substring (packet may vary).
@@ -63,9 +65,20 @@ internal sealed class SessionMessageRouter
 
         if (message.StartsWith("42") && message.Contains(BinollaWire.EvAuthorization, StringComparison.Ordinal))
         {
-            ProtocolTrace.Write("H12", "SessionMessageRouter", "s_authorization_text");
-            await HandleAuthorizedAsync(cancellationToken).ConfigureAwait(false);
+            ProtocolTrace.Write("H15", "SessionMessageRouter", "s_authorization_text");
+            await EnsureAuthorizedAsync(cancellationToken).ConfigureAwait(false);
             return;
+        }
+
+        // Live evidence: Binolla may omit text s_authorization and still push post-auth events.
+        if (message.StartsWith("42") && IsPostAuthSignal(message))
+        {
+            ProtocolTrace.Write("H15", "SessionMessageRouter", "post_auth_text_signal", new
+            {
+                kind = ProtocolTrace.Classify(message)
+            });
+            await EnsureAuthorizedAsync(cancellationToken).ConfigureAwait(false);
+            // continue — may still be a normal event with no payload
         }
 
         if (message == "2")
@@ -81,6 +94,18 @@ internal sealed class SessionMessageRouter
             {
                 upcoming = _upcomingMessageType
             });
+
+            // Auth success often arrives as binary event header before payload.
+            if (IsPostAuthSignal(_upcomingMessageType) ||
+                string.Equals(_upcomingMessageType, BinollaWire.EvAuthorization, StringComparison.Ordinal))
+            {
+                ProtocolTrace.Write("H15", "SessionMessageRouter", "post_auth_binary_header", new
+                {
+                    upcoming = _upcomingMessageType
+                });
+                await EnsureAuthorizedAsync(cancellationToken).ConfigureAwait(false);
+            }
+
             return;
         }
 
@@ -91,20 +116,43 @@ internal sealed class SessionMessageRouter
             return;
         }
 
-        // Binary payload following 451-[type]
+        // Binary payload following 451-[type] (may arrive as WS binary decoded to UTF-8 text)
         if (!string.IsNullOrEmpty(_upcomingMessageType))
         {
             var type = _upcomingMessageType;
             _upcomingMessageType = string.Empty;
-            if (string.Equals(type, BinollaWire.EvAuthorization, StringComparison.Ordinal))
+            if (string.Equals(type, BinollaWire.EvAuthorization, StringComparison.Ordinal) ||
+                IsPostAuthSignal(type))
             {
-                ProtocolTrace.Write("H12", "SessionMessageRouter", "s_authorization_binary");
-                await HandleAuthorizedAsync(cancellationToken).ConfigureAwait(false);
-                return;
+                ProtocolTrace.Write("H15", "SessionMessageRouter", "post_auth_payload", new { type });
+                await EnsureAuthorizedAsync(cancellationToken).ConfigureAwait(false);
             }
 
             await ProcessEventPayloadAsync(type, message).ConfigureAwait(false);
         }
+    }
+
+    private async Task EnsureAuthorizedAsync(CancellationToken cancellationToken)
+    {
+        if (Interlocked.Exchange(ref _authorized, 1) == 1)
+            return;
+
+        ProtocolTrace.Write("H15", "SessionMessageRouter", "ensure_authorized_enter", new
+        {
+            priorLifecycle = _state.Lifecycle.ToString()
+        });
+        await HandleAuthorizedAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static bool IsPostAuthSignal(string? value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return false;
+        return value.Contains("s_balances/", StringComparison.Ordinal)
+               || value.Contains("s_assets/", StringComparison.Ordinal)
+               || value.Contains("s_account/", StringComparison.Ordinal)
+               || value.Contains("s_orders/", StringComparison.Ordinal)
+               || value.Contains(BinollaWire.EvAuthorization, StringComparison.Ordinal);
     }
 
     private async Task HandleAuthorizedAsync(CancellationToken cancellationToken)
