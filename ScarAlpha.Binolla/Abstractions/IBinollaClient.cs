@@ -75,6 +75,9 @@ public sealed class BinollaSessionManagerOptions
     /// <summary>WS auth should complete on post-auth events within seconds; fail fast if not.</summary>
     public TimeSpan AuthenticationTimeout { get; set; } = TimeSpan.FromSeconds(20);
 
+    /// <summary>Assets/quotes/candles should not block HTTP requests for a full minute.</summary>
+    public TimeSpan MarketDataTimeout { get; set; } = TimeSpan.FromSeconds(8);
+
     public TimeSpan PlaceOrderTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
     public TimeSpan OutcomeTimeout { get; set; } = TimeSpan.FromMinutes(5);

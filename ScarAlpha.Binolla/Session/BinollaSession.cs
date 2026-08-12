@@ -309,11 +309,22 @@ public sealed class BinollaSession : IBinollaClient
         State.Touch();
 
         if (State.Assets.Count == 0)
-            await WaitForConditionAsync(() => State.Assets.Count > 0, _options.DefaultOperationTimeout, cancellationToken)
-                .ConfigureAwait(false);
+        {
+            try
+            {
+                await WaitForConditionAsync(
+                        () => State.Assets.Count > 0,
+                        _options.MarketDataTimeout,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (BinollaTimeoutException)
+            {
+                // Prefer empty list over hanging the Home/Trading UI.
+            }
+        }
 
-        return State.Assets
-            .Where(a => a.IsOpen)
+        var mapped = State.Assets
             .Select(a => new TradingAsset
             {
                 Symbol = a.Name,
@@ -323,6 +334,9 @@ public sealed class BinollaSession : IBinollaClient
                 Category = a.Type
             })
             .ToList();
+
+        var open = mapped.Where(a => a.IsOpen).ToList();
+        return open.Count > 0 ? open : mapped;
     }
 
     public async Task<QuoteData> GetLatestQuoteAsync(string asset, CancellationToken cancellationToken = default)
@@ -341,7 +355,7 @@ public sealed class BinollaSession : IBinollaClient
 
         await WaitForConditionAsync(
                 () => State.LatestQuotes.ContainsKey(key),
-                _options.DefaultOperationTimeout,
+                _options.MarketDataTimeout,
                 cancellationToken)
             .ConfigureAwait(false);
 
@@ -370,7 +384,7 @@ public sealed class BinollaSession : IBinollaClient
 
         await WaitForConditionAsync(
                 () => State.HistoricalData.ContainsKey(historyKey),
-                _options.DefaultOperationTimeout,
+                _options.MarketDataTimeout,
                 cancellationToken)
             .ConfigureAwait(false);
 
