@@ -308,6 +308,17 @@ public sealed class BinollaSession : IBinollaClient
         State.Touch();
 
         var transport = _trading ?? throw new BinollaConnectionException("Not connected.");
+        // #region agent log
+        ProtocolTrace.Write("H18", "BinollaSession.SubscribePairAsync", "subscribe_send", new
+        {
+            pair,
+            period,
+            quoteCached = State.LatestQuotes.ContainsKey(pair.Trim()),
+            historyCached = State.HistoricalData.ContainsKey($"{pair.Trim()}:{period}"),
+            quoteCount = State.LatestQuotes.Count,
+            historyCount = State.HistoricalData.Count
+        });
+        // #endregion
         await transport.SendAsync(BinollaFraming.BuildAlertList(), cancellationToken).ConfigureAwait(false);
         await transport.SendAsync(BinollaFraming.BuildAlertClosedList(), cancellationToken).ConfigureAwait(false);
         await transport.SendAsync(BinollaFraming.BuildAssetChange(pair, period), cancellationToken).ConfigureAwait(false);
@@ -363,17 +374,42 @@ public sealed class BinollaSession : IBinollaClient
         await SubscribePairAsync(key, 60, cancellationToken).ConfigureAwait(false);
 
         if (State.LatestQuotes.TryGetValue(key, out var existing))
+        {
+            // #region agent log
+            ProtocolTrace.Write("H18", "BinollaSession.GetLatestQuoteAsync", "quote_cache_hit", new { key, price = existing.Price });
+            // #endregion
             return existing;
+        }
 
-        await WaitForConditionAsync(
-                () => State.LatestQuotes.ContainsKey(key),
-                _options.MarketDataTimeout,
-                cancellationToken)
-            .ConfigureAwait(false);
+        try
+        {
+            await WaitForConditionAsync(
+                    () => State.LatestQuotes.ContainsKey(key),
+                    _options.MarketDataTimeout,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // #region agent log
+            ProtocolTrace.Write("H19", "BinollaSession.GetLatestQuoteAsync", "quote_wait_fail", new
+            {
+                key,
+                exType = ex.GetType().Name,
+                clientAbort = cancellationToken.IsCancellationRequested,
+                quoteKeys = State.LatestQuotes.Keys.Take(8).ToArray(),
+                quoteCount = State.LatestQuotes.Count
+            });
+            // #endregion
+            throw;
+        }
 
         if (!State.LatestQuotes.TryGetValue(key, out var quote))
             throw new BinollaTimeoutException("Quote not available for asset.");
 
+        // #region agent log
+        ProtocolTrace.Write("H18", "BinollaSession.GetLatestQuoteAsync", "quote_ok", new { key, price = quote.Price });
+        // #endregion
         return quote;
     }
 
@@ -392,17 +428,51 @@ public sealed class BinollaSession : IBinollaClient
         await SubscribePairAsync(key, period, cancellationToken).ConfigureAwait(false);
 
         if (State.HistoricalData.TryGetValue(historyKey, out var existing))
+        {
+            // #region agent log
+            ProtocolTrace.Write("H20", "BinollaSession.GetHistoryAsync", "history_cache_hit", new
+            {
+                historyKey,
+                candles = existing.Candles.Count
+            });
+            // #endregion
             return existing;
+        }
 
-        await WaitForConditionAsync(
-                () => State.HistoricalData.ContainsKey(historyKey),
-                _options.MarketDataTimeout,
-                cancellationToken)
-            .ConfigureAwait(false);
+        try
+        {
+            await WaitForConditionAsync(
+                    () => State.HistoricalData.ContainsKey(historyKey),
+                    _options.MarketDataTimeout,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // #region agent log
+            ProtocolTrace.Write("H20", "BinollaSession.GetHistoryAsync", "history_wait_fail", new
+            {
+                historyKey,
+                period,
+                exType = ex.GetType().Name,
+                clientAbort = cancellationToken.IsCancellationRequested,
+                historyKeys = State.HistoricalData.Keys.Take(8).ToArray(),
+                historyCount = State.HistoricalData.Count
+            });
+            // #endregion
+            throw;
+        }
 
         if (!State.HistoricalData.TryGetValue(historyKey, out var history))
             throw new BinollaTimeoutException("History not available for asset/period.");
 
+        // #region agent log
+        ProtocolTrace.Write("H20", "BinollaSession.GetHistoryAsync", "history_ok", new
+        {
+            historyKey,
+            candles = history.Candles.Count
+        });
+        // #endregion
         return history;
     }
 

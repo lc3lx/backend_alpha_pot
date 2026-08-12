@@ -79,22 +79,19 @@ internal static class ProtocolTrace
 
     private static IEnumerable<string> CandidatePaths()
     {
-        // Prefer a single concrete path so the same line is not appended twice.
         var cwd = Directory.GetCurrentDirectory();
-        var underCwd = Path.GetFullPath(Path.Combine(cwd, "logs", "debug-660ec2.log"));
-        var underParent = Path.GetFullPath(Path.Combine(cwd, "..", "logs", "debug-660ec2.log"));
+        var underCwdLogs = Path.GetFullPath(Path.Combine(cwd, "logs", "debug-660ec2.log"));
+        var underCwdRoot = Path.GetFullPath(Path.Combine(cwd, "debug-660ec2.log"));
         var vps = "/home/web/backend/logs/debug-660ec2.log";
+        var vpsRoot = "/home/web/backend/debug-660ec2.log";
         var local = @"d:\work\flul_bot\debug-660ec2.log";
 
-        if (File.Exists(vps) || Directory.Exists("/home/web/backend/logs") || Directory.Exists("/home/web/backend"))
-        {
-            yield return vps;
-            yield break;
-        }
-
-        yield return underCwd;
-        if (!string.Equals(underCwd, underParent, StringComparison.OrdinalIgnoreCase))
-            yield return underParent;
+        // Always try VPS + cwd so debug-mode can collect evidence after redeploy.
+        yield return vps;
+        yield return vpsRoot;
+        yield return underCwdLogs;
+        if (!string.Equals(underCwdLogs, underCwdRoot, StringComparison.OrdinalIgnoreCase))
+            yield return underCwdRoot;
         yield return local;
     }
 }

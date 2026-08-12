@@ -385,6 +385,7 @@ internal sealed class SessionMessageRouter
         var quotesData = JsonConvert.DeserializeObject<List<List<object>>>(content);
         if (quotesData is null) return;
 
+        var received = new List<string>(4);
         foreach (var quoteArray in quotesData)
         {
             try
@@ -404,12 +405,25 @@ internal sealed class SessionMessageRouter
                     AdditionalData = additional,
                     ReceivedAt = DateTimeOffset.UtcNow
                 };
+                if (received.Count < 4) received.Add(pair);
             }
             catch
             {
                 // skip
             }
         }
+
+        // #region agent log
+        if (received.Count > 0)
+        {
+            ProtocolTrace.Write("H21", "SessionMessageRouter.ProcessQuotesList", "quotes_received", new
+            {
+                sample = received.ToArray(),
+                batch = quotesData.Count,
+                totalCached = _state.LatestQuotes.Count
+            });
+        }
+        // #endregion
     }
 
     private void ProcessHistoryLast(string content)
@@ -464,5 +478,15 @@ internal sealed class SessionMessageRouter
         }
 
         _state.HistoricalData[$"{asset}:{period}"] = history;
+
+        // #region agent log
+        ProtocolTrace.Write("H21", "SessionMessageRouter.ProcessHistoryLast", "history_received", new
+        {
+            asset,
+            period,
+            candles = history.Candles.Count,
+            ticks = history.TickHistory.Count
+        });
+        // #endregion
     }
 }
