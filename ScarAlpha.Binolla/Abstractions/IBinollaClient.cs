@@ -73,7 +73,7 @@ public sealed class BinollaSessionManagerOptions
     public TimeSpan DefaultOperationTimeout { get; set; } = TimeSpan.FromSeconds(60);
 
     /// <summary>WS auth should complete on post-auth events within seconds; fail fast if not.</summary>
-    public TimeSpan AuthenticationTimeout { get; set; } = TimeSpan.FromSeconds(15);
+    public TimeSpan AuthenticationTimeout { get; set; } = TimeSpan.FromSeconds(20);
 
     public TimeSpan PlaceOrderTimeout { get; set; } = TimeSpan.FromSeconds(30);
 

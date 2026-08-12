@@ -476,19 +476,31 @@ public sealed class BinollaSession : IBinollaClient
         _balanceTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         var tradingUri = _options.TradingSocketUri ?? new Uri(BinollaWire.TradingSocketUri);
+        // Cache-buster avoids intermediary reuse of a half-open Engine.IO upgrade.
+        var uriBuilder = new UriBuilder(tradingUri);
+        var query = string.IsNullOrEmpty(uriBuilder.Query)
+            ? "EIO=4&transport=websocket"
+            : uriBuilder.Query.TrimStart('?');
+        if (!query.Contains("t=", StringComparison.Ordinal))
+            query += (query.Length > 0 ? "&" : "") + "t=" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        uriBuilder.Query = query;
+        tradingUri = uriBuilder.Uri;
+
         var headers = new Dictionary<string, string>
         {
             ["Origin"] = BinollaWire.Origin,
-            ["Cache-Control"] = "no-cache",
             ["User-Agent"] = BinollaWire.UserAgent
         };
-        if (!string.IsNullOrWhiteSpace(State.CookieHeader))
-            headers["Cookie"] = State.CookieHeader;
+        // Intentionally do NOT attach Playwright Cookie header to the trading WS.
+        // Live evidence: with Cookie attached, auth waited with zero Engine.IO frames;
+        // SSID authorization frame is the auth credential for ws3.
 
         ProtocolTrace.Write("H14", "BinollaSession.ConnectSocketsAsync", "ws_connect_start", new
         {
             host = tradingUri.Host,
-            hasCookie = headers.ContainsKey("Cookie")
+            hasCookie = false,
+            cookieCaptured = !string.IsNullOrWhiteSpace(State.CookieHeader),
+            queryHasT = tradingUri.Query.Contains("t=", StringComparison.Ordinal)
         });
 
         await _trading.ConnectAsync(tradingUri, headers, cancellationToken).ConfigureAwait(false);
@@ -559,8 +571,22 @@ public sealed class BinollaSession : IBinollaClient
         if (Interlocked.CompareExchange(ref _disposed, 0, 0) == 1)
             return;
 
-        if (Lifecycle is SessionLifecycleState.Disconnected or SessionLifecycleState.Connecting)
+        if (Lifecycle is SessionLifecycleState.Disconnected)
             return;
+
+        // Previously ignored closes during Connecting — auth then hung until timeout with zero frames.
+        if (Lifecycle is SessionLifecycleState.Connecting)
+        {
+            ProtocolTrace.Write("H17", "BinollaSession.OnTradingClosed", "closed_during_auth", new
+            {
+                err = error?.GetType().Name
+            });
+            var authFail = new BinollaConnectionException(
+                error is null ? "WebSocket closed during authentication." : "WebSocket lost during authentication.");
+            _authTcs?.TrySetException(authFail);
+            SetLifecycle(SessionLifecycleState.Faulted, SafeError(error));
+            return;
+        }
 
         SetLifecycle(SessionLifecycleState.Disconnected, SafeError(error));
         OnConnectionLost?.Invoke();
