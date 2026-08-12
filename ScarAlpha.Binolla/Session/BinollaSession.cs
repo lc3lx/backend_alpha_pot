@@ -459,7 +459,12 @@ public sealed class BinollaSession : IBinollaClient
                 // Never log SSID
                 await _trading.SendAsync(msg, ct).ConfigureAwait(false);
             },
-            outcome => OnOrderClosed?.Invoke(outcome));
+            outcome => OnOrderClosed?.Invoke(outcome),
+            onAuthorized: () =>
+            {
+                ProtocolTrace.Write("H16", "BinollaSession", "auth_signal_early");
+                _authTcs?.TrySetResult(true);
+            });
 
         // Fresh transport each connect — still unsubscribe first so reconnect never double-fires.
         _trading.TextMessageReceived -= OnTradingMessage;
@@ -629,8 +634,14 @@ public sealed class BinollaSession : IBinollaClient
     {
         var tcs = _authTcs ?? throw new InvalidOperationException("Auth waiter missing.");
 
+        ProtocolTrace.Write("H16", "BinollaSession.WaitForAuthenticationAsync", "auth_wait_start", new
+        {
+            timeoutSec = _options.AuthenticationTimeout.TotalSeconds,
+            lifecycle = State.Lifecycle.ToString()
+        });
+
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutCts.CancelAfter(_options.DefaultOperationTimeout);
+        timeoutCts.CancelAfter(_options.AuthenticationTimeout);
 
         await using var reg = timeoutCts.Token.Register(() =>
         {
@@ -646,8 +657,17 @@ public sealed class BinollaSession : IBinollaClient
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
+            ProtocolTrace.Write("H16", "BinollaSession.WaitForAuthenticationAsync", "auth_wait_timeout", new
+            {
+                lifecycle = State.Lifecycle.ToString()
+            });
             throw new BinollaTimeoutException("Authentication timed out.");
         }
+
+        ProtocolTrace.Write("H16", "BinollaSession.WaitForAuthenticationAsync", "auth_wait_done", new
+        {
+            lifecycle = State.Lifecycle.ToString()
+        });
 
         if (State.Lifecycle == SessionLifecycleState.AuthenticationFailed)
             throw new BinollaAuthenticationException("SSID not authorized.");

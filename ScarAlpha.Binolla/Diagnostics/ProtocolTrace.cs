@@ -79,9 +79,22 @@ internal static class ProtocolTrace
 
     private static IEnumerable<string> CandidatePaths()
     {
-        yield return "/home/web/backend/logs/debug-660ec2.log";
-        yield return Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), "logs", "debug-660ec2.log"));
-        yield return Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), "..", "logs", "debug-660ec2.log"));
-        yield return @"d:\work\flul_bot\debug-660ec2.log";
+        // Prefer a single concrete path so the same line is not appended twice.
+        var cwd = Directory.GetCurrentDirectory();
+        var underCwd = Path.GetFullPath(Path.Combine(cwd, "logs", "debug-660ec2.log"));
+        var underParent = Path.GetFullPath(Path.Combine(cwd, "..", "logs", "debug-660ec2.log"));
+        var vps = "/home/web/backend/logs/debug-660ec2.log";
+        var local = @"d:\work\flul_bot\debug-660ec2.log";
+
+        if (File.Exists(vps) || Directory.Exists("/home/web/backend/logs") || Directory.Exists("/home/web/backend"))
+        {
+            yield return vps;
+            yield break;
+        }
+
+        yield return underCwd;
+        if (!string.Equals(underCwd, underParent, StringComparison.OrdinalIgnoreCase))
+            yield return underParent;
+        yield return local;
     }
 }

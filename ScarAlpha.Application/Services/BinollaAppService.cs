@@ -137,7 +137,22 @@ public sealed class BinollaAppService
                 ct,
                 cookieHeader);
             await client.ChangeAccountAsync(EngineAccount.Demo, ct);
-            var balance = await client.GetBalanceAsync(ct);
+
+            // Do not block login on a full balance wait (was misreported as auth timeout for ~60s).
+            decimal? balanceValue = null;
+            try
+            {
+                using var balCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                balCts.CancelAfter(TimeSpan.FromSeconds(3));
+                var balance = await client.GetBalanceAsync(balCts.Token);
+                balanceValue = balance.DemoBalance;
+            }
+            catch (Exception ex) when (ex is OperationCanceledException or BinollaTimeoutException)
+            {
+                _logger.LogInformation(
+                    "Binolla balance not ready yet after connect for user {UserId}; continuing without blocking login ({Error})",
+                    userId, ex.GetType().Name);
+            }
 
             var now = DateTimeOffset.UtcNow;
             var link = await _links.GetByUserIdAsync(userId, ct) ?? new BinollaLink
@@ -179,7 +194,7 @@ public sealed class BinollaAppService
                 AdminApproved: access.AdminApproved,
                 ApprovalStatus: access.ApprovalStatus,
                 LastConnectedAt: link.LastConnectedAt,
-                Balance: balance.CurrentBalance);
+                Balance: balanceValue);
         }
         catch (ApiException)
         {

@@ -16,6 +16,7 @@ internal sealed class SessionMessageRouter
     private readonly OrderCorrelationHub _orders;
     private readonly Func<string, CancellationToken, Task> _sendAsync;
     private readonly Action<TradeOutcome>? _onOrderClosed;
+    private readonly Action? _onAuthorized;
     private string _upcomingMessageType = string.Empty;
     private int _authorized;
 
@@ -23,12 +24,14 @@ internal sealed class SessionMessageRouter
         BinollaSessionState state,
         OrderCorrelationHub orders,
         Func<string, CancellationToken, Task> sendAsync,
-        Action<TradeOutcome>? onOrderClosed = null)
+        Action<TradeOutcome>? onOrderClosed = null,
+        Action? onAuthorized = null)
     {
         _state = state;
         _orders = orders;
         _sendAsync = sendAsync;
         _onOrderClosed = onOrderClosed;
+        _onAuthorized = onAuthorized;
     }
 
     public async Task HandleRawAsync(string message, CancellationToken cancellationToken)
@@ -141,7 +144,16 @@ internal sealed class SessionMessageRouter
         {
             priorLifecycle = _state.Lifecycle.ToString()
         });
-        await HandleAuthorizedAsync(cancellationToken).ConfigureAwait(false);
+
+        // Mark Connected + unblock WaitForAuthentication BEFORE bootstrap sends.
+        _state.SetLifecycle(
+            _state.Lifecycle == SessionLifecycleState.Reconnecting
+                ? SessionLifecycleState.Reconnected
+                : SessionLifecycleState.Connected);
+        _state.SetAccountType(AccountType.Demo);
+        try { _onAuthorized?.Invoke(); } catch { /* never break protocol */ }
+
+        await SendPostAuthBootstrapAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static bool IsPostAuthSignal(string? value)
@@ -155,15 +167,8 @@ internal sealed class SessionMessageRouter
                || value.Contains(BinollaWire.EvAuthorization, StringComparison.Ordinal);
     }
 
-    private async Task HandleAuthorizedAsync(CancellationToken cancellationToken)
+    private async Task SendPostAuthBootstrapAsync(CancellationToken cancellationToken)
     {
-        _state.SetLifecycle(
-            _state.Lifecycle == SessionLifecycleState.Reconnecting
-                ? SessionLifecycleState.Reconnected
-                : SessionLifecycleState.Connected);
-
-        _state.SetAccountType(AccountType.Demo);
-
         foreach (var command in BinollaWire.PostAuthBootstrapCommands)
         {
             await _sendAsync(command, cancellationToken).ConfigureAwait(false);
