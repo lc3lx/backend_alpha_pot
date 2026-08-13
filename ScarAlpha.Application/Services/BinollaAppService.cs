@@ -214,6 +214,8 @@ public sealed class BinollaAppService
             var wasRejected = link.ApprovalStatus == AdminApprovalStatus.Rejected;
 
             link.EncryptedSsid = encrypted;
+            if (!string.IsNullOrWhiteSpace(cookieHeader))
+                link.EncryptedCookieHeader = _protector.Encrypt(cookieHeader.Trim());
             link.AccountType = DomainAccount.Demo;
             link.Status = BinollaLinkStatus.Connected;
             link.LastConnectedAt = now;

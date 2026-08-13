@@ -187,6 +187,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                 return false;
 
             string? ciphertext = null;
+            string? cookieCipher = null;
             Guid linkId = Guid.Empty;
             BinollaLinkStatus linkStatus = BinollaLinkStatus.Disconnected;
             bool approved = false;
@@ -205,6 +206,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                 approved = link.AdminApproved && link.ApprovalStatus == AdminApprovalStatus.Approved;
                 pending = link.ApprovalStatus == AdminApprovalStatus.Pending;
                 ciphertext = link.EncryptedSsid;
+                cookieCipher = link.EncryptedCookieHeader;
             }
             catch (Exception ex)
             {
@@ -254,9 +256,16 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
 
                 try
                 {
-                    // Prefer cookies already held on a prior live session for this user.
+                    // Prefer live in-memory cookies; fall back to encrypted cookies from DB
+                    // so API restart can restore without forcing a full credential re-login.
                     var existingSession = _sessions.Get(userId.ToString()) as BinollaSession;
                     var cookieHeader = existingSession?.State.CookieHeader;
+                    if (string.IsNullOrWhiteSpace(cookieHeader) && !string.IsNullOrWhiteSpace(cookieCipher))
+                    {
+                        try { cookieHeader = _protector.Decrypt(cookieCipher); }
+                        catch { cookieHeader = null; }
+                    }
+
                     // #region agent log
                     ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
                         "H104",
@@ -266,6 +275,8 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                         {
                             attempt,
                             hasCookie = !string.IsNullOrWhiteSpace(cookieHeader),
+                            cookieFromDb = string.IsNullOrWhiteSpace(existingSession?.State.CookieHeader) &&
+                                           !string.IsNullOrWhiteSpace(cookieCipher),
                             cookieLen = cookieHeader?.Length ?? 0,
                             priorLifecycle = existingSession?.Lifecycle.ToString() ?? "None"
                         });

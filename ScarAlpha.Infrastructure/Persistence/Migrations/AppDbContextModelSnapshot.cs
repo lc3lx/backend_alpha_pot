@@ -99,6 +99,9 @@ namespace ScarAlpha.Infrastructure.Persistence.Migrations
                         .IsRequired()
                         .HasColumnType("text");
 
+                    b.Property<string>("EncryptedCookieHeader")
+                        .HasColumnType("text");
+
                     b.Property<DateTimeOffset?>("LastConnectedAt")
                         .HasColumnType("timestamp with time zone");
 

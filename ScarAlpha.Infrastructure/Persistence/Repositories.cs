@@ -61,6 +61,7 @@ public sealed class BinollaLinkRepository : IBinollaLinkRepository
         else
         {
             existing.EncryptedSsid = link.EncryptedSsid;
+            existing.EncryptedCookieHeader = link.EncryptedCookieHeader;
             existing.AccountType = link.AccountType;
             existing.Status = link.Status;
             existing.BinollaAccountIdentifier = link.BinollaAccountIdentifier;

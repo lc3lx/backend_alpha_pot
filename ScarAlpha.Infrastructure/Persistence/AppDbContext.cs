@@ -34,6 +34,7 @@ public sealed class AppDbContext : DbContext
             e.HasIndex(x => x.UserId).IsUnique();
             e.HasIndex(x => x.ApprovalStatus);
             e.Property(x => x.EncryptedSsid).IsRequired();
+            e.Property(x => x.EncryptedCookieHeader);
             e.Property(x => x.BinollaAccountIdentifier).HasMaxLength(128);
             e.Property(x => x.ApprovedBy).HasMaxLength(256);
             e.Property(x => x.ApprovalStatus).HasConversion<int>();

@@ -23,6 +23,8 @@ public class BinollaLink
     public Guid Id { get; set; }
     public Guid UserId { get; set; }
     public string EncryptedSsid { get; set; } = string.Empty;
+    /// <summary>Optional Playwright cookies (encrypted) — required for reliable WS restore after API restart.</summary>
+    public string? EncryptedCookieHeader { get; set; }
     public string? BinollaAccountIdentifier { get; set; }
     public BinollaAccountType AccountType { get; set; } = BinollaAccountType.Demo;
     public BinollaLinkStatus Status { get; set; } = BinollaLinkStatus.Disconnected;
