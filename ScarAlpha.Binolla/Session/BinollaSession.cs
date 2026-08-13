@@ -360,6 +360,17 @@ public sealed class BinollaSession : IBinollaClient
         {
             try
             {
+                var transport = _trading;
+                if (transport is not null && transport.IsConnected)
+                    await transport.SendAsync("42[\"assets/list\"]", cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                // best effort nudge
+            }
+
+            try
+            {
                 await WaitForConditionAsync(
                         () => State.Assets.Count > 0,
                         _options.MarketDataTimeout,
@@ -371,6 +382,14 @@ public sealed class BinollaSession : IBinollaClient
                 // Prefer empty list over hanging the Home/Trading UI.
             }
         }
+
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H111", "BinollaSession.GetTradingAssetsAsync", "assets_ready", new
+        {
+            count = State.Assets.Count,
+            timeoutSec = _options.MarketDataTimeout.TotalSeconds
+        });
+        // #endregion
 
         var mapped = State.Assets
             .Select(a => new TradingAsset
@@ -401,14 +420,45 @@ public sealed class BinollaSession : IBinollaClient
         if (State.LatestQuotes.TryGetValue(key, out var existing))
             return existing;
 
-        await WaitForConditionAsync(
-                () => State.LatestQuotes.ContainsKey(key),
-                _options.MarketDataTimeout,
-                cancellationToken)
-            .ConfigureAwait(false);
+        var half = TimeSpan.FromMilliseconds(Math.Max(500, _options.MarketDataTimeout.TotalMilliseconds / 2));
+        try
+        {
+            await WaitForConditionAsync(
+                    () => State.LatestQuotes.ContainsKey(key),
+                    half,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (BinollaTimeoutException)
+        {
+            try
+            {
+                await SubscribePairAsync(key, 60, cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                // ignore
+            }
+
+            await WaitForConditionAsync(
+                    () => State.LatestQuotes.ContainsKey(key),
+                    half,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
 
         if (!State.LatestQuotes.TryGetValue(key, out var quote))
+        {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H112", "BinollaSession.GetLatestQuoteAsync", "quote_timeout", new
+            {
+                symbol = key,
+                assetsCached = State.Assets.Count,
+                quotesCached = State.LatestQuotes.Count
+            });
+            // #endregion
             throw new BinollaTimeoutException("Quote not available for asset.");
+        }
 
         return quote;
     }
@@ -430,14 +480,50 @@ public sealed class BinollaSession : IBinollaClient
         if (State.HistoricalData.TryGetValue(historyKey, out var existing))
             return existing;
 
-        await WaitForConditionAsync(
-                () => State.HistoricalData.ContainsKey(historyKey),
-                _options.MarketDataTimeout,
-                cancellationToken)
-            .ConfigureAwait(false);
+        // Mid-wait re-subscribe — first asset/change after login is often ignored until
+        // assets/list has landed; a second nudge recovers history within MarketDataTimeout.
+        var half = TimeSpan.FromMilliseconds(Math.Max(500, _options.MarketDataTimeout.TotalMilliseconds / 2));
+        try
+        {
+            await WaitForConditionAsync(
+                    () => State.HistoricalData.ContainsKey(historyKey),
+                    half,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (BinollaTimeoutException)
+        {
+            try
+            {
+                await SubscribePairAsync(key, period, cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                // ignore nudge failures
+            }
+
+            await WaitForConditionAsync(
+                    () => State.HistoricalData.ContainsKey(historyKey),
+                    half,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
 
         if (!State.HistoricalData.TryGetValue(historyKey, out var history))
+        {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H112", "BinollaSession.GetHistoryAsync", "history_timeout", new
+            {
+                symbol = key,
+                period,
+                assetsCached = State.Assets.Count,
+                historyCached = State.HistoricalData.Count,
+                quotesCached = State.LatestQuotes.Count,
+                timeoutSec = _options.MarketDataTimeout.TotalSeconds
+            });
+            // #endregion
             throw new BinollaTimeoutException("History not available for asset/period.");
+        }
 
         return history;
     }

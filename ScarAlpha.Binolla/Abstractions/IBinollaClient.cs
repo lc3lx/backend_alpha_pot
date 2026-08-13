@@ -79,7 +79,11 @@ public sealed class BinollaSessionManagerOptions
     public TimeSpan AuthenticationTimeout { get; set; } = TimeSpan.FromSeconds(20);
 
     /// <summary>Assets/quotes/candles should not block HTTP requests for a full minute.</summary>
-    public TimeSpan MarketDataTimeout { get; set; } = TimeSpan.FromSeconds(8);
+    /// <remarks>
+    /// Post-login Binolla often needs &gt;8s before s_assets/list and s_history/last arrive
+    /// (PM2: assets count=0 at ~8s, then count=120; candles MARKET_UNAVAILABLE at ~8s).
+    /// </remarks>
+    public TimeSpan MarketDataTimeout { get; set; } = TimeSpan.FromSeconds(20);
 
     public TimeSpan PlaceOrderTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
