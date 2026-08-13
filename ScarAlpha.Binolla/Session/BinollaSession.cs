@@ -332,6 +332,21 @@ public sealed class BinollaSession : IBinollaClient
     public async Task SubscribePairAsync(string pair, int period = 60, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
+        // asset/change during a brief unauthorized reauth — wait for Connected again.
+        if (Lifecycle is SessionLifecycleState.Connecting or SessionLifecycleState.Reconnecting)
+        {
+            try
+            {
+                using var waitCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                waitCts.CancelAfter(TimeSpan.FromSeconds(12));
+                await WaitUntilNotConnectingAsync(waitCts.Token).ConfigureAwait(false);
+            }
+            catch
+            {
+                // fall through to EnsureConnected
+            }
+        }
+
         EnsureConnected();
         State.Touch();
 
@@ -339,10 +354,20 @@ public sealed class BinollaSession : IBinollaClient
         await _subscribeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            // Remember before send — unauthorized reauth must still re-subscribe this pair.
+            State.RememberSubscription(pair);
             // Only asset/change — alert/list on every quote tick flooded the socket and
             // interleaved with binary history/quote attachments.
             await transport.SendAsync(BinollaFraming.BuildAssetChange(pair, period), cancellationToken).ConfigureAwait(false);
-            State.RememberSubscription(pair);
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H113", "BinollaSession.SubscribePairAsync", "asset_change_sent", new
+            {
+                pair,
+                period,
+                lifecycle = Lifecycle.ToString(),
+                subscribed = State.SubscribedPairs.Count
+            });
+            // #endregion
         }
         finally
         {

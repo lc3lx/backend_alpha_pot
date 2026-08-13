@@ -175,8 +175,17 @@ internal sealed class SessionMessageRouter
         {
             Interlocked.Increment(ref _unauthorizedReauthCount);
             Interlocked.Exchange(ref _authorized, 0);
-            _state.ResetMarketCaches();
-            _state.ClearSubscriptions();
+            var everAuth = Volatile.Read(ref _everAuthorized) == 1;
+            // After a successful auth, asset/change often gets a transient unauthorized.
+            // Clearing subscriptions here dropped the pair RememberSubscription just stored,
+            // so post-auth bootstrap never re-sent asset/change → candles timed out 20s
+            // (PM2: assets=121, candles/GBPUSD_otc MARKET_UNAVAILABLE).
+            if (!everAuth)
+            {
+                _state.ResetMarketCaches();
+                _state.ClearSubscriptions();
+            }
+
             // Keep Connecting — do not mark AuthenticationFailed yet.
             if (lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
                 _state.SetLifecycle(SessionLifecycleState.Connecting, "Binolla unauthorized; re-sending SSID.");
@@ -185,7 +194,10 @@ internal sealed class SessionMessageRouter
             {
                 ssidLen = _state.Ssid!.Length,
                 fromLifecycle = lifecycle.ToString(),
-                reauthCount = Volatile.Read(ref _unauthorizedReauthCount)
+                reauthCount = Volatile.Read(ref _unauthorizedReauthCount),
+                everAuth,
+                keptSubscriptions = everAuth,
+                subscribed = _state.SubscribedPairs.Count
             });
             await _sendAsync(_state.Ssid, cancellationToken).ConfigureAwait(false);
             return;
@@ -666,5 +678,15 @@ internal sealed class SessionMessageRouter
         }
 
         _state.HistoricalData[$"{asset}:{period}"] = history;
+        // #region agent log
+        LoginTrace.Write("H113", "SessionMessageRouter.ProcessHistoryLast", "history_stored", new
+        {
+            asset,
+            period,
+            candleCount = history.Candles.Count,
+            tickCount = history.TickHistory.Count,
+            cacheSize = _state.HistoricalData.Count
+        });
+        // #endregion
     }
 }
