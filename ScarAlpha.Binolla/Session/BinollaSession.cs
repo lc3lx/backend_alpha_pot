@@ -491,7 +491,8 @@ public sealed class BinollaSession : IBinollaClient
             return null;
         }
 
-        await SubscribePairAsync(key, 60, cancellationToken).ConfigureAwait(false);
+        // Subscribe/wait independent of HTTP abort (same as GetHistoryAsync).
+        await SubscribePairAsync(key, 60, CancellationToken.None).ConfigureAwait(false);
 
         if (FindQuote() is { } existing)
             return existing;
@@ -502,25 +503,32 @@ public sealed class BinollaSession : IBinollaClient
             await WaitForConditionAsync(
                     () => FindQuote() is not null,
                     half,
-                    cancellationToken)
+                    CancellationToken.None)
                 .ConfigureAwait(false);
         }
         catch (BinollaTimeoutException)
         {
             try
             {
-                await SubscribePairAsync(key, 60, cancellationToken).ConfigureAwait(false);
+                await SubscribePairAsync(key, 60, CancellationToken.None).ConfigureAwait(false);
             }
             catch
             {
                 // ignore
             }
 
-            await WaitForConditionAsync(
-                    () => FindQuote() is not null,
-                    half,
-                    cancellationToken)
-                .ConfigureAwait(false);
+            try
+            {
+                await WaitForConditionAsync(
+                        () => FindQuote() is not null,
+                        half,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch (BinollaTimeoutException)
+            {
+                // fall through
+            }
         }
 
         if (FindQuote() is not { } quote)
@@ -601,15 +609,14 @@ public sealed class BinollaSession : IBinollaClient
             return afterSub;
         }
 
-        // Independent of HTTP abort — FE timeout must not cancel the WS history wait early.
+        // Wait only on timeout budget — never on HTTP RequestAborted (FE aborts ~15–35s).
         var half = TimeSpan.FromMilliseconds(Math.Max(500, _options.MarketDataTimeout.TotalMilliseconds / 2));
         try
         {
-            using var waitCts = new CancellationTokenSource(half);
             await WaitForConditionAsync(
                     () => FindHistory() is not null,
                     half,
-                    waitCts.Token)
+                    CancellationToken.None)
                 .ConfigureAwait(false);
         }
         catch (BinollaTimeoutException)
@@ -625,13 +632,12 @@ public sealed class BinollaSession : IBinollaClient
                 // ignore nudge failures
             }
 
-            using var waitCts2 = new CancellationTokenSource(half);
             try
             {
                 await WaitForConditionAsync(
                         () => FindHistory() is not null,
                         half,
-                        waitCts2.Token)
+                        CancellationToken.None)
                     .ConfigureAwait(false);
             }
             catch (BinollaTimeoutException)
@@ -678,18 +684,28 @@ public sealed class BinollaSession : IBinollaClient
         if (condition())
             return;
 
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        cts.CancelAfter(timeout);
+        // Dedicated timeout CTS — do NOT link caller CT into CancelAfter semantics.
+        // Passing an already-CancelAfter token made timeout look like caller cancel
+        // (PM2: TaskCanceledException at ~15s → Unable to load candles 500).
+        using var timeoutCts = new CancellationTokenSource(timeout);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
         try
         {
             while (!condition())
             {
-                cts.Token.ThrowIfCancellationRequested();
-                await Task.Delay(50, cts.Token).ConfigureAwait(false);
+                linked.Token.ThrowIfCancellationRequested();
+                await Task.Delay(50, linked.Token).ConfigureAwait(false);
             }
         }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
+                "H130",
+                "BinollaSession.WaitForConditionAsync",
+                "mapped_timeout",
+                new { timeoutMs = timeout.TotalMilliseconds });
+            // #endregion
             throw new BinollaTimeoutException("Timed out waiting for market data.");
         }
     }

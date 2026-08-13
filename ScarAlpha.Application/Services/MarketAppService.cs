@@ -123,11 +123,24 @@ public sealed class MarketAppService
         }
         catch (BinollaTimeoutException)
         {
+            _logger.LogInformation(
+                "Market price not ready for user {UserId} asset={Asset}; returning unavailable soft",
+                _currentUser.UserId, symbol);
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
+                "H131",
+                "MarketAppService.GetPriceAsync",
+                "quote_soft_timeout",
+                new { symbol, elapsedMs = sw.ElapsedMilliseconds });
+            // #endregion
             throw new ApiException(ApiErrorCodes.MarketUnavailable, "Quote is not available for this asset.", 503);
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
-            throw new ApiException(ApiErrorCodes.MarketUnavailable, "Quote request was cancelled.", 503);
+            _logger.LogInformation(
+                "Market price canceled for user {UserId} asset={Asset}",
+                _currentUser.UserId, symbol);
+            throw new ApiException(ApiErrorCodes.MarketUnavailable, "Quote is not available for this asset.", 503);
         }
         catch (BinollaConnectionException)
         {
@@ -216,11 +229,29 @@ public sealed class MarketAppService
             _logger.LogInformation(
                 "Market candles not ready for user {UserId} asset={Asset} period={Period}; returning empty",
                 _currentUser.UserId, symbol, period);
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
+                "H131",
+                "MarketAppService.GetCandlesAsync",
+                "candles_soft_timeout",
+                new { symbol, period, elapsedMs = sw.ElapsedMilliseconds });
+            // #endregion
             return new MarketCandlesResponse(symbol, period, Array.Empty<MarketCandleDto>());
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
-            throw new ApiException(ApiErrorCodes.MarketUnavailable, "Candles request was cancelled.", 503);
+            // Timeout mis-classified as cancel, or client aborted mid-wait — never 500 the chart.
+            _logger.LogInformation(
+                "Market candles canceled/empty for user {UserId} asset={Asset} period={Period}",
+                _currentUser.UserId, symbol, period);
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
+                "H131",
+                "MarketAppService.GetCandlesAsync",
+                "candles_soft_cancel",
+                new { symbol, period, elapsedMs = sw.ElapsedMilliseconds, httpAborted = ct.IsCancellationRequested });
+            // #endregion
+            return new MarketCandlesResponse(symbol, period, Array.Empty<MarketCandleDto>());
         }
         catch (BinollaConnectionException)
         {
@@ -234,7 +265,7 @@ public sealed class MarketAppService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Market candles failed for user {UserId}", _currentUser.UserId);
-            throw new ApiException(ApiErrorCodes.BinollaConnectionFailed, "Unable to load candles.", 502);
+            return new MarketCandlesResponse(symbol, period, Array.Empty<MarketCandleDto>());
         }
     }
 
