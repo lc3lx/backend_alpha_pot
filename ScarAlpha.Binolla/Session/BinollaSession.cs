@@ -93,19 +93,20 @@ public sealed class BinollaSession : IBinollaClient
             });
             // #endregion
 
+            var connectSw = System.Diagnostics.Stopwatch.StartNew();
             await ConnectSocketsAsync(_sessionCts.Token).ConfigureAwait(false);
+            var socketMs = connectSw.ElapsedMilliseconds;
             await WaitForAuthenticationAsync(cancellationToken).ConfigureAwait(false);
 
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H80", "BinollaSession.ConnectAsync", "auth_ok", new
             {
                 lifecycle = Lifecycle.ToString(),
-                transportUp = _trading?.IsConnected == true
+                transportUp = _trading?.IsConnected == true,
+                socketMs,
+                authMs = connectSw.ElapsedMilliseconds
             });
             // #endregion
-
-            // Balance list is bootstrap-driven; wait briefly for first balance event if possible
-            await WaitForBalanceHintAsync(cancellationToken).ConfigureAwait(false);
 
             // Final guard — unauthorized can race in after auth_ok and leave AuthFailed
             // while ConnectAsync would otherwise return successfully (login then 502 on ChangeAccount).
@@ -693,6 +694,14 @@ public sealed class BinollaSession : IBinollaClient
 
         await using var reg = timeoutCts.Token.Register(() =>
         {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H101", "BinollaSession.WaitForAuthenticationAsync", "auth_timeout", new
+            {
+                lifecycle = State.Lifecycle.ToString(),
+                timeoutSec = _options.AuthenticationTimeout.TotalSeconds,
+                transportUp = _trading?.IsConnected == true
+            });
+            // #endregion
             if (cancellationToken.IsCancellationRequested)
                 tcs.TrySetCanceled(cancellationToken);
             else

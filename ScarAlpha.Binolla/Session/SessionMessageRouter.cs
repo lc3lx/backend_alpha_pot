@@ -50,6 +50,13 @@ internal sealed class SessionMessageRouter
         {
             var ssid = _state.Ssid
                        ?? throw new BinollaAuthenticationException("SSID is missing.");
+            // #region agent log
+            LoginTrace.Write("H102", "SessionMessageRouter.HandleRaw", "ns_connect_send_ssid", new
+            {
+                lifecycle = _state.Lifecycle.ToString(),
+                ssidLen = ssid.Length
+            });
+            // #endregion
             await _sendAsync(ssid, cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -81,6 +88,18 @@ internal sealed class SessionMessageRouter
                 await HandleUnauthorizedAsync(cancellationToken).ConfigureAwait(false);
                 return;
             }
+
+            // #region agent log
+            if (_state.Lifecycle is SessionLifecycleState.Connecting or SessionLifecycleState.Reconnecting &&
+                TryParseSocketIoEvent(message, out var inboundName, out _))
+            {
+                LoginTrace.Write("H102", "SessionMessageRouter.HandleRaw", "connect_event", new
+                {
+                    eventName = inboundName.Length > 40 ? inboundName[..40] : inboundName,
+                    lifecycle = _state.Lifecycle.ToString()
+                });
+            }
+            // #endregion
 
             if (TryParseSocketIoEvent(message, out var eventName, out var payload))
             {

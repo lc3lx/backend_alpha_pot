@@ -343,8 +343,24 @@ async function main() {
   const signupUrl = arg('signupUrl', 'https://binolla.com/signup/?lid=15968');
   const timeoutMs = Number(arg('timeoutMs', '45000')) || 45000;
   // Leave headroom so C# WaitForExit (timeoutMs+15s) does not kill us mid-exit.
-  // Keep poll short: exit as soon as token appears; do not burn 45s after failed API.
-  const waitBudgetMs = Math.max(8_000, Math.min(timeoutMs - 15_000, 12_000));
+  // Exit as soon as token appears — do not burn extra seconds after a successful API login.
+  const waitBudgetMs = Math.max(3_000, Math.min(timeoutMs - 20_000, 5_000));
+  const captureStarted = Date.now();
+  const agentLog = (hypothesisId, location, message, data) => {
+    fetch('http://127.0.0.1:7892/ingest/aea6d51e-f3e9-4c7e-b6b4-db55c4306e97', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '660ec2' },
+      body: JSON.stringify({
+        sessionId: '660ec2',
+        runId: 'login-speed',
+        hypothesisId,
+        location,
+        message,
+        data,
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+  };
   const proxyServer =
     arg('proxy') || process.env.BINOLLA_AUTH_PROXY || process.env.Binolla__CredentialLogin__ProxyServer || '';
 
@@ -466,12 +482,7 @@ async function main() {
     });
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
-    // Brief settle for Cloudflare cookies — avoid long networkidle stalls.
-    try {
-      await page.waitForLoadState('networkidle', { timeout: 3000 });
-    } catch {
-      /* best effort */
-    }
+    agentLog('H103', 'capture.mjs:goto', 'page_loaded', { elapsedMs: Date.now() - captureStarted, isSignup });
 
 
     // --- Preferred path: in-page auth API (CF cookies already set) ---
@@ -483,11 +494,17 @@ async function main() {
     // API may set cookies/storage without putting token in the JSON body.
     if (!token && apiResult.okStatus) {
       const started = Date.now();
-      while (!token && Date.now() - started < 4000) {
-        await page.waitForTimeout(200);
+      while (!token && Date.now() - started < 800) {
+        await page.waitForTimeout(100);
         tryCapture(await scanStorage(page), 'storage-after-api');
       }
     }
+    agentLog('H103', 'capture.mjs:api', 'after_api', {
+      elapsedMs: Date.now() - captureStarted,
+      hasToken: Boolean(token),
+      apiOk: Boolean(apiResult.okStatus),
+      attempts: (apiResult.attempts || []).map((a) => `${a.path}:${a.status}`).slice(0, 6),
+    });
 
     if (!token) {
       // --- Fallback: DOM form ---
@@ -553,15 +570,9 @@ async function main() {
 
       const clicked = await clickSubmit(page, isSignup);
 
-      try {
-        await page.waitForLoadState('networkidle', { timeout: Math.min(3000, waitBudgetMs) });
-      } catch {
-        /* best effort */
-      }
-
       const started = Date.now();
       while (!token && Date.now() - started < waitBudgetMs) {
-        await page.waitForTimeout(250);
+        await page.waitForTimeout(150);
         if (!token) tryCapture(await scanStorage(page), 'storage-poll');
       }
     }
@@ -610,10 +621,16 @@ async function main() {
       process.exit(1);
     }
 
+    const cookies = await buildCookieHeader(context);
+    agentLog('H103', 'capture.mjs:done', 'token_captured', {
+      elapsedMs: Date.now() - captureStarted,
+      hasCookies: Boolean(cookies),
+      cookieLen: cookies ? cookies.length : 0,
+    });
     process.stdout.write(JSON.stringify({
       ok: true,
       token,
-      cookies: await buildCookieHeader(context),
+      cookies,
     }));
   } catch (err) {
     process.stdout.write(

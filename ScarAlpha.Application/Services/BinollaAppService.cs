@@ -51,6 +51,7 @@ public sealed class BinollaAppService
         ValidateCredentialRequest(request);
 
         BinollaCapturedSession captured;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             captured = await _credentialAuth.LoginAsync(request.Email, request.Password, ct);
@@ -68,11 +69,47 @@ public sealed class BinollaAppService
                 400);
         }
 
+        var captureMs = sw.ElapsedMilliseconds;
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H100", "BinollaAppService.LoginWithCredentialsAsync", "capture_ok", new
+        {
+            captureMs,
+            hasCookies = !string.IsNullOrWhiteSpace(captured.CookieHeader),
+            cookieLen = captured.CookieHeader?.Length ?? 0,
+            ssidLen = captured.SsidFrame?.Length ?? 0
+        });
+        // #endregion
+
         // Password is never stored — only the resulting SSID is encrypted via ConnectAsync.
-        return await ConnectAsync(
-            new BinollaConnectRequest(captured.SsidFrame, request.AccountType),
-            ct,
-            captured.CookieHeader);
+        try
+        {
+            var result = await ConnectAsync(
+                new BinollaConnectRequest(captured.SsidFrame, request.AccountType),
+                ct,
+                captured.CookieHeader);
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H100", "BinollaAppService.LoginWithCredentialsAsync", "login_ok", new
+            {
+                captureMs,
+                totalMs = sw.ElapsedMilliseconds
+            });
+            // #endregion
+            return result;
+        }
+        catch (Exception ex)
+        {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H101", "BinollaAppService.LoginWithCredentialsAsync", "connect_after_capture_failed", new
+            {
+                captureMs,
+                totalMs = sw.ElapsedMilliseconds,
+                type = ex.GetType().Name,
+                code = (ex as ApiException)?.Code,
+                message = ex.Message.Length > 140 ? ex.Message[..140] : ex.Message
+            });
+            // #endregion
+            throw;
+        }
     }
 
     public async Task<BinollaConnectResponse> SignUpWithCredentialsAsync(
@@ -158,21 +195,8 @@ public sealed class BinollaAppService
 
             await client.ChangeAccountAsync(EngineAccount.Demo, ct);
 
-            // Do not block login on a full balance wait (was misreported as auth timeout for ~60s).
+            // Login must return as soon as the socket is authorized. Balance loads on the next market call.
             decimal? balanceValue = null;
-            try
-            {
-                using var balCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                balCts.CancelAfter(TimeSpan.FromSeconds(8));
-                var balance = await client.GetBalanceAsync(balCts.Token);
-                balanceValue = balance.DemoBalance;
-            }
-            catch (Exception ex) when (ex is OperationCanceledException or BinollaTimeoutException)
-            {
-                _logger.LogInformation(
-                    "Binolla balance not ready yet after connect for user {UserId}; continuing without blocking login ({Error})",
-                    userId, ex.GetType().Name);
-            }
 
             var now = DateTimeOffset.UtcNow;
             var link = await _links.GetByUserIdAsync(userId, ct) ?? new BinollaLink
