@@ -677,6 +677,54 @@ internal sealed class SessionMessageRouter
             }
         }
 
+        // Some OTC pushes only tick history — synthesize OHLC so the chart can render.
+        if (history.Candles.Count == 0 && history.TickHistory.Count > 0)
+        {
+            var bucket = Math.Max(1, period);
+            long? curBucket = null;
+            double open = 0, high = 0, low = 0, close = 0;
+            foreach (var tick in history.TickHistory.OrderBy(t => t.Timestamp))
+            {
+                var ts = (long)tick.Timestamp;
+                var b = ts - (ts % bucket);
+                if (curBucket is null || curBucket != b)
+                {
+                    if (curBucket is not null)
+                    {
+                        history.Candles.Add(new CandlestickData
+                        {
+                            Timestamp = curBucket.Value,
+                            Open = open,
+                            High = high,
+                            Low = low,
+                            Close = close
+                        });
+                    }
+
+                    open = high = low = close = tick.Price;
+                    curBucket = b;
+                }
+                else
+                {
+                    high = Math.Max(high, tick.Price);
+                    low = Math.Min(low, tick.Price);
+                    close = tick.Price;
+                }
+            }
+
+            if (curBucket is not null)
+            {
+                history.Candles.Add(new CandlestickData
+                {
+                    Timestamp = curBucket.Value,
+                    Open = open,
+                    High = high,
+                    Low = low,
+                    Close = close
+                });
+            }
+        }
+
         _state.HistoricalData[$"{asset}:{period}"] = history;
         // #region agent log
         LoginTrace.Write("H113", "SessionMessageRouter.ProcessHistoryLast", "history_stored", new
@@ -685,6 +733,7 @@ internal sealed class SessionMessageRouter
             period,
             candleCount = history.Candles.Count,
             tickCount = history.TickHistory.Count,
+            synthesized = history.Candles.Count > 0 && history.TickHistory.Count > 0,
             cacheSize = _state.HistoricalData.Count
         });
         // #endregion
