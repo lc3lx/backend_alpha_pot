@@ -180,18 +180,31 @@ public sealed class BinollaSession : IBinollaClient
         {
             var transport = _trading;
             if (transport is not null && transport.IsConnected)
-                await transport.SendAsync("42[\"balances/list\"]", cancellationToken).ConfigureAwait(false);
+                await transport.SendAsync("42[\"balances/list\"]", CancellationToken.None).ConfigureAwait(false);
         }
         catch
         {
             // best effort
         }
 
-        await WaitForConditionAsync(
-                () => State.BalanceUpdatedAt is not null,
-                _options.MarketDataTimeout,
-                cancellationToken)
-            .ConfigureAwait(false);
+        // Keep page navigations snappy — Home/Trading poll; do not burn MarketDataTimeout here.
+        using var waitCts = new CancellationTokenSource(TimeSpan.FromSeconds(2.5));
+        try
+        {
+            await WaitForConditionAsync(
+                    () => State.BalanceUpdatedAt is not null,
+                    TimeSpan.FromSeconds(2.5),
+                    waitCts.Token)
+                .ConfigureAwait(false);
+        }
+        catch (BinollaTimeoutException)
+        {
+            // fall through
+        }
+        catch (OperationCanceledException)
+        {
+            // fall through
+        }
 
         if (State.BalanceUpdatedAt is null)
             throw new BinollaTimeoutException("Balance was not received in time.");
@@ -399,24 +412,31 @@ public sealed class BinollaSession : IBinollaClient
             {
                 var transport = _trading;
                 if (transport is not null && transport.IsConnected)
-                    await transport.SendAsync("42[\"assets/list\"]", cancellationToken).ConfigureAwait(false);
+                    await transport.SendAsync("42[\"assets/list\"]", CancellationToken.None).ConfigureAwait(false);
             }
             catch
             {
                 // best effort nudge
             }
 
+            // Do NOT wait full MarketDataTimeout on every page — that made Home/Trading hang ~30s
+            // when s_assets/list was slow (PM2: count=0 elapsedMs=30005).
+            using var waitCts = new CancellationTokenSource(TimeSpan.FromSeconds(2.5));
             try
             {
                 await WaitForConditionAsync(
                         () => State.Assets.Count > 0,
-                        _options.MarketDataTimeout,
-                        cancellationToken)
+                        TimeSpan.FromSeconds(2.5),
+                        waitCts.Token)
                     .ConfigureAwait(false);
             }
             catch (BinollaTimeoutException)
             {
-                // Prefer empty list over hanging the Home/Trading UI.
+                // Prefer empty list over hanging the UI.
+            }
+            catch (OperationCanceledException)
+            {
+                // Prefer empty list over hanging the UI.
             }
         }
 

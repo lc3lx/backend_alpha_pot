@@ -29,11 +29,11 @@ public sealed class MarketAppService
     public async Task<MarketAssetsResponse> GetAssetsAsync(CancellationToken ct)
     {
         await EnsureBotAccessAsync(ct);
-        var client = RequireConnectedClient();
+        var client = await RequireConnectedClientAsync(ct);
         var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
-            var assets = await client.GetTradingAssetsAsync(ct);
+            var assets = await client.GetTradingAssetsAsync(CancellationToken.None);
             _logger.LogInformation(
                 "Market assets for user {UserId}: count={Count} elapsedMs={ElapsedMs}",
                 _currentUser.UserId, assets.Count, sw.ElapsedMilliseconds);
@@ -65,6 +65,10 @@ public sealed class MarketAppService
                 Available: a.IsOpen,
                 Payout: a.PayoutPercentage > 0 ? a.PayoutPercentage : null)).ToList());
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            return new MarketAssetsResponse(Array.Empty<MarketAssetDto>());
+        }
         catch (BinollaAuthenticationException)
         {
             throw new ApiException(ApiErrorCodes.BinollaSessionExpired, "Binolla session expired.", 401);
@@ -81,7 +85,8 @@ public sealed class MarketAppService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Market assets failed for user {UserId}", _currentUser.UserId);
-            throw new ApiException(ApiErrorCodes.BinollaConnectionFailed, "Unable to load market assets.", 502);
+            // Soft-fail empty list — never 500 the Trading shell on a transient WS warm-up.
+            return new MarketAssetsResponse(Array.Empty<MarketAssetDto>());
         }
     }
 
@@ -91,7 +96,7 @@ public sealed class MarketAppService
             throw new ApiException(ApiErrorCodes.ValidationError, "asset is required.");
 
         await EnsureBotAccessAsync(ct);
-        var client = RequireConnectedClient();
+        var client = await RequireConnectedClientAsync(ct);
         var symbol = asset.Trim();
         var sw = System.Diagnostics.Stopwatch.StartNew();
         try
@@ -142,7 +147,7 @@ public sealed class MarketAppService
             throw new ApiException(ApiErrorCodes.ValidationError, "period must be between 1 and 14400 seconds.");
 
         await EnsureBotAccessAsync(ct);
-        var client = RequireConnectedClient();
+        var client = await RequireConnectedClientAsync(ct);
         var symbol = asset.Trim();
         var sw = System.Diagnostics.Stopwatch.StartNew();
         try
@@ -228,15 +233,28 @@ public sealed class MarketAppService
         AccountAppService.EnsureConnectedForMarket(access);
     }
 
-    private IBinollaClient RequireConnectedClient()
+    private async Task<IBinollaClient> RequireConnectedClientAsync(CancellationToken ct)
     {
-        var client = _sessions.Get(_currentUser.UserId.ToString());
-        if (client is null ||
-            client.Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected))
+        for (var i = 0; i < 15; i++)
         {
-            throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Connect Binolla before requesting market data.", 409);
+            var client = _sessions.Get(_currentUser.UserId.ToString());
+            if (client is not null &&
+                client.IsTransportConnected &&
+                client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
+            {
+                return client;
+            }
+
+            try
+            {
+                await Task.Delay(200, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                break;
+            }
         }
 
-        return client;
+        throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Connect Binolla before requesting market data.", 409);
     }
 }

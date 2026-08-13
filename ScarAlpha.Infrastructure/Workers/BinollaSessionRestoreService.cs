@@ -25,6 +25,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
     private readonly ILogger<BinollaSessionRestoreService> _logger;
     private readonly ConcurrentDictionary<Guid, byte> _authFailed = new();
     private readonly ConcurrentDictionary<Guid, SemaphoreSlim> _userGates = new();
+    private readonly ConcurrentDictionary<Guid, byte> _bgRestoreQueued = new();
     private readonly TaskCompletionSource _initialDone = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private CancellationTokenSource? _cts;
 
@@ -149,6 +150,40 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
     }
 
     public void ClearAuthFailure(Guid userId) => _authFailed.TryRemove(userId, out _);
+
+    public void EnsureBackgroundRestore(Guid userId)
+    {
+        if (!_options.Enabled || IsLive(userId) || _authFailed.ContainsKey(userId))
+            return;
+
+        if (!_bgRestoreQueued.TryAdd(userId, 1))
+            return;
+
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
+            "H123",
+            "BinollaSessionRestoreService.EnsureBackgroundRestore",
+            "queued",
+            new { });
+        // #endregion
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await RestoreOneAsync(userId, maxAttempts: Math.Max(1, _options.LazyMaxAttempts), CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Background session restore ended for user {UserId}", userId);
+            }
+            finally
+            {
+                _bgRestoreQueued.TryRemove(userId, out _);
+            }
+        });
+    }
 
     private bool IsLive(Guid userId)
     {

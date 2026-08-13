@@ -34,6 +34,7 @@ public sealed class Phase5AccessUnitTests
 
         var client = new Mock<IBinollaClient>(MockBehavior.Strict);
         client.SetupGet(c => c.Lifecycle).Returns(SessionLifecycleState.Connected);
+        client.SetupGet(c => c.IsTransportConnected).Returns(true);
 
         var sessions = new Mock<IBinollaSessionManager>(MockBehavior.Strict);
         sessions.Setup(s => s.Get(userId.ToString())).Returns(client.Object);
@@ -41,6 +42,8 @@ public sealed class Phase5AccessUnitTests
         var restorer = new Mock<IBinollaSessionRestorer>(MockBehavior.Strict);
         restorer.Setup(r => r.TryRestoreUserAsync(It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(false);
+        restorer.Setup(r => r.EnsureBackgroundRestore(It.IsAny<Guid>()));
+        restorer.Setup(r => r.ClearAuthFailure(It.IsAny<Guid>()));
 
         var botAccess = new BotAccessService(links.Object, sessions.Object, restorer.Object);
         var result = await botAccess.CheckAsync(userId);

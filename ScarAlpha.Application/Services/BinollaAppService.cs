@@ -429,8 +429,7 @@ public sealed class BinollaAppService
         var client = RequireConnectedClient();
         try
         {
-            using var balCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            balCts.CancelAfter(TimeSpan.FromSeconds(15));
+            using var balCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
             var balance = await client.GetBalanceAsync(balCts.Token);
             // Real trading is disabled: never surface Real balance as actionable funds.
             return new BinollaBalanceDto(

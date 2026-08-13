@@ -48,6 +48,11 @@ public interface IBinollaSessionRestorer
     /// Clears the sticky auth-failure skip so a fresh credential login can restore again.
     /// </summary>
     void ClearAuthFailure(Guid userId);
+
+    /// <summary>
+    /// Kick a non-blocking restore if the user is not live. Safe to call on every status poll.
+    /// </summary>
+    void EnsureBackgroundRestore(Guid userId);
 }
 
 public enum StrategyCatalogStatus
