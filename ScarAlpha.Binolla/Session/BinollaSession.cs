@@ -374,23 +374,29 @@ public sealed class BinollaSession : IBinollaClient
         {
             // Remember before send — soft unauthorized reauth re-nudges SubscribedPairs.
             State.RememberSubscription(pair);
-            // Prime alert lists once per session (upstream does this before asset/change).
-            if (Interlocked.CompareExchange(ref _alertsPrimed, 1, 0) == 0)
+            // Match upstream exactly: alerts before every asset/change (not once per session).
+            await transport.SendAsync(BinollaFraming.BuildAlertList(), CancellationToken.None).ConfigureAwait(false);
+            await transport.SendAsync(BinollaFraming.BuildAlertClosedList(), CancellationToken.None).ConfigureAwait(false);
+            // Period 60 is what Binolla OTC reliably answers with s_history/last.
+            await transport.SendAsync(BinollaFraming.BuildAssetChange(pair, 60), CancellationToken.None)
+                .ConfigureAwait(false);
+            if (period != 60)
             {
-                await transport.SendAsync(BinollaFraming.BuildAlertList(), CancellationToken.None).ConfigureAwait(false);
-                await transport.SendAsync(BinollaFraming.BuildAlertClosedList(), CancellationToken.None).ConfigureAwait(false);
+                await Task.Delay(40, CancellationToken.None).ConfigureAwait(false);
+                await transport.SendAsync(BinollaFraming.BuildAssetChange(pair, period), CancellationToken.None)
+                    .ConfigureAwait(false);
             }
 
-            await transport.SendAsync(BinollaFraming.BuildAssetChange(pair, period), CancellationToken.None)
-                .ConfigureAwait(false);
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H113", "BinollaSession.SubscribePairAsync", "asset_change_sent", new
             {
                 pair,
                 period,
+                alsoPeriod60 = period != 60,
                 lifecycle = Lifecycle.ToString(),
                 subscribed = State.SubscribedPairs.Count,
-                unauthorized = _router?.UnauthorizedSeen ?? 0
+                unauthorized = _router?.UnauthorizedSeen ?? 0,
+                assetsCached = State.Assets.Count
             });
             // #endregion
         }
@@ -579,7 +585,7 @@ public sealed class BinollaSession : IBinollaClient
             return cached;
         }
 
-        await SubscribePairAsync(key, period, cancellationToken).ConfigureAwait(false);
+        await SubscribePairAsync(key, period, CancellationToken.None).ConfigureAwait(false);
         if (FindHistory() is { } afterSub)
         {
             // #region agent log
@@ -595,34 +601,43 @@ public sealed class BinollaSession : IBinollaClient
             return afterSub;
         }
 
-        // Mid-wait re-subscribe — also nudge period 60 which Binolla OTC most reliably pushes.
+        // Independent of HTTP abort — FE timeout must not cancel the WS history wait early.
         var half = TimeSpan.FromMilliseconds(Math.Max(500, _options.MarketDataTimeout.TotalMilliseconds / 2));
         try
         {
+            using var waitCts = new CancellationTokenSource(half);
             await WaitForConditionAsync(
                     () => FindHistory() is not null,
                     half,
-                    cancellationToken)
+                    waitCts.Token)
                 .ConfigureAwait(false);
         }
         catch (BinollaTimeoutException)
         {
             try
             {
-                await SubscribePairAsync(key, period, cancellationToken).ConfigureAwait(false);
+                await SubscribePairAsync(key, 60, CancellationToken.None).ConfigureAwait(false);
                 if (period != 60)
-                    await SubscribePairAsync(key, 60, cancellationToken).ConfigureAwait(false);
+                    await SubscribePairAsync(key, period, CancellationToken.None).ConfigureAwait(false);
             }
             catch
             {
                 // ignore nudge failures
             }
 
-            await WaitForConditionAsync(
-                    () => FindHistory() is not null,
-                    half,
-                    cancellationToken)
-                .ConfigureAwait(false);
+            using var waitCts2 = new CancellationTokenSource(half);
+            try
+            {
+                await WaitForConditionAsync(
+                        () => FindHistory() is not null,
+                        half,
+                        waitCts2.Token)
+                    .ConfigureAwait(false);
+            }
+            catch (BinollaTimeoutException)
+            {
+                // fall through to FindHistory / timeout log
+            }
         }
 
         if (FindHistory() is { } history)

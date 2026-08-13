@@ -140,17 +140,30 @@ internal sealed class SessionMessageRouter
         // Binary payload following 451-[type] (WS binary decoded to UTF-8).
         // Never treat Engine.IO / Socket.IO control or event frames as attachment payloads —
         // that previously corrupted balances/quotes/history waits.
-        if (!string.IsNullOrEmpty(_upcomingMessageType) && !LooksLikeEngineIoPacket(message))
+        if (!string.IsNullOrEmpty(_upcomingMessageType))
         {
-            var type = _upcomingMessageType;
-            _upcomingMessageType = string.Empty;
-            if (string.Equals(type, BinollaWire.EvAuthorization, StringComparison.Ordinal) ||
-                IsPostAuthSignal(type))
+            if (LooksLikeEngineIoPacket(message))
             {
-                await EnsureAuthorizedAsync(cancellationToken).ConfigureAwait(false);
+                // #region agent log
+                LoginTrace.Write("H126", "SessionMessageRouter.HandleRaw", "binary_skipped_eio", new
+                {
+                    upcoming = _upcomingMessageType,
+                    prefix = message.Length > 12 ? message[..12] : message
+                });
+                // #endregion
             }
+            else
+            {
+                var type = _upcomingMessageType;
+                _upcomingMessageType = string.Empty;
+                if (string.Equals(type, BinollaWire.EvAuthorization, StringComparison.Ordinal) ||
+                    IsPostAuthSignal(type))
+                {
+                    await EnsureAuthorizedAsync(cancellationToken).ConfigureAwait(false);
+                }
 
-            await ProcessEventPayloadAsync(type, message).ConfigureAwait(false);
+                await ProcessEventPayloadAsync(type, message).ConfigureAwait(false);
+            }
         }
     }
 
@@ -264,8 +277,18 @@ internal sealed class SessionMessageRouter
     {
         if (string.IsNullOrEmpty(message)) return true;
         if (message is "2" or "3") return true;
-        if (message.StartsWith('0')) return true;
-        if (message.StartsWith('4')) return true; // 40/41/42/451…
+        // Engine.IO OPEN packet "0{...}" — not a bare '0' digit inside JSON.
+        if (message.StartsWith('0') && (message.Length == 1 || message[1] == '{'))
+            return true;
+        // Precise Socket.IO / Engine.IO message prefixes only.
+        // Previously StartsWith('4') skipped binary JSON payloads that began with '4'
+        // (e.g. corrupted/partial frames) and left s_history/last unprocessed.
+        if (message.StartsWith("40", StringComparison.Ordinal)) return true;
+        if (message.StartsWith("41", StringComparison.Ordinal)) return true;
+        if (message.StartsWith("42", StringComparison.Ordinal)) return true;
+        if (message.StartsWith("43", StringComparison.Ordinal)) return true;
+        if (message.StartsWith("44", StringComparison.Ordinal)) return true;
+        if (message.StartsWith("45", StringComparison.Ordinal)) return true; // 451 binary header
         return false;
     }
 
@@ -702,122 +725,150 @@ internal sealed class SessionMessageRouter
 
     private void ProcessHistoryLast(string content)
     {
-        var historyMessage = JsonConvert.DeserializeObject<JObject>(content);
-        if (historyMessage is null) return;
-
-        var asset = historyMessage["asset"]?.ToString();
-        if (string.IsNullOrWhiteSpace(asset)) return;
-
-        var period = historyMessage["period"]?.ToObject<int>() ?? 60;
-        var history = new HistoryData
+        try
         {
-            Asset = asset,
-            Period = period,
-            ReceivedAt = DateTimeOffset.UtcNow
-        };
-
-        var historyArray = historyMessage["history"] as JArray;
-        if (historyArray is not null)
-        {
-            foreach (var item in historyArray)
+            var historyMessage = JsonConvert.DeserializeObject<JObject>(content);
+            if (historyMessage is null)
             {
-                if (item is not JArray arr || arr.Count < 2) continue;
-                history.TickHistory.Add(new TickData
+                LoginTrace.Write("H126", "SessionMessageRouter.ProcessHistoryLast", "history_null", new
                 {
-                    Timestamp = arr[0]!.Value<double>(),
-                    Price = arr[1]!.Value<double>(),
-                    AdditionalData = arr.Count > 2 ? arr[2] : null
+                    len = content?.Length ?? 0,
+                    prefix = content is { Length: > 0 } ? content[..Math.Min(40, content.Length)] : ""
                 });
+                return;
             }
-        }
 
-        var candlesArray = historyMessage["candles"] as JArray;
-        if (candlesArray is not null)
-        {
-            foreach (var item in candlesArray)
+            var asset = historyMessage["asset"]?.ToString()
+                        ?? historyMessage["pair"]?.ToString()
+                        ?? historyMessage["symbol"]?.ToString();
+            if (string.IsNullOrWhiteSpace(asset))
             {
-                if (item is not JArray arr || arr.Count < 5) continue;
-                // Format: [timestamp, open, low, high, close, volume?, end?]  (upstream)
-                var open = arr[1]!.Value<double>();
-                var low = arr[2]!.Value<double>();
-                var high = arr[3]!.Value<double>();
-                var close = arr[4]!.Value<double>();
-                // Guard against swapped high/low from wire variants.
-                if (low > high) (low, high) = (high, low);
-                high = Math.Max(high, Math.Max(open, close));
-                low = Math.Min(low, Math.Min(open, close));
-                history.Candles.Add(new CandlestickData
+                LoginTrace.Write("H126", "SessionMessageRouter.ProcessHistoryLast", "history_no_asset", new
                 {
-                    Timestamp = arr[0]!.Value<double>(),
-                    Open = open,
-                    Low = low,
-                    High = high,
-                    Close = close,
-                    Volume = arr.Count > 5 ? arr[5]?.Value<double?>() : null,
-                    EndTimestamp = arr.Count > 6 ? arr[6]?.Value<double?>() : null
+                    keys = string.Join(",", historyMessage.Properties().Select(p => p.Name).Take(8))
                 });
+                return;
             }
-        }
 
-        // Some OTC pushes only tick history — synthesize OHLC so the chart can render.
-        if (history.Candles.Count == 0 && history.TickHistory.Count > 0)
-        {
-            var bucket = Math.Max(1, period);
-            long? curBucket = null;
-            double open = 0, high = 0, low = 0, close = 0;
-            foreach (var tick in history.TickHistory.OrderBy(t => t.Timestamp))
+            var period = historyMessage["period"]?.ToObject<int>() ?? 60;
+            var history = new HistoryData
             {
-                var ts = (long)tick.Timestamp;
-                var b = ts - (ts % bucket);
-                if (curBucket is null || curBucket != b)
+                Asset = asset,
+                Period = period,
+                ReceivedAt = DateTimeOffset.UtcNow
+            };
+
+            var historyArray = historyMessage["history"] as JArray;
+            if (historyArray is not null)
+            {
+                foreach (var item in historyArray)
                 {
-                    if (curBucket is not null)
+                    if (item is not JArray arr || arr.Count < 2) continue;
+                    history.TickHistory.Add(new TickData
                     {
-                        history.Candles.Add(new CandlestickData
-                        {
-                            Timestamp = curBucket.Value,
-                            Open = open,
-                            High = high,
-                            Low = low,
-                            Close = close
-                        });
-                    }
-
-                    open = high = low = close = tick.Price;
-                    curBucket = b;
-                }
-                else
-                {
-                    high = Math.Max(high, tick.Price);
-                    low = Math.Min(low, tick.Price);
-                    close = tick.Price;
+                        Timestamp = arr[0]!.Value<double>(),
+                        Price = arr[1]!.Value<double>(),
+                        AdditionalData = arr.Count > 2 ? arr[2] : null
+                    });
                 }
             }
 
-            if (curBucket is not null)
+            var candlesArray = historyMessage["candles"] as JArray;
+            if (candlesArray is not null)
             {
-                history.Candles.Add(new CandlestickData
+                foreach (var item in candlesArray)
                 {
-                    Timestamp = curBucket.Value,
-                    Open = open,
-                    High = high,
-                    Low = low,
-                    Close = close
-                });
+                    if (item is not JArray arr || arr.Count < 5) continue;
+                    // Format: [timestamp, open, low, high, close, volume?, end?]  (upstream)
+                    var open = arr[1]!.Value<double>();
+                    var low = arr[2]!.Value<double>();
+                    var high = arr[3]!.Value<double>();
+                    var close = arr[4]!.Value<double>();
+                    // Guard against swapped high/low from wire variants.
+                    if (low > high) (low, high) = (high, low);
+                    high = Math.Max(high, Math.Max(open, close));
+                    low = Math.Min(low, Math.Min(open, close));
+                    history.Candles.Add(new CandlestickData
+                    {
+                        Timestamp = arr[0]!.Value<double>(),
+                        Open = open,
+                        Low = low,
+                        High = high,
+                        Close = close,
+                        Volume = arr.Count > 5 ? arr[5]?.Value<double?>() : null,
+                        EndTimestamp = arr.Count > 6 ? arr[6]?.Value<double?>() : null
+                    });
+                }
             }
-        }
 
-        _state.HistoricalData[$"{asset}:{period}"] = history;
-        // #region agent log
-        LoginTrace.Write("H113", "SessionMessageRouter.ProcessHistoryLast", "history_stored", new
+            // Some OTC pushes only tick history — synthesize OHLC so the chart can render.
+            if (history.Candles.Count == 0 && history.TickHistory.Count > 0)
+            {
+                var bucket = Math.Max(1, period);
+                long? curBucket = null;
+                double open = 0, high = 0, low = 0, close = 0;
+                foreach (var tick in history.TickHistory.OrderBy(t => t.Timestamp))
+                {
+                    var ts = (long)tick.Timestamp;
+                    var b = ts - (ts % bucket);
+                    if (curBucket is null || curBucket != b)
+                    {
+                        if (curBucket is not null)
+                        {
+                            history.Candles.Add(new CandlestickData
+                            {
+                                Timestamp = curBucket.Value,
+                                Open = open,
+                                High = high,
+                                Low = low,
+                                Close = close
+                            });
+                        }
+
+                        open = high = low = close = tick.Price;
+                        curBucket = b;
+                    }
+                    else
+                    {
+                        high = Math.Max(high, tick.Price);
+                        low = Math.Min(low, tick.Price);
+                        close = tick.Price;
+                    }
+                }
+
+                if (curBucket is not null)
+                {
+                    history.Candles.Add(new CandlestickData
+                    {
+                        Timestamp = curBucket.Value,
+                        Open = open,
+                        High = high,
+                        Low = low,
+                        Close = close
+                    });
+                }
+            }
+
+            _state.HistoricalData[$"{asset}:{period}"] = history;
+            // #region agent log
+            LoginTrace.Write("H113", "SessionMessageRouter.ProcessHistoryLast", "history_stored", new
+            {
+                asset,
+                period,
+                candleCount = history.Candles.Count,
+                tickCount = history.TickHistory.Count,
+                synthesized = history.Candles.Count > 0 && history.TickHistory.Count > 0,
+                cacheSize = _state.HistoricalData.Count
+            });
+            // #endregion
+        }
+        catch (Exception ex)
         {
-            asset,
-            period,
-            candleCount = history.Candles.Count,
-            tickCount = history.TickHistory.Count,
-            synthesized = history.Candles.Count > 0 && history.TickHistory.Count > 0,
-            cacheSize = _state.HistoricalData.Count
-        });
-        // #endregion
+            LoginTrace.Write("H126", "SessionMessageRouter.ProcessHistoryLast", "history_parse_fail", new
+            {
+                type = ex.GetType().Name,
+                len = content?.Length ?? 0
+            });
+        }
     }
 }

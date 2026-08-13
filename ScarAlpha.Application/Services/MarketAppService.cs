@@ -212,7 +212,11 @@ public sealed class MarketAppService
         }
         catch (BinollaTimeoutException)
         {
-            throw new ApiException(ApiErrorCodes.MarketUnavailable, "Candles are not available for this asset.", 503);
+            // Soft empty — FE retries; hard 500 blocked the chart shell after assets already worked.
+            _logger.LogInformation(
+                "Market candles not ready for user {UserId} asset={Asset} period={Period}; returning empty",
+                _currentUser.UserId, symbol, period);
+            return new MarketCandlesResponse(symbol, period, Array.Empty<MarketCandleDto>());
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
