@@ -38,6 +38,27 @@ public sealed class MarketAppService
                 "Market assets for user {UserId}: count={Count} elapsedMs={ElapsedMs}",
                 _currentUser.UserId, assets.Count, sw.ElapsedMilliseconds);
 
+            // #region agent log
+            var fxLike = assets.Where(a =>
+                System.Text.RegularExpressions.Regex.IsMatch(
+                    a.Symbol.Replace("/", "", StringComparison.Ordinal),
+                    @"^(EUR|GBP|USD|AUD|CAD|CHF|JPY|NZD){2}(_otc)?$",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase)).ToList();
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
+                "H1",
+                "MarketAppService.GetAssetsAsync",
+                "assets_list",
+                new
+                {
+                    total = assets.Count,
+                    open = assets.Count(a => a.IsOpen),
+                    fxCount = fxLike.Count,
+                    sample = assets.Take(8).Select(a => a.Symbol).ToArray(),
+                    fxSample = fxLike.Take(12).Select(a => a.Symbol).ToArray(),
+                    hasEurUsd = assets.Any(a => a.Symbol.Contains("EURUSD", StringComparison.OrdinalIgnoreCase)),
+                });
+            // #endregion
+
             return new MarketAssetsResponse(assets.Select(a => new MarketAssetDto(
                 Symbol: a.Symbol,
                 Name: string.IsNullOrWhiteSpace(a.Description) ? a.Symbol : a.Description,
