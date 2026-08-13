@@ -419,14 +419,13 @@ public sealed class BinollaSession : IBinollaClient
                 // best effort nudge
             }
 
-            // Do NOT wait full MarketDataTimeout on every page — that made Home/Trading hang ~30s
-            // when s_assets/list was slow (PM2: count=0 elapsedMs=30005).
-            using var waitCts = new CancellationTokenSource(TimeSpan.FromSeconds(2.5));
+            // First paint after restore often needs >2.5s for s_assets/list binary.
+            using var waitCts = new CancellationTokenSource(TimeSpan.FromSeconds(12));
             try
             {
                 await WaitForConditionAsync(
                         () => State.Assets.Count > 0,
-                        TimeSpan.FromSeconds(2.5),
+                        TimeSpan.FromSeconds(12),
                         waitCts.Token)
                     .ConfigureAwait(false);
             }

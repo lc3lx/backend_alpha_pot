@@ -426,7 +426,33 @@ public sealed class BinollaAppService
         var access = await _access.CheckAsync(_currentUser.UserId, ct);
         AccountAppService.EnsureConnectedForMarket(access);
 
-        var client = RequireConnectedClient();
+        IBinollaClient? client = null;
+        for (var i = 0; i < 15; i++)
+        {
+            client = _sessions.Get(_currentUser.UserId.ToString());
+            if (client is not null &&
+                client.IsTransportConnected &&
+                client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
+            {
+                break;
+            }
+
+            client = null;
+            try { await Task.Delay(200, ct); }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+        }
+
+        if (client is null)
+        {
+            // Background restore still warming — never 500 the shell.
+            return new BinollaBalanceDto(
+                Connected: false,
+                AccountType: "Demo",
+                DemoBalance: 0m,
+                RealBalance: 0m,
+                CurrentBalance: 0m);
+        }
+
         try
         {
             using var balCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
@@ -459,7 +485,12 @@ public sealed class BinollaAppService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Balance fetch failed for user {UserId}", _currentUser.UserId);
-            throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Binolla session is not available.", 409);
+            return new BinollaBalanceDto(
+                Connected: true,
+                AccountType: "Demo",
+                DemoBalance: 0m,
+                RealBalance: 0m,
+                CurrentBalance: 0m);
         }
     }
 

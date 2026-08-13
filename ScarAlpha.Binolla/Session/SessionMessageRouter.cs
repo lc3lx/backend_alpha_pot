@@ -448,7 +448,9 @@ internal sealed class SessionMessageRouter
     }
 
     /// <summary>
-    /// Binary attachments sometimes arrive as a JSON string, or as ["event", payload].
+    /// Binary attachments sometimes arrive as a JSON string, or as ["eventName", payload].
+    /// Must NOT unwrap raw assets/quotes matrices ([[row],[row],...]) — that destroyed
+    /// s_assets/list (PM2: Session restore connected then assets count=0 forever).
     /// </summary>
     private static string UnwrapPayload(string content)
     {
@@ -468,9 +470,14 @@ internal sealed class SessionMessageRouter
             if (trimmed.StartsWith('['))
             {
                 var arr = JsonConvert.DeserializeObject<JArray>(trimmed);
-                if (arr is { Count: >= 2 } && arr[1] is not null &&
+                // Only Socket.IO-style ["event", payload] — first element must be the event name.
+                if (arr is { Count: >= 2 } &&
+                    arr[0]?.Type == JTokenType.String &&
+                    arr[1] is not null &&
                     arr[1]!.Type is JTokenType.Object or JTokenType.Array)
+                {
                     return arr[1]!.ToString(Formatting.None);
+                }
             }
         }
         catch
@@ -652,6 +659,13 @@ internal sealed class SessionMessageRouter
         }
 
         _state.ReplaceAssets(list);
+        // #region agent log
+        LoginTrace.Write("H124", "SessionMessageRouter.ProcessAssetsList", "assets_parsed", new
+        {
+            count = list.Count,
+            sample = list.Take(5).Select(a => a.Name).ToArray()
+        });
+        // #endregion
     }
 
     private void ProcessQuotesList(string content)
