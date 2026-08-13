@@ -19,10 +19,12 @@ internal sealed class SessionMessageRouter
     private readonly Action? _onAuthorized;
     private string _upcomingMessageType = string.Empty;
     private int _authorized;
+    private int _everAuthorized;
     private int _unauthorizedReauthCount;
     private int _nsConnectSends;
     private int _unauthorizedSeen;
     private int _authSignals;
+    private long _lastSoftReauthTicks;
     private string? _lastInboundEvent;
     private const int MaxUnauthorizedReauths = 3;
 
@@ -189,15 +191,51 @@ internal sealed class SessionMessageRouter
             return;
         }
 
-        // Budget exhausted: fail immediately — even while Connecting.
-        // Ignoring here left WaitForAuthentication hanging until the 20s timeout
-        // (PM2: "WebSocket authentication timed out after login token capture").
+        // Budget exhausted.
+        // If we already authenticated once, bootstrap often spams unauthorized — soft re-send
+        // SSID instead of killing the live session (PM2: login 200 then assets BINOLLA_NOT_CONNECTED).
+        if (Volatile.Read(ref _everAuthorized) == 1 && !string.IsNullOrEmpty(_state.Ssid))
+        {
+            var now = Environment.TickCount64;
+            var last = Interlocked.Read(ref _lastSoftReauthTicks);
+            if (now - last < 2_000)
+            {
+                // #region agent log
+                LoginTrace.Write("H109", "SessionMessageRouter.HandleUnauthorized", "soft_reauth_throttled", new
+                {
+                    lifecycle = lifecycle.ToString(),
+                    reauthCount = Volatile.Read(ref _unauthorizedReauthCount)
+                });
+                // #endregion
+                return;
+            }
+
+            Interlocked.Exchange(ref _lastSoftReauthTicks, now);
+            Interlocked.Exchange(ref _authorized, 0);
+            _state.ResetMarketCaches();
+            _state.ClearSubscriptions();
+            if (lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
+                _state.SetLifecycle(SessionLifecycleState.Connecting, "Binolla unauthorized; soft re-auth.");
+
+            // #region agent log
+            LoginTrace.Write("H109", "SessionMessageRouter.HandleUnauthorized", "soft_reauth_post_auth", new
+            {
+                fromLifecycle = lifecycle.ToString(),
+                reauthCount = Volatile.Read(ref _unauthorizedReauthCount)
+            });
+            // #endregion
+            await _sendAsync(_state.Ssid, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        // Never authenticated + budget exhausted → fail fast (avoids 20s login hang).
         // #region agent log
         LoginTrace.Write("H108", "SessionMessageRouter.HandleUnauthorized", "unauthorized_auth_failed", new
         {
             lifecycle = lifecycle.ToString(),
             reauthCount = Volatile.Read(ref _unauthorizedReauthCount),
-            hadAuth = Volatile.Read(ref _authorized) == 1
+            hadAuth = Volatile.Read(ref _authorized) == 1,
+            everAuthorized = Volatile.Read(ref _everAuthorized) == 1
         });
         // #endregion
 
@@ -270,6 +308,7 @@ internal sealed class SessionMessageRouter
     {
         Interlocked.Increment(ref _authSignals);
         _lastInboundEvent = "auth_signal";
+        Interlocked.Exchange(ref _everAuthorized, 1);
         if (Interlocked.Exchange(ref _authorized, 1) == 1)
             return;
 

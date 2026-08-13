@@ -708,14 +708,12 @@ public sealed class BinollaSession : IBinollaClient
     {
         var tcs = _authTcs ?? throw new InvalidOperationException("Auth waiter missing.");
 
-        // Prefer AuthenticationTimeout over HTTP RequestAborted so a slow FE does not
-        // cancel the handshake early; still honor explicit caller cancel.
+        // Do NOT link to the caller/HTTP/restore CT. Lazy restore used an 18s CTS that cancelled
+        // auth mid-handshake while a parallel status restore later succeeded (PM2 assets 18s
+        // BINOLLA_NOT_CONNECTED, then "Session restore: connected").
         using var timeoutCts = new CancellationTokenSource(_options.AuthenticationTimeout);
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
-            timeoutCts.Token,
-            cancellationToken);
 
-        await using var reg = linkedCts.Token.Register(() =>
+        await using var reg = timeoutCts.Token.Register(() =>
         {
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H101", "BinollaSession.WaitForAuthenticationAsync", "auth_timeout", new
@@ -723,18 +721,14 @@ public sealed class BinollaSession : IBinollaClient
                 lifecycle = State.Lifecycle.ToString(),
                 timeoutSec = _options.AuthenticationTimeout.TotalSeconds,
                 transportUp = _trading?.IsConnected == true,
-                requestCanceled = cancellationToken.IsCancellationRequested,
-                authTimedOut = timeoutCts.IsCancellationRequested,
+                callerCanceled = cancellationToken.IsCancellationRequested,
                 nsConnects = _router?.NsConnectSends ?? 0,
                 unauthorized = _router?.UnauthorizedSeen ?? 0,
                 authSignals = _router?.AuthSignals ?? 0,
                 lastEvent = _router?.LastInboundEvent
             });
             // #endregion
-            if (cancellationToken.IsCancellationRequested)
-                tcs.TrySetCanceled(cancellationToken);
-            else
-                tcs.TrySetException(new BinollaTimeoutException("Authentication timed out."));
+            tcs.TrySetException(new BinollaTimeoutException("Authentication timed out."));
         });
 
         try

@@ -81,7 +81,7 @@ public sealed class BotAccessService : IBotAccessService
                 if (deadSession)
                     _restorer.ClearAuthFailure(userId);
 
-                using var restoreCts = new CancellationTokenSource(TimeSpan.FromSeconds(18));
+                using var restoreCts = new CancellationTokenSource(TimeSpan.FromSeconds(35));
                 // #region agent log
                 ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
                     "H106",

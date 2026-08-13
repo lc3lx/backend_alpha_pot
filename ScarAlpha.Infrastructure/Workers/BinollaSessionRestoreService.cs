@@ -161,7 +161,23 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
     private async Task<bool> RestoreOneAsync(Guid userId, int maxAttempts, CancellationToken ct)
     {
         var userGate = _userGates.GetOrAdd(userId, _ => new SemaphoreSlim(1, 1));
-        await userGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await userGate.WaitAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Another restore may still finish — report live state instead of false NOT_CONNECTED.
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
+                "H110",
+                "BinollaSessionRestoreService.RestoreOneAsync",
+                "gate_wait_canceled",
+                new { live = IsLive(userId) });
+            // #endregion
+            return IsLive(userId);
+        }
+
         try
         {
             if (IsLive(userId))
@@ -180,7 +196,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
             {
                 await using var scope = _scopeFactory.CreateAsyncScope();
                 var links = scope.ServiceProvider.GetRequiredService<IBinollaLinkRepository>();
-                var link = await links.GetByUserIdAsync(userId, ct).ConfigureAwait(false);
+                var link = await links.GetByUserIdAsync(userId, CancellationToken.None).ConfigureAwait(false);
                 if (link is null)
                     return false;
 
@@ -215,7 +231,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                     ex,
                     "Session restore: decrypt failed for user {UserId} link={LinkId}; skipping",
                     userId, linkId);
-                await MarkLinkDisconnectedAsync(userId, "DECRYPT_FAILED", ct).ConfigureAwait(false);
+                await MarkLinkDisconnectedAsync(userId, "DECRYPT_FAILED", CancellationToken.None).ConfigureAwait(false);
                 return false;
             }
 
@@ -224,7 +240,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                 _logger.LogWarning(
                     "Session restore: empty SSID after decrypt for user {UserId} link={LinkId}; skipping",
                     userId, linkId);
-                await MarkLinkDisconnectedAsync(userId, "EMPTY_SSID", ct).ConfigureAwait(false);
+                await MarkLinkDisconnectedAsync(userId, "EMPTY_SSID", CancellationToken.None).ConfigureAwait(false);
                 return false;
             }
 
@@ -233,7 +249,8 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
 
             for (var attempt = 1; attempt <= maxAttempts; attempt++)
             {
-                ct.ThrowIfCancellationRequested();
+                if (ct.IsCancellationRequested)
+                    return IsLive(userId);
 
                 try
                 {
@@ -254,11 +271,17 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                         });
                     // #endregion
 
-                    var client = await _sessions.GetOrCreateAsync(userId.ToString(), ssid, ct, cookieHeader)
+                    // Use None for the socket handshake so an 18s access-check CTS cannot
+                    // abort auth after sockets are up; gate still serializes per user.
+                    var client = await _sessions.GetOrCreateAsync(
+                            userId.ToString(),
+                            ssid,
+                            CancellationToken.None,
+                            cookieHeader)
                         .ConfigureAwait(false);
-                    // Demo is selected by post-auth bootstrap — avoid a second account/change race.
+                    _ = client;
 
-                    await TouchLastConnectedAsync(userId, ct).ConfigureAwait(false);
+                    await TouchLastConnectedAsync(userId, CancellationToken.None).ConfigureAwait(false);
                     _authFailed.TryRemove(userId, out _);
 
                     _logger.LogInformation(
@@ -274,12 +297,19 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                         ex,
                         "Session restore: authentication failed for user {UserId} link={LinkId} (SSID invalid/expired); skipping further attempts",
                         userId, linkId);
-                    await MarkLinkDisconnectedAsync(userId, "SSID_EXPIRED", ct).ConfigureAwait(false);
+                    await MarkLinkDisconnectedAsync(userId, "SSID_EXPIRED", CancellationToken.None).ConfigureAwait(false);
                     return false;
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
-                    throw;
+                    // #region agent log
+                    ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
+                        "H110",
+                        "BinollaSessionRestoreService.RestoreOneAsync",
+                        "restore_canceled_check_live",
+                        new { live = IsLive(userId), attempt });
+                    // #endregion
+                    return IsLive(userId);
                 }
                 catch (Exception ex)
                 {
@@ -289,7 +319,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                         userId, linkId, attempt, maxAttempts);
 
                     if (attempt >= maxAttempts)
-                        return false;
+                        return IsLive(userId);
 
                     try
                     {
@@ -297,14 +327,14 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                     }
                     catch (OperationCanceledException) when (ct.IsCancellationRequested)
                     {
-                        throw;
+                        return IsLive(userId);
                     }
 
                     delay = Math.Min(maxDelay, Math.Max(1, delay) * 2);
                 }
             }
 
-            return false;
+            return IsLive(userId);
         }
         finally
         {
