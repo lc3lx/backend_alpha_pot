@@ -6,6 +6,7 @@ using Microsoft.Extensions.Options;
 using ScarAlpha.Application.Abstractions;
 using ScarAlpha.Binolla.Abstractions;
 using ScarAlpha.Binolla.Models;
+using ScarAlpha.Binolla.Session;
 using ScarAlpha.Domain.Enums;
 using EngineAccount = ScarAlpha.Binolla.Models.AccountType;
 
@@ -153,6 +154,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
     {
         var client = _sessions.Get(userId.ToString());
         return client is not null &&
+               client.IsTransportConnected &&
                client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected;
     }
 
@@ -235,7 +237,24 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
 
                 try
                 {
-                    var client = await _sessions.GetOrCreateAsync(userId.ToString(), ssid, ct)
+                    // Prefer cookies already held on a prior live session for this user.
+                    var existingSession = _sessions.Get(userId.ToString()) as BinollaSession;
+                    var cookieHeader = existingSession?.State.CookieHeader;
+                    // #region agent log
+                    ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
+                        "H104",
+                        "BinollaSessionRestoreService.RestoreOneAsync",
+                        "restore_attempt",
+                        new
+                        {
+                            attempt,
+                            hasCookie = !string.IsNullOrWhiteSpace(cookieHeader),
+                            cookieLen = cookieHeader?.Length ?? 0,
+                            priorLifecycle = existingSession?.Lifecycle.ToString() ?? "None"
+                        });
+                    // #endregion
+
+                    var client = await _sessions.GetOrCreateAsync(userId.ToString(), ssid, ct, cookieHeader)
                         .ConfigureAwait(false);
                     await client.ChangeAccountAsync(EngineAccount.Demo, ct).ConfigureAwait(false);
 

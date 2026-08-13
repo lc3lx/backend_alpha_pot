@@ -27,6 +27,7 @@ public sealed class BotAccessService : IBotAccessService
         var client = _sessions.Get(userId.ToString());
 
         var connected = client is not null &&
+                        client.IsTransportConnected &&
                         client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected;
 
         var accountType = (link?.AccountType ?? BinollaAccountType.Demo).ToString();
@@ -34,12 +35,13 @@ public sealed class BotAccessService : IBotAccessService
         var adminApproved = link?.AdminApproved == true;
 
         var deadSession = client is not null &&
-                          client.Lifecycle is SessionLifecycleState.AuthenticationFailed
-                              or SessionLifecycleState.SessionExpired;
+                          (client.Lifecycle is SessionLifecycleState.AuthenticationFailed
+                              or SessionLifecycleState.SessionExpired
+                           || !client.IsTransportConnected);
 
         // Approved/pending + Connected-in-DB but no live session (API restart / idle eviction / unauthorized):
         // best-effort lazy restore before reporting disconnect / session expired.
-        // Do NOT sticky-return SessionExpired on a dead in-memory session — try restore first.
+        // Cap wait — never block /api/account/status for the full WS auth timeout (~20s).
         if ((!connected || deadSession) &&
             link is not null &&
             link.Status == BinollaLinkStatus.Connected &&
@@ -51,7 +53,9 @@ public sealed class BotAccessService : IBotAccessService
                 if (deadSession)
                     _restorer.ClearAuthFailure(userId);
 
-                connected = await _restorer.TryRestoreUserAsync(userId, ct);
+                using var restoreCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                restoreCts.CancelAfter(TimeSpan.FromSeconds(4));
+                connected = await _restorer.TryRestoreUserAsync(userId, restoreCts.Token);
                 if (connected)
                 {
                     client = _sessions.Get(userId.ToString());
@@ -64,7 +68,9 @@ public sealed class BotAccessService : IBotAccessService
             }
             catch
             {
-                connected = false;
+                connected = client is not null &&
+                            client.IsTransportConnected &&
+                            client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected;
             }
         }
 

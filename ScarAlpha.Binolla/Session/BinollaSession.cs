@@ -79,7 +79,10 @@ public sealed class BinollaSession : IBinollaClient
 
             SetLifecycle(SessionLifecycleState.Connecting);
             State.Ssid = ssid;
-            State.CookieHeader = string.IsNullOrWhiteSpace(cookieHeader) ? null : cookieHeader.Trim();
+            // Keep Playwright cookies across SSID-only restores/reconnects.
+            // Wiping CookieHeader here caused post-login /api/account/status to hang 20s then fail.
+            if (!string.IsNullOrWhiteSpace(cookieHeader))
+                State.CookieHeader = cookieHeader.Trim();
             _sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             _reconnectAttempts = 0;
 
