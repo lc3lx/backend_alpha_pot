@@ -194,6 +194,9 @@ internal sealed class SessionMessageRouter
         // Budget exhausted.
         // If we already authenticated once, bootstrap often spams unauthorized — soft re-send
         // SSID instead of killing the live session (PM2: login 200 then assets BINOLLA_NOT_CONNECTED).
+        // Do NOT ResetMarketCaches here: wiping history/quotes mid-wait caused
+        // GetHistoryAsync/GetLatestQuoteAsync to time out at MarketDataTimeout (PM2: MS_otc /
+        // GBPUSD_otc candles/price MARKET_UNAVAILABLE after ~20s while assets stayed at 120).
         if (Volatile.Read(ref _everAuthorized) == 1 && !string.IsNullOrEmpty(_state.Ssid))
         {
             var now = Environment.TickCount64;
@@ -212,8 +215,6 @@ internal sealed class SessionMessageRouter
 
             Interlocked.Exchange(ref _lastSoftReauthTicks, now);
             Interlocked.Exchange(ref _authorized, 0);
-            _state.ResetMarketCaches();
-            _state.ClearSubscriptions();
             if (lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
                 _state.SetLifecycle(SessionLifecycleState.Connecting, "Binolla unauthorized; soft re-auth.");
 
@@ -221,7 +222,9 @@ internal sealed class SessionMessageRouter
             LoginTrace.Write("H109", "SessionMessageRouter.HandleUnauthorized", "soft_reauth_post_auth", new
             {
                 fromLifecycle = lifecycle.ToString(),
-                reauthCount = Volatile.Read(ref _unauthorizedReauthCount)
+                reauthCount = Volatile.Read(ref _unauthorizedReauthCount),
+                historyCached = _state.HistoricalData.Count,
+                quotesCached = _state.LatestQuotes.Count
             });
             // #endregion
             await _sendAsync(_state.Ssid, cancellationToken).ConfigureAwait(false);
