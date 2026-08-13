@@ -20,7 +20,16 @@ internal sealed class SessionMessageRouter
     private string _upcomingMessageType = string.Empty;
     private int _authorized;
     private int _unauthorizedReauthCount;
+    private int _nsConnectSends;
+    private int _unauthorizedSeen;
+    private int _authSignals;
+    private string? _lastInboundEvent;
     private const int MaxUnauthorizedReauths = 3;
+
+    public int NsConnectSends => Volatile.Read(ref _nsConnectSends);
+    public int UnauthorizedSeen => Volatile.Read(ref _unauthorizedSeen);
+    public int AuthSignals => Volatile.Read(ref _authSignals);
+    public string? LastInboundEvent => _lastInboundEvent;
 
     public SessionMessageRouter(
         BinollaSessionState state,
@@ -51,6 +60,8 @@ internal sealed class SessionMessageRouter
         {
             var ssid = _state.Ssid
                        ?? throw new BinollaAuthenticationException("SSID is missing.");
+            Interlocked.Increment(ref _nsConnectSends);
+            _lastInboundEvent = "ns_connect";
             // #region agent log
             LoginTrace.Write("H102", "SessionMessageRouter.HandleRaw", "ns_connect_send_ssid", new
             {
@@ -143,6 +154,8 @@ internal sealed class SessionMessageRouter
 
     private async Task HandleUnauthorizedAsync(CancellationToken cancellationToken)
     {
+        Interlocked.Increment(ref _unauthorizedSeen);
+        _lastInboundEvent = "unauthorized";
         var lifecycle = _state.Lifecycle;
         // #region agent log
         ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H83", "SessionMessageRouter.HandleUnauthorized", "unauthorized_received", new
@@ -176,15 +189,17 @@ internal sealed class SessionMessageRouter
             return;
         }
 
-        // Duplicate unauthorized while reauth handshake is still in flight — ignore.
-        if (lifecycle is SessionLifecycleState.Connecting or SessionLifecycleState.Reconnecting)
+        // Budget exhausted: fail immediately — even while Connecting.
+        // Ignoring here left WaitForAuthentication hanging until the 20s timeout
+        // (PM2: "WebSocket authentication timed out after login token capture").
+        // #region agent log
+        LoginTrace.Write("H108", "SessionMessageRouter.HandleUnauthorized", "unauthorized_auth_failed", new
         {
-            LoginTrace.Write("H83", "SessionMessageRouter.HandleUnauthorized", "unauthorized_ignored_during_reauth", new
-            {
-                lifecycle = lifecycle.ToString()
-            });
-            return;
-        }
+            lifecycle = lifecycle.ToString(),
+            reauthCount = Volatile.Read(ref _unauthorizedReauthCount),
+            hadAuth = Volatile.Read(ref _authorized) == 1
+        });
+        // #endregion
 
         _state.ResetMarketCaches();
         _state.ClearSubscriptions();
@@ -253,6 +268,8 @@ internal sealed class SessionMessageRouter
 
     private async Task EnsureAuthorizedAsync(CancellationToken cancellationToken)
     {
+        Interlocked.Increment(ref _authSignals);
+        _lastInboundEvent = "auth_signal";
         if (Interlocked.Exchange(ref _authorized, 1) == 1)
             return;
 

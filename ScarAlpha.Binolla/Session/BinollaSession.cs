@@ -95,7 +95,11 @@ public sealed class BinollaSession : IBinollaClient
             // Wiping CookieHeader here caused post-login /api/account/status to hang 20s then fail.
             if (!string.IsNullOrWhiteSpace(cookieHeader))
                 State.CookieHeader = cookieHeader.Trim();
-            _sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            // Session lifetime must NOT link to the HTTP request CT — RequestAborted / FE abort
+            // was cancelling the receive loop mid-handshake and producing auth timeouts.
+            try { _sessionCts?.Cancel(); } catch { /* ignore */ }
+            try { _sessionCts?.Dispose(); } catch { /* ignore */ }
+            _sessionCts = new CancellationTokenSource();
             _reconnectAttempts = 0;
 
             // #region agent log
@@ -704,17 +708,27 @@ public sealed class BinollaSession : IBinollaClient
     {
         var tcs = _authTcs ?? throw new InvalidOperationException("Auth waiter missing.");
 
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutCts.CancelAfter(_options.AuthenticationTimeout);
+        // Prefer AuthenticationTimeout over HTTP RequestAborted so a slow FE does not
+        // cancel the handshake early; still honor explicit caller cancel.
+        using var timeoutCts = new CancellationTokenSource(_options.AuthenticationTimeout);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+            timeoutCts.Token,
+            cancellationToken);
 
-        await using var reg = timeoutCts.Token.Register(() =>
+        await using var reg = linkedCts.Token.Register(() =>
         {
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H101", "BinollaSession.WaitForAuthenticationAsync", "auth_timeout", new
             {
                 lifecycle = State.Lifecycle.ToString(),
                 timeoutSec = _options.AuthenticationTimeout.TotalSeconds,
-                transportUp = _trading?.IsConnected == true
+                transportUp = _trading?.IsConnected == true,
+                requestCanceled = cancellationToken.IsCancellationRequested,
+                authTimedOut = timeoutCts.IsCancellationRequested,
+                nsConnects = _router?.NsConnectSends ?? 0,
+                unauthorized = _router?.UnauthorizedSeen ?? 0,
+                authSignals = _router?.AuthSignals ?? 0,
+                lastEvent = _router?.LastInboundEvent
             });
             // #endregion
             if (cancellationToken.IsCancellationRequested)
