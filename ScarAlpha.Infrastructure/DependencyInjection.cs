@@ -80,7 +80,9 @@ public static class DependencyInjection
             AuthenticationTimeout = TimeSpan.FromSeconds(
                 configuration.GetValue("Binolla:AuthenticationTimeoutSeconds", 45)),
             MarketDataTimeout = TimeSpan.FromSeconds(
-                configuration.GetValue("Binolla:MarketDataTimeoutSeconds", 30))
+                configuration.GetValue("Binolla:MarketDataTimeoutSeconds", 30)),
+            MarketHttpWait = TimeSpan.FromSeconds(
+                configuration.GetValue("Binolla:MarketHttpWaitSeconds", 4))
         };
         services.AddSingleton(binollaOptions);
         services.AddSingleton<IBinollaSessionManager>(sp =>

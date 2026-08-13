@@ -4,6 +4,7 @@ using ScarAlpha.Application.Common;
 using ScarAlpha.Application.Contracts;
 using ScarAlpha.Binolla.Abstractions;
 using ScarAlpha.Binolla.Models;
+using ScarAlpha.Binolla.Protocol;
 
 namespace ScarAlpha.Application.Services;
 
@@ -53,6 +54,16 @@ public sealed class MarketAppService
                 "Market assets for user {UserId}: count={Count} elapsedMs={ElapsedMs}",
                 _currentUser.UserId, assets.Count, sw.ElapsedMilliseconds);
 
+            // Prefetch EURUSD_otc (or first FX OTC) so candles/price hit cache on next poll.
+            var prefer = assets.FirstOrDefault(a =>
+                             a.Symbol.Equals("EURUSD_otc", StringComparison.OrdinalIgnoreCase))
+                         ?? assets.FirstOrDefault(a =>
+                             a.Symbol.EndsWith("_otc", StringComparison.OrdinalIgnoreCase) &&
+                             a.Symbol.Contains("EUR", StringComparison.OrdinalIgnoreCase))
+                         ?? assets.FirstOrDefault(a => a.IsOpen);
+            if (prefer is not null)
+                client.EnsureMarketDataWarm(prefer.Symbol, 60);
+
             // #region agent log
             var fxLike = assets.Where(a =>
                 System.Text.RegularExpressions.Regex.IsMatch(
@@ -71,6 +82,7 @@ public sealed class MarketAppService
                     sample = assets.Take(8).Select(a => a.Symbol).ToArray(),
                     fxSample = fxLike.Take(12).Select(a => a.Symbol).ToArray(),
                     hasEurUsd = assets.Any(a => a.Symbol.Contains("EURUSD", StringComparison.OrdinalIgnoreCase)),
+                    warmAsset = prefer?.Symbol
                 });
             // #endregion
 
@@ -101,13 +113,24 @@ public sealed class MarketAppService
             throw new ApiException(ApiErrorCodes.ValidationError, "asset is required.");
 
         await EnsureBotAccessAsync(ct);
-        var client = await EnsureLiveClientAsync(ct)
-            ?? throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Binolla session is warming up. Retry shortly.", 409);
+        var client = await EnsureLiveClientAsync(ct);
         var symbol = asset.Trim();
+        if (client is null)
+        {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
+                "H131",
+                "MarketAppService.GetPriceAsync",
+                "price_soft_not_live",
+                new { symbol });
+            // #endregion
+            return new MarketPriceResponse(symbol, null, DateTimeOffset.UtcNow);
+        }
+
         var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
-            var quote = await client.GetLatestQuoteAsync(symbol, ct);
+            var quote = await client.GetLatestQuoteAsync(symbol, CancellationToken.None);
             _logger.LogInformation(
                 "Market price for user {UserId} asset={Asset} elapsedMs={ElapsedMs}",
                 _currentUser.UserId, symbol, sw.ElapsedMilliseconds);
@@ -123,8 +146,9 @@ public sealed class MarketAppService
         }
         catch (BinollaTimeoutException)
         {
+            client.EnsureMarketDataWarm(symbol, 60);
             _logger.LogInformation(
-                "Market price not ready for user {UserId} asset={Asset}; returning unavailable soft",
+                "Market price not ready for user {UserId} asset={Asset}; returning soft null",
                 _currentUser.UserId, symbol);
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
@@ -133,18 +157,20 @@ public sealed class MarketAppService
                 "quote_soft_timeout",
                 new { symbol, elapsedMs = sw.ElapsedMilliseconds });
             // #endregion
-            throw new ApiException(ApiErrorCodes.MarketUnavailable, "Quote is not available for this asset.", 503);
+            // Soft 200 — never 5xx ERR that kills the chart shell.
+            return new MarketPriceResponse(symbol, null, DateTimeOffset.UtcNow);
         }
         catch (OperationCanceledException)
         {
+            client.EnsureMarketDataWarm(symbol, 60);
             _logger.LogInformation(
-                "Market price canceled for user {UserId} asset={Asset}",
+                "Market price canceled for user {UserId} asset={Asset}; returning soft null",
                 _currentUser.UserId, symbol);
-            throw new ApiException(ApiErrorCodes.MarketUnavailable, "Quote is not available for this asset.", 503);
+            return new MarketPriceResponse(symbol, null, DateTimeOffset.UtcNow);
         }
         catch (BinollaConnectionException)
         {
-            throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Binolla session is not connected.", 409);
+            return new MarketPriceResponse(symbol, null, DateTimeOffset.UtcNow);
         }
         catch (BinollaOrderException ex)
         {
@@ -154,7 +180,7 @@ public sealed class MarketAppService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Market price failed for user {UserId}", _currentUser.UserId);
-            throw new ApiException(ApiErrorCodes.BinollaConnectionFailed, "Unable to load quote.", 502);
+            return new MarketPriceResponse(symbol, null, DateTimeOffset.UtcNow);
         }
     }
 
@@ -166,13 +192,26 @@ public sealed class MarketAppService
             throw new ApiException(ApiErrorCodes.ValidationError, "period must be between 1 and 14400 seconds.");
 
         await EnsureBotAccessAsync(ct);
-        var client = await EnsureLiveClientAsync(ct)
-            ?? throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Binolla session is warming up. Retry shortly.", 409);
+        var client = await EnsureLiveClientAsync(ct);
         var symbol = asset.Trim();
+        var wirePeriod = BinollaMarketPeriods.NormalizeHistoryPeriod(period);
+        if (client is null)
+        {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
+                "H131",
+                "MarketAppService.GetCandlesAsync",
+                "candles_soft_not_live",
+                new { symbol, period, wirePeriod });
+            // #endregion
+            return new MarketCandlesResponse(symbol, wirePeriod, Array.Empty<MarketCandleDto>());
+        }
+
+        client.EnsureMarketDataWarm(symbol, wirePeriod);
         var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
-            var history = await client.GetHistoryAsync(symbol, period, ct);
+            var history = await client.GetHistoryAsync(symbol, wirePeriod, CancellationToken.None);
             var raw = history.Candles;
             var rawFirstTs = raw.Count > 0 ? raw[0].Timestamp : (double?)null;
             var rawLastTs = raw.Count > 0 ? raw[^1].Timestamp : (double?)null;
@@ -194,9 +233,10 @@ public sealed class MarketAppService
             var tail = candles.TakeLast(3).Select(c =>
                 $"{c.Open:F5}/{c.High:F5}/{c.Low:F5}/{c.Close:F5}").ToArray();
 
+            var responsePeriod = history.Period > 0 ? history.Period : wirePeriod;
             _logger.LogInformation(
                 "Market candles for user {UserId} asset={Asset} period={Period} count={Count} up={Up} down={Down} doji={Doji} sample={Sample} elapsedMs={ElapsedMs}",
-                _currentUser.UserId, symbol, period, candles.Count, up, down, doji,
+                _currentUser.UserId, symbol, responsePeriod, candles.Count, up, down, doji,
                 string.Join(" | ", tail), sw.ElapsedMilliseconds);
 
             // #region agent log
@@ -212,12 +252,14 @@ public sealed class MarketAppService
                     wasNewestFirst,
                     sortedFirstTs = candles.Count > 0 ? candles[0].Timestamp.ToUnixTimeSeconds() : (long?)null,
                     sortedLastTs = candles.Count > 0 ? candles[^1].Timestamp.ToUnixTimeSeconds() : (long?)null,
-                    period,
+                    requestedPeriod = period,
+                    wirePeriod,
+                    responsePeriod,
                     symbol
                 });
             // #endregion
 
-            return new MarketCandlesResponse(symbol, period, candles);
+            return new MarketCandlesResponse(symbol, responsePeriod, candles);
         }
         catch (BinollaAuthenticationException)
         {
@@ -228,34 +270,34 @@ public sealed class MarketAppService
             // Soft empty — FE retries; hard 500 blocked the chart shell after assets already worked.
             _logger.LogInformation(
                 "Market candles not ready for user {UserId} asset={Asset} period={Period}; returning empty",
-                _currentUser.UserId, symbol, period);
+                _currentUser.UserId, symbol, wirePeriod);
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
                 "H131",
                 "MarketAppService.GetCandlesAsync",
                 "candles_soft_timeout",
-                new { symbol, period, elapsedMs = sw.ElapsedMilliseconds });
+                new { symbol, period, wirePeriod, elapsedMs = sw.ElapsedMilliseconds });
             // #endregion
-            return new MarketCandlesResponse(symbol, period, Array.Empty<MarketCandleDto>());
+            return new MarketCandlesResponse(symbol, wirePeriod, Array.Empty<MarketCandleDto>());
         }
         catch (OperationCanceledException)
         {
             // Timeout mis-classified as cancel, or client aborted mid-wait — never 500 the chart.
             _logger.LogInformation(
                 "Market candles canceled/empty for user {UserId} asset={Asset} period={Period}",
-                _currentUser.UserId, symbol, period);
+                _currentUser.UserId, symbol, wirePeriod);
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
                 "H131",
                 "MarketAppService.GetCandlesAsync",
                 "candles_soft_cancel",
-                new { symbol, period, elapsedMs = sw.ElapsedMilliseconds, httpAborted = ct.IsCancellationRequested });
+                new { symbol, period, wirePeriod, elapsedMs = sw.ElapsedMilliseconds, httpAborted = ct.IsCancellationRequested });
             // #endregion
-            return new MarketCandlesResponse(symbol, period, Array.Empty<MarketCandleDto>());
+            return new MarketCandlesResponse(symbol, wirePeriod, Array.Empty<MarketCandleDto>());
         }
         catch (BinollaConnectionException)
         {
-            throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Binolla session is not connected.", 409);
+            return new MarketCandlesResponse(symbol, wirePeriod, Array.Empty<MarketCandleDto>());
         }
         catch (BinollaOrderException ex)
         {
@@ -265,7 +307,7 @@ public sealed class MarketAppService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Market candles failed for user {UserId}", _currentUser.UserId);
-            return new MarketCandlesResponse(symbol, period, Array.Empty<MarketCandleDto>());
+            return new MarketCandlesResponse(symbol, wirePeriod, Array.Empty<MarketCandleDto>());
         }
     }
 

@@ -1,3 +1,4 @@
+using ScarAlpha.Binolla.Protocol;
 using ScarAlpha.Binolla.Session;
 using Xunit;
 
@@ -29,5 +30,17 @@ public class SocketIoEventParseTests
         Assert.True(ok);
         Assert.Equal("s_quotes/list", name);
         Assert.StartsWith("[", payload);
+    }
+
+    [Theory]
+    [InlineData(60, 60)]
+    [InlineData(300, 300)]
+    [InlineData(900, 900)]
+    [InlineData(3600, 3600)]
+    [InlineData(14400, 60)]
+    [InlineData(120, 60)]
+    public void NormalizeHistoryPeriod_maps_unsupported_to_binolla_safe(int input, int expected)
+    {
+        Assert.Equal(expected, BinollaMarketPeriods.NormalizeHistoryPeriod(input));
     }
 }

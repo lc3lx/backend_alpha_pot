@@ -98,7 +98,7 @@ public sealed record MarketAssetsResponse(IReadOnlyList<MarketAssetDto> Assets);
 
 public sealed record MarketPriceResponse(
     string Asset,
-    decimal Price,
+    decimal? Price,
     DateTimeOffset Timestamp);
 
 public sealed record MarketCandleDto(

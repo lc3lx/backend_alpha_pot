@@ -16,6 +16,7 @@ public sealed class BinollaSession : IBinollaClient
     private readonly SemaphoreSlim _lifecycleLock = new(1, 1);
     private readonly SemaphoreSlim _inboundGate = new(1, 1);
     private readonly SemaphoreSlim _subscribeLock = new(1, 1);
+    private readonly ConcurrentDictionary<string, byte> _warmInFlight = new(StringComparer.OrdinalIgnoreCase);
     private readonly OrderCorrelationHub _orders = new();
     private int _alertsPrimed;
 
@@ -188,18 +189,17 @@ public sealed class BinollaSession : IBinollaClient
         }
 
         // Keep page navigations snappy — Home/Trading poll; do not burn MarketDataTimeout here.
-        using var waitCts = new CancellationTokenSource(TimeSpan.FromSeconds(2.5));
         try
         {
             await WaitForConditionAsync(
                     () => State.BalanceUpdatedAt is not null,
-                    TimeSpan.FromSeconds(2.5),
-                    waitCts.Token)
+                    TimeSpan.FromSeconds(4),
+                    CancellationToken.None)
                 .ConfigureAwait(false);
         }
         catch (BinollaTimeoutException)
         {
-            // fall through
+            // fall through — soft empty Demo snapshot
         }
         catch (OperationCanceledException)
         {
@@ -207,7 +207,22 @@ public sealed class BinollaSession : IBinollaClient
         }
 
         if (State.BalanceUpdatedAt is null)
-            throw new BinollaTimeoutException("Balance was not received in time.");
+        {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H132", "BinollaSession.GetBalanceAsync", "balance_soft_empty", new
+            {
+                assetsCached = State.Assets.Count
+            });
+            // #endregion
+            return new BalanceInfo
+            {
+                DemoBalance = 0m,
+                RealBalance = 0m,
+                CurrentType = AccountType.Demo,
+                LastUpdated = null,
+                Currency = "USD"
+            };
+        }
 
         return State.GetBalanceInfo();
     }
@@ -365,6 +380,8 @@ public sealed class BinollaSession : IBinollaClient
         EnsureConnected();
         State.Touch();
 
+        var requestedPeriod = period;
+        var wirePeriod = BinollaMarketPeriods.NormalizeHistoryPeriod(period);
         var transport = _trading ?? throw new BinollaConnectionException("Not connected.");
         // Do not let a cancelled HTTP tick abort another request's subscribe — use a short local wait.
         using var lockCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -377,22 +394,18 @@ public sealed class BinollaSession : IBinollaClient
             // Match upstream exactly: alerts before every asset/change (not once per session).
             await transport.SendAsync(BinollaFraming.BuildAlertList(), CancellationToken.None).ConfigureAwait(false);
             await transport.SendAsync(BinollaFraming.BuildAlertClosedList(), CancellationToken.None).ConfigureAwait(false);
-            // Period 60 is what Binolla OTC reliably answers with s_history/last.
-            await transport.SendAsync(BinollaFraming.BuildAssetChange(pair, 60), CancellationToken.None)
+            // ONE asset/change only. Sending 14400 after 60 cancels the reliable OTC history push
+            // (PM2: history never arrives for EURUSD_otc period=14400 within 30s).
+            await transport.SendAsync(BinollaFraming.BuildAssetChange(pair, wirePeriod), CancellationToken.None)
                 .ConfigureAwait(false);
-            if (period != 60)
-            {
-                await Task.Delay(40, CancellationToken.None).ConfigureAwait(false);
-                await transport.SendAsync(BinollaFraming.BuildAssetChange(pair, period), CancellationToken.None)
-                    .ConfigureAwait(false);
-            }
 
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H113", "BinollaSession.SubscribePairAsync", "asset_change_sent", new
             {
                 pair,
-                period,
-                alsoPeriod60 = period != 60,
+                requestedPeriod,
+                wirePeriod,
+                clamped = requestedPeriod != wirePeriod,
                 lifecycle = Lifecycle.ToString(),
                 subscribed = State.SubscribedPairs.Count,
                 unauthorized = _router?.UnauthorizedSeen ?? 0,
@@ -404,6 +417,73 @@ public sealed class BinollaSession : IBinollaClient
         {
             _subscribeLock.Release();
         }
+    }
+
+    public void EnsureMarketDataWarm(string asset, int period = 60)
+    {
+        if (string.IsNullOrWhiteSpace(asset))
+            return;
+        if (Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected))
+            return;
+        if (!IsTransportConnected)
+            return;
+
+        var key = asset.Trim();
+        var wirePeriod = BinollaMarketPeriods.NormalizeHistoryPeriod(period);
+        var warmKey = $"{key}:{wirePeriod}";
+        if (!_warmInFlight.TryAdd(warmKey, 1))
+            return;
+
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H133", "BinollaSession.EnsureMarketDataWarm", "warm_queued", new
+        {
+            symbol = key,
+            wirePeriod
+        });
+        // #endregion
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await SubscribePairAsync(key, wirePeriod, CancellationToken.None).ConfigureAwait(false);
+                var budget = _options.MarketDataTimeout;
+                if (budget < TimeSpan.FromSeconds(8))
+                    budget = TimeSpan.FromSeconds(20);
+                try
+                {
+                    await WaitForConditionAsync(
+                            () => FindHistoryFor(key, wirePeriod) is not null || FindQuoteFor(key) is not null,
+                            budget,
+                            CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch (BinollaTimeoutException)
+                {
+                    // next HTTP poll may still hit a late push
+                }
+
+                // #region agent log
+                ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H133", "BinollaSession.EnsureMarketDataWarm", "warm_done", new
+                {
+                    symbol = key,
+                    wirePeriod,
+                    historyHit = FindHistoryFor(key, wirePeriod) is not null,
+                    quoteHit = FindQuoteFor(key) is not null,
+                    historyKeys = State.HistoricalData.Keys.Take(8).ToArray(),
+                    quoteKeys = State.LatestQuotes.Keys.Take(8).ToArray()
+                });
+                // #endregion
+            }
+            catch (Exception)
+            {
+                // best effort — never surface to HTTP
+            }
+            finally
+            {
+                _warmInFlight.TryRemove(warmKey, out _);
+            }
+        });
     }
 
     public async Task<IReadOnlyList<TradingAsset>> GetTradingAssetsAsync(CancellationToken cancellationToken = default)
@@ -478,74 +558,59 @@ public sealed class BinollaSession : IBinollaClient
         State.Touch();
         var key = asset.Trim();
 
-        QuoteData? FindQuote()
-        {
-            if (State.LatestQuotes.TryGetValue(key, out var exact))
-                return exact;
-            foreach (var pair in State.LatestQuotes)
-            {
-                if (string.Equals(pair.Key, key, StringComparison.OrdinalIgnoreCase))
-                    return pair.Value;
-            }
-
-            return null;
-        }
+        if (FindQuoteFor(key) is { } existing)
+            return existing;
 
         // Subscribe/wait independent of HTTP abort (same as GetHistoryAsync).
         await SubscribePairAsync(key, 60, CancellationToken.None).ConfigureAwait(false);
 
-        if (FindQuote() is { } existing)
-            return existing;
+        if (FindQuoteFor(key) is { } afterSub)
+            return afterSub;
 
-        var half = TimeSpan.FromMilliseconds(Math.Max(500, _options.MarketDataTimeout.TotalMilliseconds / 2));
+        var httpWait = _options.MarketHttpWait;
+        if (httpWait < TimeSpan.FromSeconds(1))
+            httpWait = TimeSpan.FromSeconds(4);
         try
         {
             await WaitForConditionAsync(
-                    () => FindQuote() is not null,
-                    half,
+                    () => FindQuoteFor(key) is not null || FindHistoryFor(key, 60) is not null,
+                    httpWait,
                     CancellationToken.None)
                 .ConfigureAwait(false);
         }
         catch (BinollaTimeoutException)
         {
-            try
-            {
-                await SubscribePairAsync(key, 60, CancellationToken.None).ConfigureAwait(false);
-            }
-            catch
-            {
-                // ignore
-            }
-
-            try
-            {
-                await WaitForConditionAsync(
-                        () => FindQuote() is not null,
-                        half,
-                        CancellationToken.None)
-                    .ConfigureAwait(false);
-            }
-            catch (BinollaTimeoutException)
-            {
-                // fall through
-            }
+            EnsureMarketDataWarm(key, 60);
         }
 
-        if (FindQuote() is not { } quote)
+        if (FindQuoteFor(key) is { } quote)
+            return quote;
+
+        // Synthesize from last candle/tick so price soft-path can return 200 instead of 5xx.
+        if (TryQuoteFromHistory(key, out var synthesized) && synthesized is not null)
         {
             // #region agent log
-            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H112", "BinollaSession.GetLatestQuoteAsync", "quote_timeout", new
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H134", "BinollaSession.GetLatestQuoteAsync", "quote_from_history", new
             {
                 symbol = key,
-                assetsCached = State.Assets.Count,
-                quotesCached = State.LatestQuotes.Count,
-                quoteKeys = State.LatestQuotes.Keys.Take(8).ToArray()
+                price = synthesized.Price
             });
             // #endregion
-            throw new BinollaTimeoutException("Quote not available for asset.");
+            return synthesized;
         }
 
-        return quote;
+        EnsureMarketDataWarm(key, 60);
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H112", "BinollaSession.GetLatestQuoteAsync", "quote_timeout", new
+        {
+            symbol = key,
+            assetsCached = State.Assets.Count,
+            quotesCached = State.LatestQuotes.Count,
+            quoteKeys = State.LatestQuotes.Keys.Take(8).ToArray(),
+            httpWaitMs = httpWait.TotalMilliseconds
+        });
+        // #endregion
+        throw new BinollaTimeoutException("Quote not available for asset.");
     }
 
     public async Task<HistoryData> GetHistoryAsync(string asset, int period, CancellationToken cancellationToken = default)
@@ -559,32 +624,17 @@ public sealed class BinollaSession : IBinollaClient
 
         State.Touch();
         var key = asset.Trim();
-        var historyKey = $"{key}:{period}";
+        var requestedPeriod = period;
+        var wirePeriod = BinollaMarketPeriods.NormalizeHistoryPeriod(period);
 
-        HistoryData? FindHistory()
-        {
-            if (State.HistoricalData.TryGetValue(historyKey, out var exact) &&
-                (exact.Candles.Count > 0 || exact.TickHistory.Count > 0))
-                return exact;
-            // Binolla sometimes pushes a different period than requested (e.g. 60 while UI asks 300).
-            foreach (var pair in State.HistoricalData)
-            {
-                if (!pair.Key.StartsWith(key + ":", StringComparison.OrdinalIgnoreCase))
-                    continue;
-                if (pair.Value.Candles.Count > 0 || pair.Value.TickHistory.Count > 0)
-                    return pair.Value;
-            }
-
-            return null;
-        }
-
-        if (FindHistory() is { } cached)
+        if (FindHistoryFor(key, wirePeriod) is { } cached)
         {
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H115", "BinollaSession.GetHistoryAsync", "history_hit_cache", new
             {
                 symbol = key,
-                requestedPeriod = period,
+                requestedPeriod,
+                wirePeriod,
                 returnedPeriod = cached.Period,
                 candleCount = cached.Candles.Count,
                 tickCount = cached.TickHistory.Count
@@ -593,14 +643,15 @@ public sealed class BinollaSession : IBinollaClient
             return cached;
         }
 
-        await SubscribePairAsync(key, period, CancellationToken.None).ConfigureAwait(false);
-        if (FindHistory() is { } afterSub)
+        await SubscribePairAsync(key, wirePeriod, CancellationToken.None).ConfigureAwait(false);
+        if (FindHistoryFor(key, wirePeriod) is { } afterSub)
         {
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H115", "BinollaSession.GetHistoryAsync", "history_hit_after_sub", new
             {
                 symbol = key,
-                requestedPeriod = period,
+                requestedPeriod,
+                wirePeriod,
                 returnedPeriod = afterSub.Period,
                 candleCount = afterSub.Candles.Count,
                 tickCount = afterSub.TickHistory.Count
@@ -609,23 +660,27 @@ public sealed class BinollaSession : IBinollaClient
             return afterSub;
         }
 
-        // Wait only on timeout budget — never on HTTP RequestAborted (FE aborts ~15–35s).
-        var half = TimeSpan.FromMilliseconds(Math.Max(500, _options.MarketDataTimeout.TotalMilliseconds / 2));
+        // Short HTTP wait — soft empty + background warm; never block ~30s.
+        var httpWait = _options.MarketHttpWait;
+        if (httpWait < TimeSpan.FromSeconds(1))
+            httpWait = TimeSpan.FromSeconds(4);
         try
         {
             await WaitForConditionAsync(
-                    () => FindHistory() is not null,
-                    half,
+                    () => FindHistoryFor(key, wirePeriod) is not null,
+                    httpWait,
                     CancellationToken.None)
                 .ConfigureAwait(false);
         }
         catch (BinollaTimeoutException)
         {
+            // one quick re-nudge with period 60 (OTC baseline), then soft miss
             try
             {
-                await SubscribePairAsync(key, 60, CancellationToken.None).ConfigureAwait(false);
-                if (period != 60)
-                    await SubscribePairAsync(key, period, CancellationToken.None).ConfigureAwait(false);
+                if (wirePeriod != 60)
+                    await SubscribePairAsync(key, 60, CancellationToken.None).ConfigureAwait(false);
+                else
+                    await SubscribePairAsync(key, wirePeriod, CancellationToken.None).ConfigureAwait(false);
             }
             catch
             {
@@ -635,24 +690,25 @@ public sealed class BinollaSession : IBinollaClient
             try
             {
                 await WaitForConditionAsync(
-                        () => FindHistory() is not null,
-                        half,
+                        () => FindHistoryFor(key, wirePeriod) is not null,
+                        TimeSpan.FromSeconds(1.5),
                         CancellationToken.None)
                     .ConfigureAwait(false);
             }
             catch (BinollaTimeoutException)
             {
-                // fall through to FindHistory / timeout log
+                // fall through
             }
         }
 
-        if (FindHistory() is { } history)
+        if (FindHistoryFor(key, wirePeriod) is { } history)
         {
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H115", "BinollaSession.GetHistoryAsync", "history_hit_after_wait", new
             {
                 symbol = key,
-                requestedPeriod = period,
+                requestedPeriod,
+                wirePeriod,
                 returnedPeriod = history.Period,
                 candleCount = history.Candles.Count,
                 tickCount = history.TickHistory.Count
@@ -661,19 +717,98 @@ public sealed class BinollaSession : IBinollaClient
             return history;
         }
 
+        EnsureMarketDataWarm(key, wirePeriod);
         // #region agent log
         ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H112", "BinollaSession.GetHistoryAsync", "history_timeout", new
         {
             symbol = key,
-            period,
+            requestedPeriod,
+            wirePeriod,
             assetsCached = State.Assets.Count,
             historyCached = State.HistoricalData.Count,
             quotesCached = State.LatestQuotes.Count,
             historyKeys = State.HistoricalData.Keys.Take(8).ToArray(),
+            httpWaitMs = httpWait.TotalMilliseconds,
             timeoutSec = _options.MarketDataTimeout.TotalSeconds
         });
         // #endregion
         throw new BinollaTimeoutException("History not available for asset/period.");
+    }
+
+    /// <summary>
+    /// Prefer exact period, else period 60, else any non-empty history for the asset.
+    /// </summary>
+    private HistoryData? FindHistoryFor(string key, int preferredPeriod)
+    {
+        var preferredKey = $"{key}:{preferredPeriod}";
+        if (State.HistoricalData.TryGetValue(preferredKey, out var exact) &&
+            (exact.Candles.Count > 0 || exact.TickHistory.Count > 0))
+            return exact;
+
+        // Prefer period 60 when available (OTC baseline), then any non-empty for the asset.
+        HistoryData? any = null;
+        HistoryData? sixty = null;
+        foreach (var pair in State.HistoricalData)
+        {
+            if (!pair.Key.StartsWith(key + ":", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (pair.Value.Candles.Count == 0 && pair.Value.TickHistory.Count == 0)
+                continue;
+            any ??= pair.Value;
+            if (pair.Value.Period == 60 || pair.Key.EndsWith(":60", StringComparison.Ordinal))
+                sixty = pair.Value;
+        }
+
+        return sixty ?? any;
+    }
+
+    private QuoteData? FindQuoteFor(string key)
+    {
+        if (State.LatestQuotes.TryGetValue(key, out var exact))
+            return exact;
+        foreach (var pair in State.LatestQuotes)
+        {
+            if (string.Equals(pair.Key, key, StringComparison.OrdinalIgnoreCase))
+                return pair.Value;
+        }
+
+        return null;
+    }
+
+    private bool TryQuoteFromHistory(string key, out QuoteData? quote)
+    {
+        quote = null;
+        var history = FindHistoryFor(key, 60);
+        if (history is null)
+            return false;
+
+        if (history.TickHistory.Count > 0)
+        {
+            var tick = history.TickHistory[^1];
+            quote = new QuoteData
+            {
+                Pair = key,
+                Timestamp = tick.Timestamp,
+                Price = tick.Price,
+                ReceivedAt = DateTimeOffset.UtcNow
+            };
+            return true;
+        }
+
+        if (history.Candles.Count > 0)
+        {
+            var candle = history.Candles.OrderBy(c => c.Timestamp).Last();
+            quote = new QuoteData
+            {
+                Pair = key,
+                Timestamp = candle.Timestamp,
+                Price = candle.Close,
+                ReceivedAt = DateTimeOffset.UtcNow
+            };
+            return true;
+        }
+
+        return false;
     }
 
     private static async Task WaitForConditionAsync(

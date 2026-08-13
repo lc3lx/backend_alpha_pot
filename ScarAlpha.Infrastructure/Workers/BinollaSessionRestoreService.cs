@@ -93,24 +93,27 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
         {
             await using var scope = _scopeFactory.CreateAsyncScope();
             var links = scope.ServiceProvider.GetRequiredService<IBinollaLinkRepository>();
-            var approved = await links.ListAsync(AdminApprovalStatus.Approved, ct).ConfigureAwait(false);
-            targets = approved
+            // Restore approved AND pending connected links — pending users were only lazy-restored
+            // on first market call (~23–25s cold), which blocked assets/candles.
+            var all = await links.ListAsync(approvalStatus: null, ct).ConfigureAwait(false);
+            targets = all
                 .Where(l =>
-                    l.AdminApproved &&
-                    l.ApprovalStatus == AdminApprovalStatus.Approved &&
                     l.Status == BinollaLinkStatus.Connected &&
-                    !string.IsNullOrWhiteSpace(l.EncryptedSsid))
+                    !string.IsNullOrWhiteSpace(l.EncryptedSsid) &&
+                    (l.ApprovalStatus == AdminApprovalStatus.Approved ||
+                     l.ApprovalStatus == AdminApprovalStatus.Pending) &&
+                    l.ApprovalStatus != AdminApprovalStatus.Rejected)
                 .Select(l => (l.UserId, l.Id))
                 .ToList();
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to load approved Binolla links for session restore");
+            _logger.LogError(ex, "Failed to load Binolla links for session restore");
             return;
         }
 
         _logger.LogInformation(
-            "Binolla session restore starting for {Count} approved linked user(s); parallelism={Parallelism}",
+            "Binolla session restore starting for {Count} approved/pending linked user(s); parallelism={Parallelism}",
             targets.Count, Math.Max(1, _options.MaxDegreeOfParallelism));
 
         using var gate = new SemaphoreSlim(Math.Max(1, _options.MaxDegreeOfParallelism));

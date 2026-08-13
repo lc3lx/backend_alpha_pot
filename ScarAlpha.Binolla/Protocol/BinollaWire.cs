@@ -64,6 +64,44 @@ public static class BinollaWire
     };
 }
 
+/// <summary>
+/// Binolla OTC history periods that actually receive s_history/last pushes.
+/// </summary>
+public static class BinollaMarketPeriods
+{
+    private static readonly int[] Supported = { 60, 300, 900, 3600 };
+
+    /// <summary>
+    /// Map FE periods to Binolla-supported candle sizes. 14400 (4h) never gets history_stored.
+    /// </summary>
+    public static int NormalizeHistoryPeriod(int period)
+    {
+        foreach (var supported in Supported)
+        {
+            if (supported == period)
+                return supported;
+        }
+
+        // Above 1h — Binolla OTC does not push 4h; prefer reliable 60s chart data.
+        if (period > 3600)
+            return 60;
+
+        var best = 60;
+        var bestDist = int.MaxValue;
+        foreach (var supported in Supported)
+        {
+            var dist = Math.Abs(supported - period);
+            if (dist < bestDist)
+            {
+                bestDist = dist;
+                best = supported;
+            }
+        }
+
+        return best;
+    }
+}
+
 public static class BinollaFraming
 {
     /// <summary>

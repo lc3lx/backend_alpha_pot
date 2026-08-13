@@ -33,6 +33,11 @@ public interface IBinollaClient : IAsyncDisposable
 
     Task SubscribePairAsync(string pair, int period = 60, CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Fire-and-forget subscribe so the next HTTP poll can hit cache without blocking.
+    /// </summary>
+    void EnsureMarketDataWarm(string asset, int period = 60);
+
     Task<IReadOnlyList<TradingAsset>> GetTradingAssetsAsync(CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -78,12 +83,15 @@ public sealed class BinollaSessionManagerOptions
     /// <summary>WS auth should complete on post-auth events within seconds; fail fast if not.</summary>
     public TimeSpan AuthenticationTimeout { get; set; } = TimeSpan.FromSeconds(45);
 
-    /// <summary>Assets/quotes/candles should not block HTTP requests for a full minute.</summary>
+    /// <summary>Background warm budget after a soft HTTP miss (not for blocking request path).</summary>
     /// <remarks>
-    /// Post-login Binolla often needs &gt;8s before s_assets/list and s_history/last arrive
-    /// (PM2: assets count=0 at ~8s, then count=120; candles MARKET_UNAVAILABLE at ~8s).
+    /// HTTP market calls use a short wait (~4s) then soft-empty; this timeout is for
+    /// EnsureMarketDataWarm so history_stored can still populate cache for the next poll.
     /// </remarks>
     public TimeSpan MarketDataTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>Max block for HTTP candles/price before soft-empty + background warm.</summary>
+    public TimeSpan MarketHttpWait { get; set; } = TimeSpan.FromSeconds(4);
 
     public TimeSpan PlaceOrderTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
