@@ -1,6 +1,7 @@
 using ScarAlpha.Application.Abstractions;
 using ScarAlpha.Binolla.Abstractions;
 using ScarAlpha.Binolla.Models;
+using ScarAlpha.Binolla.Session;
 using ScarAlpha.Domain.Enums;
 
 namespace ScarAlpha.Infrastructure.Access;
@@ -26,6 +27,23 @@ public sealed class BotAccessService : IBotAccessService
         var link = await _links.GetByUserIdAsync(userId, ct);
         var client = _sessions.Get(userId.ToString());
 
+        // If a connect/reauth is already running, wait for it — do not start a competing restore.
+        if (client is BinollaSession connectingSession &&
+            connectingSession.Lifecycle is SessionLifecycleState.Connecting or SessionLifecycleState.Reconnecting)
+        {
+            try
+            {
+                using var waitCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                waitCts.CancelAfter(TimeSpan.FromSeconds(12));
+                await connectingSession.WaitUntilNotConnectingAsync(waitCts.Token);
+            }
+            catch
+            {
+                /* fall through to restore / status evaluation */
+            }
+            client = _sessions.Get(userId.ToString());
+        }
+
         var connected = client is not null &&
                         client.IsTransportConnected &&
                         client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected;
@@ -34,10 +52,10 @@ public sealed class BotAccessService : IBotAccessService
         var approvalStatus = (link?.ApprovalStatus ?? AdminApprovalStatus.Pending).ToString();
         var adminApproved = link?.AdminApproved == true;
 
+        // Transport flaps during Connecting must not be treated as a sticky SessionExpired.
         var deadSession = client is not null &&
-                          (client.Lifecycle is SessionLifecycleState.AuthenticationFailed
-                              or SessionLifecycleState.SessionExpired
-                           || !client.IsTransportConnected);
+                          client.Lifecycle is SessionLifecycleState.AuthenticationFailed
+                              or SessionLifecycleState.SessionExpired;
 
         // Approved/pending + Connected-in-DB but no live session (API restart / idle eviction / unauthorized):
         // best-effort lazy restore before reporting disconnect / session expired.

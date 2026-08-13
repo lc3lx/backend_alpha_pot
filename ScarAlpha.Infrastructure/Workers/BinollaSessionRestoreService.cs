@@ -256,7 +256,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
 
                     var client = await _sessions.GetOrCreateAsync(userId.ToString(), ssid, ct, cookieHeader)
                         .ConfigureAwait(false);
-                    await client.ChangeAccountAsync(EngineAccount.Demo, ct).ConfigureAwait(false);
+                    // Demo is selected by post-auth bootstrap — avoid a second account/change race.
 
                     await TouchLastConnectedAsync(userId, ct).ConfigureAwait(false);
                     _authFailed.TryRemove(userId, out _);

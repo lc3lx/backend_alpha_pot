@@ -193,7 +193,8 @@ public sealed class BinollaAppService
                     $"Binolla session not ready after connect (state={client.Lifecycle}).");
             }
 
-            await client.ChangeAccountAsync(EngineAccount.Demo, ct);
+            // Do not send a second account/change here — post-auth bootstrap already sets Demo.
+            // A duplicate wire call raced unauthorized and dropped the fresh session within seconds.
 
             // Login must return as soon as the socket is authorized. Balance loads on the next market call.
             decimal? balanceValue = null;

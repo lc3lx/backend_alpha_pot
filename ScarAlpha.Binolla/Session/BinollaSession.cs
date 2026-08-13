@@ -52,6 +52,18 @@ public sealed class BinollaSession : IBinollaClient
 
     public bool IsTransportConnected => _trading?.IsConnected == true;
 
+    /// <summary>
+    /// Wait while another connect/reauth is in flight. Avoids stomping a live handshake.
+    /// </summary>
+    public async Task WaitUntilNotConnectingAsync(CancellationToken cancellationToken = default)
+    {
+        while (Lifecycle is SessionLifecycleState.Connecting or SessionLifecycleState.Reconnecting)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await Task.Delay(50, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
     public event Action<SessionLifecycleState, string?>? LifecycleChanged;
     public event Action? OnConnectionLost;
     public event Action? OnReconnected;

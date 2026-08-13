@@ -97,14 +97,29 @@ public sealed class BinollaSessionManager : IBinollaSessionManager
         CancellationToken cancellationToken,
         string? cookieHeader = null)
     {
+        if (!string.IsNullOrWhiteSpace(cookieHeader))
+            session.State.CookieHeader = cookieHeader.Trim();
+
+        // Never tear down an in-flight connect/reauth — that caused post-login SessionExpired storms.
+        if (session.Lifecycle is SessionLifecycleState.Connecting or SessionLifecycleState.Reconnecting)
+        {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H105", "BinollaSessionManager.EnsureSessionUsesSsid", "wait_connecting", new
+            {
+                lifecycle = session.Lifecycle.ToString(),
+                hasCookie = !string.IsNullOrWhiteSpace(session.State.CookieHeader)
+            });
+            // #endregion
+            await session.WaitUntilNotConnectingAsync(cancellationToken).ConfigureAwait(false);
+        }
+
         var lifecycle = session.Lifecycle;
         var transportDead = !session.IsTransportConnected;
         var needsLifecycleReconnect = transportDead
             || lifecycle is SessionLifecycleState.Disconnected
                 or SessionLifecycleState.Faulted
                 or SessionLifecycleState.AuthenticationFailed
-                or SessionLifecycleState.SessionExpired
-                or SessionLifecycleState.Connecting;
+                or SessionLifecycleState.SessionExpired;
 
         var ssidChanged = !string.Equals(session.State.Ssid, ssid, StringComparison.Ordinal);
 
@@ -115,16 +130,12 @@ public sealed class BinollaSessionManager : IBinollaSessionManager
             transportDead,
             ssidChanged,
             needsLifecycleReconnect,
-            hasCookie = !string.IsNullOrWhiteSpace(cookieHeader)
+            hasCookie = !string.IsNullOrWhiteSpace(session.State.CookieHeader)
         });
         // #endregion
 
         if (!needsLifecycleReconnect && !ssidChanged)
-        {
-            if (!string.IsNullOrWhiteSpace(cookieHeader))
-                session.State.CookieHeader = cookieHeader.Trim();
             return;
-        }
 
         if (!needsLifecycleReconnect && ssidChanged)
             await session.DisconnectAsync(cancellationToken).ConfigureAwait(false);
