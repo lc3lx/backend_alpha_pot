@@ -19,7 +19,8 @@ internal sealed class SessionMessageRouter
     private readonly Action? _onAuthorized;
     private string _upcomingMessageType = string.Empty;
     private int _authorized;
-    private int _unauthorizedReauthSent;
+    private int _unauthorizedReauthCount;
+    private const int MaxUnauthorizedReauths = 3;
 
     public SessionMessageRouter(
         BinollaSessionState state,
@@ -148,16 +149,16 @@ internal sealed class SessionMessageRouter
         {
             lifecycle = lifecycle.ToString(),
             hadAuth = Volatile.Read(ref _authorized) == 1,
-            reauthSent = Volatile.Read(ref _unauthorizedReauthSent) == 1
+            reauthCount = Volatile.Read(ref _unauthorizedReauthCount)
         });
         // #endregion
 
-        // One silent SSID re-send (connect OR live). Immediate fail-fast on the first
-        // unauthorized during Connecting left login in AuthenticationFailed while ConnectAsync
-        // could still return, then ChangeAccount blew up with 502.
-        if (Interlocked.CompareExchange(ref _unauthorizedReauthSent, 1, 0) == 0 &&
+        // Up to N silent SSID re-sends. Bootstrap often emits multiple unauthorized frames
+        // after a fresh login; failing on the 2nd killed the session before assets loaded.
+        if (Volatile.Read(ref _unauthorizedReauthCount) < MaxUnauthorizedReauths &&
             !string.IsNullOrEmpty(_state.Ssid))
         {
+            Interlocked.Increment(ref _unauthorizedReauthCount);
             Interlocked.Exchange(ref _authorized, 0);
             _state.ResetMarketCaches();
             _state.ClearSubscriptions();
@@ -168,15 +169,14 @@ internal sealed class SessionMessageRouter
             LoginTrace.Write("H83", "SessionMessageRouter.HandleUnauthorized", "unauthorized_reauth_send", new
             {
                 ssidLen = _state.Ssid!.Length,
-                fromLifecycle = lifecycle.ToString()
+                fromLifecycle = lifecycle.ToString(),
+                reauthCount = Volatile.Read(ref _unauthorizedReauthCount)
             });
             await _sendAsync(_state.Ssid, cancellationToken).ConfigureAwait(false);
             return;
         }
 
         // Duplicate unauthorized while reauth handshake is still in flight — ignore.
-        // Bootstrap floods often emit a second unauthorized before the SSID re-send completes;
-        // marking AuthenticationFailed here killed fresh logins within seconds.
         if (lifecycle is SessionLifecycleState.Connecting or SessionLifecycleState.Reconnecting)
         {
             LoginTrace.Write("H83", "SessionMessageRouter.HandleUnauthorized", "unauthorized_ignored_during_reauth", new
@@ -256,7 +256,7 @@ internal sealed class SessionMessageRouter
         if (Interlocked.Exchange(ref _authorized, 1) == 1)
             return;
 
-        // Do NOT reset unauthorizedReauthSent here — that re-enabled infinite
+        // Do NOT reset unauthorizedReauthCount here — that re-enabled infinite
         // unauthorized → reauth → bootstrap loops in production.
 
         // Mark Connected + unblock WaitForAuthentication BEFORE bootstrap sends.

@@ -28,13 +28,24 @@ public sealed class BotAccessService : IBotAccessService
         var client = _sessions.Get(userId.ToString());
 
         // If a connect/reauth is already running, wait for it — do not start a competing restore.
+        // Do not link wait to the HTTP request CT: FE abort (~8–25s) must not cancel an in-flight connect.
         if (client is BinollaSession connectingSession &&
             connectingSession.Lifecycle is SessionLifecycleState.Connecting or SessionLifecycleState.Reconnecting)
         {
             try
             {
-                using var waitCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                waitCts.CancelAfter(TimeSpan.FromSeconds(12));
+                using var waitCts = new CancellationTokenSource(TimeSpan.FromSeconds(12));
+                // #region agent log
+                ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
+                    "H107",
+                    "BotAccessService.CheckAsync",
+                    "wait_connecting_begin",
+                    new
+                    {
+                        lifecycle = connectingSession.Lifecycle.ToString(),
+                        requestCtCanBeCanceled = ct.CanBeCanceled
+                    });
+                // #endregion
                 await connectingSession.WaitUntilNotConnectingAsync(waitCts.Token);
             }
             catch
@@ -57,9 +68,8 @@ public sealed class BotAccessService : IBotAccessService
                           client.Lifecycle is SessionLifecycleState.AuthenticationFailed
                               or SessionLifecycleState.SessionExpired;
 
-        // Approved/pending + Connected-in-DB but no live session (API restart / idle eviction / unauthorized):
-        // best-effort lazy restore before reporting disconnect / session expired.
-        // Auth after Playwright login typically needs ~5–15s — 4s was cancelling every restore.
+        // Cap wait independently of the HTTP request CT. Frontend MARKET_FETCH_MS (~8s) was
+        // cancelling restore mid-flight and CheckAsync then reported a false SessionExpired.
         if ((!connected || deadSession) &&
             link is not null &&
             link.Status == BinollaLinkStatus.Connected &&
@@ -71,8 +81,7 @@ public sealed class BotAccessService : IBotAccessService
                 if (deadSession)
                     _restorer.ClearAuthFailure(userId);
 
-                using var restoreCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                restoreCts.CancelAfter(TimeSpan.FromSeconds(18));
+                using var restoreCts = new CancellationTokenSource(TimeSpan.FromSeconds(18));
                 // #region agent log
                 ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
                     "H106",
@@ -95,6 +104,17 @@ public sealed class BotAccessService : IBotAccessService
                     adminApproved = link.AdminApproved;
                     deadSession = false;
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                // Independent restore timed out — re-read live state; do not invent SessionExpired.
+                client = _sessions.Get(userId.ToString());
+                connected = client is not null &&
+                            client.IsTransportConnected &&
+                            client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected;
+                deadSession = client is not null &&
+                              client.Lifecycle is SessionLifecycleState.AuthenticationFailed
+                                  or SessionLifecycleState.SessionExpired;
             }
             catch
             {
