@@ -12,24 +12,39 @@ public sealed class MarketAppService
     private readonly ICurrentUser _currentUser;
     private readonly IBinollaSessionManager _sessions;
     private readonly IBotAccessService _botAccess;
+    private readonly IBinollaSessionRestorer _restorer;
     private readonly ILogger<MarketAppService> _logger;
 
     public MarketAppService(
         ICurrentUser currentUser,
         IBinollaSessionManager sessions,
         IBotAccessService botAccess,
+        IBinollaSessionRestorer restorer,
         ILogger<MarketAppService> logger)
     {
         _currentUser = currentUser;
         _sessions = sessions;
         _botAccess = botAccess;
+        _restorer = restorer;
         _logger = logger;
     }
 
     public async Task<MarketAssetsResponse> GetAssetsAsync(CancellationToken ct)
     {
         await EnsureBotAccessAsync(ct);
-        var client = await RequireConnectedClientAsync(ct);
+        var client = await EnsureLiveClientAsync(ct);
+        if (client is null)
+        {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
+                "H125",
+                "MarketAppService.GetAssetsAsync",
+                "not_live_soft_empty",
+                new { });
+            // #endregion
+            return new MarketAssetsResponse(Array.Empty<MarketAssetDto>());
+        }
+
         var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
@@ -73,19 +88,9 @@ public sealed class MarketAppService
         {
             throw new ApiException(ApiErrorCodes.BinollaSessionExpired, "Binolla session expired.", 401);
         }
-        catch (BinollaTimeoutException)
-        {
-            throw new ApiException(ApiErrorCodes.MarketUnavailable, "Market assets are not available yet.", 503);
-        }
-        catch (BinollaConnectionException)
-        {
-            throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Binolla session is not connected.", 409);
-        }
-        catch (ApiException) { throw; }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Market assets failed for user {UserId}", _currentUser.UserId);
-            // Soft-fail empty list — never 500 the Trading shell on a transient WS warm-up.
             return new MarketAssetsResponse(Array.Empty<MarketAssetDto>());
         }
     }
@@ -96,7 +101,8 @@ public sealed class MarketAppService
             throw new ApiException(ApiErrorCodes.ValidationError, "asset is required.");
 
         await EnsureBotAccessAsync(ct);
-        var client = await RequireConnectedClientAsync(ct);
+        var client = await EnsureLiveClientAsync(ct)
+            ?? throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Binolla session is warming up. Retry shortly.", 409);
         var symbol = asset.Trim();
         var sw = System.Diagnostics.Stopwatch.StartNew();
         try
@@ -147,7 +153,8 @@ public sealed class MarketAppService
             throw new ApiException(ApiErrorCodes.ValidationError, "period must be between 1 and 14400 seconds.");
 
         await EnsureBotAccessAsync(ct);
-        var client = await RequireConnectedClientAsync(ct);
+        var client = await EnsureLiveClientAsync(ct)
+            ?? throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Binolla session is warming up. Retry shortly.", 409);
         var symbol = asset.Trim();
         var sw = System.Diagnostics.Stopwatch.StartNew();
         try
@@ -233,28 +240,59 @@ public sealed class MarketAppService
         AccountAppService.EnsureConnectedForMarket(access);
     }
 
-    private async Task<IBinollaClient> RequireConnectedClientAsync(CancellationToken ct)
+    /// <summary>
+    /// Prefer live in-memory session; if cold, block on restore (independent of HTTP abort)
+    /// so market calls do not race background restore and return BINOLLA_NOT_CONNECTED.
+    /// </summary>
+    private async Task<IBinollaClient?> EnsureLiveClientAsync(CancellationToken ct)
     {
-        for (var i = 0; i < 15; i++)
-        {
-            var client = _sessions.Get(_currentUser.UserId.ToString());
-            if (client is not null &&
-                client.IsTransportConnected &&
-                client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
-            {
-                return client;
-            }
+        var live = FindLiveClient();
+        if (live is not null)
+            return live;
 
-            try
-            {
-                await Task.Delay(200, ct);
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                break;
-            }
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
+            "H125",
+            "MarketAppService.EnsureLiveClientAsync",
+            "restore_blocking_begin",
+            new { });
+        // #endregion
+
+        try
+        {
+            using var restoreCts = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+            await _restorer.TryRestoreUserAsync(_currentUser.UserId, restoreCts.Token);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Market ensure-live restore ended for user {UserId}", _currentUser.UserId);
         }
 
-        throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Connect Binolla before requesting market data.", 409);
+        live = FindLiveClient();
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
+            "H125",
+            "MarketAppService.EnsureLiveClientAsync",
+            live is null ? "restore_blocking_miss" : "restore_blocking_ok",
+            new
+            {
+                lifecycle = live?.Lifecycle.ToString() ?? "None",
+                transportUp = live?.IsTransportConnected == true
+            });
+        // #endregion
+        return live;
+    }
+
+    private IBinollaClient? FindLiveClient()
+    {
+        var client = _sessions.Get(_currentUser.UserId.ToString());
+        if (client is not null &&
+            client.IsTransportConnected &&
+            client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
+        {
+            return client;
+        }
+
+        return null;
     }
 }
