@@ -59,7 +59,7 @@ public sealed class BotAccessService : IBotAccessService
 
         // Approved/pending + Connected-in-DB but no live session (API restart / idle eviction / unauthorized):
         // best-effort lazy restore before reporting disconnect / session expired.
-        // Cap wait — never block /api/account/status for the full WS auth timeout (~20s).
+        // Auth after Playwright login typically needs ~5–15s — 4s was cancelling every restore.
         if ((!connected || deadSession) &&
             link is not null &&
             link.Status == BinollaLinkStatus.Connected &&
@@ -72,7 +72,19 @@ public sealed class BotAccessService : IBotAccessService
                     _restorer.ClearAuthFailure(userId);
 
                 using var restoreCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                restoreCts.CancelAfter(TimeSpan.FromSeconds(4));
+                restoreCts.CancelAfter(TimeSpan.FromSeconds(18));
+                // #region agent log
+                ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
+                    "H106",
+                    "BotAccessService.CheckAsync",
+                    "restore_begin",
+                    new
+                    {
+                        deadSession,
+                        priorLifecycle = client?.Lifecycle.ToString() ?? "None",
+                        transportUp = client?.IsTransportConnected == true
+                    });
+                // #endregion
                 connected = await _restorer.TryRestoreUserAsync(userId, restoreCts.Token);
                 if (connected)
                 {
@@ -91,6 +103,21 @@ public sealed class BotAccessService : IBotAccessService
                             client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected;
             }
         }
+
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
+            "H106",
+            "BotAccessService.CheckAsync",
+            "access_result",
+            new
+            {
+                connected,
+                deadSession,
+                lifecycle = client?.Lifecycle.ToString() ?? "None",
+                transportUp = client?.IsTransportConnected == true,
+                linkStatus = link?.Status.ToString() ?? "None"
+            });
+        // #endregion
 
         if (deadSession && !connected)
         {

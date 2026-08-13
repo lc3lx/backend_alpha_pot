@@ -43,6 +43,25 @@ public static class BinollaWire
         "42[\"indicator/list\"]",
         "42[\"drawing/load\"]"
     };
+
+    /// <summary>Commands required for Demo market browse right after SSID auth.</summary>
+    public static readonly string[] PostAuthBootstrapCommandsEssential =
+    {
+        "42[\"account/change\",{\"demo\":1}]",
+        "42[\"balances/list\"]",
+        "42[\"assets/list\"]",
+    };
+
+    /// <summary>Secondary lists — deferred so they do not race the first unauthorized window.</summary>
+    public static readonly string[] PostAuthBootstrapCommandsDeferred =
+    {
+        "42[\"orders/opened/list\"]",
+        "42[\"orders/closed/list\"]",
+        "42[\"alert/list\"]",
+        "42[\"alert/closed/list\"]",
+        "42[\"indicator/list\"]",
+        "42[\"drawing/load\"]"
+    };
 }
 
 public static class BinollaFraming

@@ -174,13 +174,23 @@ internal sealed class SessionMessageRouter
             return;
         }
 
+        // Duplicate unauthorized while reauth handshake is still in flight — ignore.
+        // Bootstrap floods often emit a second unauthorized before the SSID re-send completes;
+        // marking AuthenticationFailed here killed fresh logins within seconds.
+        if (lifecycle is SessionLifecycleState.Connecting or SessionLifecycleState.Reconnecting)
+        {
+            LoginTrace.Write("H83", "SessionMessageRouter.HandleUnauthorized", "unauthorized_ignored_during_reauth", new
+            {
+                lifecycle = lifecycle.ToString()
+            });
+            return;
+        }
+
         _state.ResetMarketCaches();
         _state.ClearSubscriptions();
         _state.SetLifecycle(
             SessionLifecycleState.AuthenticationFailed,
-            lifecycle is SessionLifecycleState.Connecting or SessionLifecycleState.Disconnected
-                ? "Binolla unauthorized during connect."
-                : "Binolla unauthorized.");
+            "Binolla unauthorized.");
         Interlocked.Exchange(ref _authorized, 0);
     }
 
@@ -274,10 +284,18 @@ internal sealed class SessionMessageRouter
 
     private async Task SendPostAuthBootstrapAsync(CancellationToken cancellationToken)
     {
-        foreach (var command in BinollaWire.PostAuthBootstrapCommands)
+        // Minimal bootstrap first — full list spam after auth often triggers a second unauthorized
+        // before the session is stable.
+        foreach (var command in BinollaWire.PostAuthBootstrapCommandsEssential)
         {
             await _sendAsync(command, cancellationToken).ConfigureAwait(false);
-            await Task.Delay(10, cancellationToken).ConfigureAwait(false);
+            await Task.Delay(25, cancellationToken).ConfigureAwait(false);
+        }
+
+        foreach (var command in BinollaWire.PostAuthBootstrapCommandsDeferred)
+        {
+            await _sendAsync(command, cancellationToken).ConfigureAwait(false);
+            await Task.Delay(40, cancellationToken).ConfigureAwait(false);
         }
 
         // Re-subscribe previously subscribed pairs after reconnect
