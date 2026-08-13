@@ -75,7 +75,12 @@ public static class DependencyInjection
         {
             EnableAutoReconnect = configuration.GetValue("Binolla:EnableAutoReconnect", true),
             MaxConcurrentSessions = configuration.GetValue("Binolla:MaxConcurrentSessions", 100),
-            EnableChartConnection = false
+            EnableChartConnection = false,
+            // Fresh Binolla auth often needs >20s; login capture already succeeded in PM2 logs.
+            AuthenticationTimeout = TimeSpan.FromSeconds(
+                configuration.GetValue("Binolla:AuthenticationTimeoutSeconds", 45)),
+            MarketDataTimeout = TimeSpan.FromSeconds(
+                configuration.GetValue("Binolla:MarketDataTimeoutSeconds", 30))
         };
         services.AddSingleton(binollaOptions);
         services.AddSingleton<IBinollaSessionManager>(sp =>

@@ -76,14 +76,14 @@ public sealed class BinollaSessionManagerOptions
     public TimeSpan DefaultOperationTimeout { get; set; } = TimeSpan.FromSeconds(60);
 
     /// <summary>WS auth should complete on post-auth events within seconds; fail fast if not.</summary>
-    public TimeSpan AuthenticationTimeout { get; set; } = TimeSpan.FromSeconds(20);
+    public TimeSpan AuthenticationTimeout { get; set; } = TimeSpan.FromSeconds(45);
 
     /// <summary>Assets/quotes/candles should not block HTTP requests for a full minute.</summary>
     /// <remarks>
     /// Post-login Binolla often needs &gt;8s before s_assets/list and s_history/last arrive
     /// (PM2: assets count=0 at ~8s, then count=120; candles MARKET_UNAVAILABLE at ~8s).
     /// </remarks>
-    public TimeSpan MarketDataTimeout { get; set; } = TimeSpan.FromSeconds(20);
+    public TimeSpan MarketDataTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
     public TimeSpan PlaceOrderTimeout { get; set; } = TimeSpan.FromSeconds(30);
 

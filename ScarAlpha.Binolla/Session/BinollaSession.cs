@@ -351,21 +351,28 @@ public sealed class BinollaSession : IBinollaClient
         State.Touch();
 
         var transport = _trading ?? throw new BinollaConnectionException("Not connected.");
-        await _subscribeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        // Do not let a cancelled HTTP tick abort another request's subscribe — use a short local wait.
+        using var lockCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        lockCts.CancelAfter(TimeSpan.FromSeconds(8));
+        await _subscribeLock.WaitAsync(lockCts.Token).ConfigureAwait(false);
         try
         {
-            // Remember before send — unauthorized reauth must still re-subscribe this pair.
+            // Remember before send — soft unauthorized reauth re-nudges SubscribedPairs.
             State.RememberSubscription(pair);
-            // Only asset/change — alert/list on every quote tick flooded the socket and
-            // interleaved with binary history/quote attachments.
-            await transport.SendAsync(BinollaFraming.BuildAssetChange(pair, period), cancellationToken).ConfigureAwait(false);
+            // Match upstream BinollaApiClient.SubscribePair — alert lists before asset/change
+            // are required for s_history/last / s_quotes/list to start flowing.
+            await transport.SendAsync(BinollaFraming.BuildAlertList(), CancellationToken.None).ConfigureAwait(false);
+            await transport.SendAsync(BinollaFraming.BuildAlertClosedList(), CancellationToken.None).ConfigureAwait(false);
+            await transport.SendAsync(BinollaFraming.BuildAssetChange(pair, period), CancellationToken.None)
+                .ConfigureAwait(false);
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H113", "BinollaSession.SubscribePairAsync", "asset_change_sent", new
             {
                 pair,
                 period,
                 lifecycle = Lifecycle.ToString(),
-                subscribed = State.SubscribedPairs.Count
+                subscribed = State.SubscribedPairs.Count,
+                unauthorized = _router?.UnauthorizedSeen ?? 0
             });
             // #endregion
         }

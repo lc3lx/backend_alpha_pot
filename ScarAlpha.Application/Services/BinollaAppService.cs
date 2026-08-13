@@ -81,35 +81,77 @@ public sealed class BinollaAppService
         // #endregion
 
         // Password is never stored — only the resulting SSID is encrypted via ConnectAsync.
-        try
+        // Capture is expensive; WS auth can flake — retry connect with the same token/cookies.
+        const int maxConnectAttempts = 3;
+        Exception? lastConnectError = null;
+        for (var attempt = 1; attempt <= maxConnectAttempts; attempt++)
         {
-            var result = await ConnectAsync(
-                new BinollaConnectRequest(captured.SsidFrame, request.AccountType),
-                ct,
-                captured.CookieHeader);
-            // #region agent log
-            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H100", "BinollaAppService.LoginWithCredentialsAsync", "login_ok", new
+            try
             {
-                captureMs,
-                totalMs = sw.ElapsedMilliseconds
-            });
-            // #endregion
-            return result;
+                var result = await ConnectAsync(
+                    new BinollaConnectRequest(captured.SsidFrame, request.AccountType),
+                    ct,
+                    captured.CookieHeader);
+                // #region agent log
+                ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H100", "BinollaAppService.LoginWithCredentialsAsync", "login_ok", new
+                {
+                    captureMs,
+                    totalMs = sw.ElapsedMilliseconds,
+                    attempt
+                });
+                // #endregion
+                return result;
+            }
+            catch (Exception ex) when (
+                attempt < maxConnectAttempts &&
+                (ex is ApiException api &&
+                 (api.Code is ApiErrorCodes.BinollaConnectionFailed
+                     or ApiErrorCodes.BinollaSessionExpired
+                     or ApiErrorCodes.BinollaNotConnected)))
+            {
+                lastConnectError = ex;
+                // #region agent log
+                ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H101", "BinollaAppService.LoginWithCredentialsAsync", "connect_retry", new
+                {
+                    captureMs,
+                    attempt,
+                    type = ex.GetType().Name,
+                    code = (ex as ApiException)?.Code,
+                    message = ex.Message.Length > 120 ? ex.Message[..120] : ex.Message
+                });
+                // #endregion
+                try { await _sessions.RemoveAsync(_currentUser.UserId.ToString(), ct); } catch { /* ignore */ }
+                await Task.Delay(TimeSpan.FromMilliseconds(400 * attempt), ct);
+            }
+            catch (Exception ex)
+            {
+                // #region agent log
+                ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H101", "BinollaAppService.LoginWithCredentialsAsync", "connect_after_capture_failed", new
+                {
+                    captureMs,
+                    totalMs = sw.ElapsedMilliseconds,
+                    attempt,
+                    type = ex.GetType().Name,
+                    code = (ex as ApiException)?.Code,
+                    message = ex.Message.Length > 140 ? ex.Message[..140] : ex.Message
+                });
+                // #endregion
+                throw;
+            }
         }
-        catch (Exception ex)
+
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H101", "BinollaAppService.LoginWithCredentialsAsync", "connect_after_capture_failed", new
         {
-            // #region agent log
-            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H101", "BinollaAppService.LoginWithCredentialsAsync", "connect_after_capture_failed", new
-            {
-                captureMs,
-                totalMs = sw.ElapsedMilliseconds,
-                type = ex.GetType().Name,
-                code = (ex as ApiException)?.Code,
-                message = ex.Message.Length > 140 ? ex.Message[..140] : ex.Message
-            });
-            // #endregion
-            throw;
-        }
+            captureMs,
+            totalMs = sw.ElapsedMilliseconds,
+            attempt = maxConnectAttempts,
+            type = lastConnectError?.GetType().Name,
+            message = lastConnectError?.Message is { Length: > 140 } m ? m[..140] : lastConnectError?.Message
+        });
+        // #endregion
+        if (lastConnectError is not null) throw lastConnectError;
+        throw new ApiException(ApiErrorCodes.BinollaConnectionFailed, "Unable to connect to Binolla.", 502);
     }
 
     public async Task<BinollaConnectResponse> SignUpWithCredentialsAsync(

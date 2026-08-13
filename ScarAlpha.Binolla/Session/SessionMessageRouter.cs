@@ -159,35 +159,66 @@ internal sealed class SessionMessageRouter
         Interlocked.Increment(ref _unauthorizedSeen);
         _lastInboundEvent = "unauthorized";
         var lifecycle = _state.Lifecycle;
+        var everAuth = Volatile.Read(ref _everAuthorized) == 1;
         // #region agent log
         ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H83", "SessionMessageRouter.HandleUnauthorized", "unauthorized_received", new
         {
             lifecycle = lifecycle.ToString(),
             hadAuth = Volatile.Read(ref _authorized) == 1,
+            everAuth,
             reauthCount = Volatile.Read(ref _unauthorizedReauthCount)
         });
         // #endregion
 
-        // Up to N silent SSID re-sends. Bootstrap often emits multiple unauthorized frames
-        // after a fresh login; failing on the 2nd killed the session before assets loaded.
+        // After the first successful auth, transient unauthorized frames are normal around
+        // asset/change. Clearing _authorized forced EnsureAuthorized → full bootstrap again,
+        // which stormed unauthorized and starved s_history/last / s_quotes/list (PM2: assets=103
+        // OK, candles/price MARKET_UNAVAILABLE after exactly MarketDataTimeout).
+        if (everAuth && !string.IsNullOrEmpty(_state.Ssid))
+        {
+            var now = Environment.TickCount64;
+            var last = Interlocked.Read(ref _lastSoftReauthTicks);
+            if (now - last < 1_500)
+            {
+                // #region agent log
+                LoginTrace.Write("H109", "SessionMessageRouter.HandleUnauthorized", "soft_reauth_throttled", new
+                {
+                    lifecycle = lifecycle.ToString(),
+                    subscribed = _state.SubscribedPairs.Count
+                });
+                // #endregion
+                return;
+            }
+
+            Interlocked.Exchange(ref _lastSoftReauthTicks, now);
+            // Keep Connected + _authorized=1 so we do NOT re-run PostAuthBootstrap.
+            LoginTrace.Write("H109", "SessionMessageRouter.HandleUnauthorized", "soft_reauth_ssid_only", new
+            {
+                fromLifecycle = lifecycle.ToString(),
+                subscribed = _state.SubscribedPairs.Count,
+                historyCached = _state.HistoricalData.Count,
+                quotesCached = _state.LatestQuotes.Count
+            });
+            await _sendAsync(_state.Ssid, cancellationToken).ConfigureAwait(false);
+            foreach (var pair in _state.SubscribedPairs)
+            {
+                await _sendAsync(BinollaFraming.BuildAssetChange(pair, 60), cancellationToken)
+                    .ConfigureAwait(false);
+                await Task.Delay(20, cancellationToken).ConfigureAwait(false);
+            }
+
+            return;
+        }
+
+        // Pre-auth only: limited SSID retries before AuthenticationFailed.
         if (Volatile.Read(ref _unauthorizedReauthCount) < MaxUnauthorizedReauths &&
             !string.IsNullOrEmpty(_state.Ssid))
         {
             Interlocked.Increment(ref _unauthorizedReauthCount);
             Interlocked.Exchange(ref _authorized, 0);
-            var everAuth = Volatile.Read(ref _everAuthorized) == 1;
-            // After a successful auth, asset/change often gets a transient unauthorized.
-            // Clearing subscriptions here dropped the pair RememberSubscription just stored,
-            // so post-auth bootstrap never re-sent asset/change → candles timed out 20s
-            // (PM2: assets=121, candles/GBPUSD_otc MARKET_UNAVAILABLE).
-            if (!everAuth)
-            {
-                _state.ResetMarketCaches();
-                _state.ClearSubscriptions();
-            }
-
-            // Keep Connecting — do not mark AuthenticationFailed yet.
-            if (lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
+            _state.ResetMarketCaches();
+            _state.ClearSubscriptions();
+            if (lifecycle is not (SessionLifecycleState.Connecting or SessionLifecycleState.Reconnecting))
                 _state.SetLifecycle(SessionLifecycleState.Connecting, "Binolla unauthorized; re-sending SSID.");
 
             LoginTrace.Write("H83", "SessionMessageRouter.HandleUnauthorized", "unauthorized_reauth_send", new
@@ -195,62 +226,19 @@ internal sealed class SessionMessageRouter
                 ssidLen = _state.Ssid!.Length,
                 fromLifecycle = lifecycle.ToString(),
                 reauthCount = Volatile.Read(ref _unauthorizedReauthCount),
-                everAuth,
-                keptSubscriptions = everAuth,
-                subscribed = _state.SubscribedPairs.Count
+                everAuth = false
             });
             await _sendAsync(_state.Ssid, cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        // Budget exhausted.
-        // If we already authenticated once, bootstrap often spams unauthorized — soft re-send
-        // SSID instead of killing the live session (PM2: login 200 then assets BINOLLA_NOT_CONNECTED).
-        // Do NOT ResetMarketCaches here: wiping history/quotes mid-wait caused
-        // GetHistoryAsync/GetLatestQuoteAsync to time out at MarketDataTimeout (PM2: MS_otc /
-        // GBPUSD_otc candles/price MARKET_UNAVAILABLE after ~20s while assets stayed at 120).
-        if (Volatile.Read(ref _everAuthorized) == 1 && !string.IsNullOrEmpty(_state.Ssid))
-        {
-            var now = Environment.TickCount64;
-            var last = Interlocked.Read(ref _lastSoftReauthTicks);
-            if (now - last < 2_000)
-            {
-                // #region agent log
-                LoginTrace.Write("H109", "SessionMessageRouter.HandleUnauthorized", "soft_reauth_throttled", new
-                {
-                    lifecycle = lifecycle.ToString(),
-                    reauthCount = Volatile.Read(ref _unauthorizedReauthCount)
-                });
-                // #endregion
-                return;
-            }
-
-            Interlocked.Exchange(ref _lastSoftReauthTicks, now);
-            Interlocked.Exchange(ref _authorized, 0);
-            if (lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
-                _state.SetLifecycle(SessionLifecycleState.Connecting, "Binolla unauthorized; soft re-auth.");
-
-            // #region agent log
-            LoginTrace.Write("H109", "SessionMessageRouter.HandleUnauthorized", "soft_reauth_post_auth", new
-            {
-                fromLifecycle = lifecycle.ToString(),
-                reauthCount = Volatile.Read(ref _unauthorizedReauthCount),
-                historyCached = _state.HistoricalData.Count,
-                quotesCached = _state.LatestQuotes.Count
-            });
-            // #endregion
-            await _sendAsync(_state.Ssid, cancellationToken).ConfigureAwait(false);
-            return;
-        }
-
-        // Never authenticated + budget exhausted → fail fast (avoids 20s login hang).
         // #region agent log
         LoginTrace.Write("H108", "SessionMessageRouter.HandleUnauthorized", "unauthorized_auth_failed", new
         {
             lifecycle = lifecycle.ToString(),
             reauthCount = Volatile.Read(ref _unauthorizedReauthCount),
             hadAuth = Volatile.Read(ref _authorized) == 1,
-            everAuthorized = Volatile.Read(ref _everAuthorized) == 1
+            everAuthorized = false
         });
         // #endregion
 
