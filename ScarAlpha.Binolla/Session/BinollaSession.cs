@@ -17,6 +17,7 @@ public sealed class BinollaSession : IBinollaClient
     private readonly SemaphoreSlim _inboundGate = new(1, 1);
     private readonly SemaphoreSlim _subscribeLock = new(1, 1);
     private readonly OrderCorrelationHub _orders = new();
+    private int _alertsPrimed;
 
     private IWebSocketTransport? _trading;
     private IWebSocketTransport? _chart;
@@ -101,6 +102,7 @@ public sealed class BinollaSession : IBinollaClient
             try { _sessionCts?.Dispose(); } catch { /* ignore */ }
             _sessionCts = new CancellationTokenSource();
             _reconnectAttempts = 0;
+            Interlocked.Exchange(ref _alertsPrimed, 0);
 
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H80", "BinollaSession.ConnectAsync", "connecting", new
@@ -359,10 +361,13 @@ public sealed class BinollaSession : IBinollaClient
         {
             // Remember before send — soft unauthorized reauth re-nudges SubscribedPairs.
             State.RememberSubscription(pair);
-            // Match upstream BinollaApiClient.SubscribePair — alert lists before asset/change
-            // are required for s_history/last / s_quotes/list to start flowing.
-            await transport.SendAsync(BinollaFraming.BuildAlertList(), CancellationToken.None).ConfigureAwait(false);
-            await transport.SendAsync(BinollaFraming.BuildAlertClosedList(), CancellationToken.None).ConfigureAwait(false);
+            // Prime alert lists once per session (upstream does this before asset/change).
+            if (Interlocked.CompareExchange(ref _alertsPrimed, 1, 0) == 0)
+            {
+                await transport.SendAsync(BinollaFraming.BuildAlertList(), CancellationToken.None).ConfigureAwait(false);
+                await transport.SendAsync(BinollaFraming.BuildAlertClosedList(), CancellationToken.None).ConfigureAwait(false);
+            }
+
             await transport.SendAsync(BinollaFraming.BuildAssetChange(pair, period), CancellationToken.None)
                 .ConfigureAwait(false);
             // #region agent log

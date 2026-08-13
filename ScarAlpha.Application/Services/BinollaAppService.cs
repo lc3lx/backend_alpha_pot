@@ -50,11 +50,15 @@ public sealed class BinollaAppService
             throw new ApiException(ApiErrorCodes.ValidationError, "Request body is required.");
         ValidateCredentialRequest(request);
 
+        // Independent of RequestAborted — Telegram/WebView often cancels ~20–25s.
+        using var workCts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+        var workCt = workCts.Token;
+
         BinollaCapturedSession captured;
         var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
-            captured = await _credentialAuth.LoginAsync(request.Email, request.Password, ct);
+            captured = await _credentialAuth.LoginAsync(request.Email, request.Password, workCt);
         }
         catch (ApiException)
         {
@@ -90,7 +94,7 @@ public sealed class BinollaAppService
             {
                 var result = await ConnectAsync(
                     new BinollaConnectRequest(captured.SsidFrame, request.AccountType),
-                    ct,
+                    workCt,
                     captured.CookieHeader);
                 // #region agent log
                 ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H100", "BinollaAppService.LoginWithCredentialsAsync", "login_ok", new
@@ -120,8 +124,8 @@ public sealed class BinollaAppService
                     message = ex.Message.Length > 120 ? ex.Message[..120] : ex.Message
                 });
                 // #endregion
-                try { await _sessions.RemoveAsync(_currentUser.UserId.ToString(), ct); } catch { /* ignore */ }
-                await Task.Delay(TimeSpan.FromMilliseconds(400 * attempt), ct);
+                try { await _sessions.RemoveAsync(_currentUser.UserId.ToString(), workCt); } catch { /* ignore */ }
+                await Task.Delay(TimeSpan.FromMilliseconds(400 * attempt), workCt);
             }
             catch (Exception ex)
             {
@@ -213,16 +217,19 @@ public sealed class BinollaAppService
 
         try
         {
+            using var workCts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+            var workCt = workCts.Token;
+
             // Allow reconnect after a prior SSID auth failure / unauthorized drop.
             _restorer.ClearAuthFailure(userId);
 
             // Drop any zombie in-memory session so cookie+SSID attach on a fresh socket.
-            await _sessions.RemoveAsync(userId.ToString(), ct);
+            await _sessions.RemoveAsync(userId.ToString(), workCt);
 
             var client = await _sessions.GetOrCreateAsync(
                 userId.ToString(),
                 request.Ssid.Trim(),
-                ct,
+                workCt,
                 cookieHeader);
 
             if (!client.IsTransportConnected ||
@@ -240,9 +247,20 @@ public sealed class BinollaAppService
 
             // Login must return as soon as the socket is authorized. Balance loads on the next market call.
             decimal? balanceValue = null;
+            try
+            {
+                using var balCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+                balanceValue = (await client.GetBalanceAsync(balCts.Token)).CurrentBalance;
+            }
+            catch
+            {
+                // balance is optional on connect
+            }
 
             var now = DateTimeOffset.UtcNow;
-            var link = await _links.GetByUserIdAsync(userId, ct) ?? new BinollaLink
+            // Persist with workCt — never HttpContext.RequestAborted (PM2: OCE on Npgsql after
+            // token capture while WS was already up → false BINOLLA_CONNECTION_FAILED).
+            var link = await _links.GetByUserIdAsync(userId, workCt) ?? new BinollaLink
             {
                 Id = Guid.NewGuid(),
                 UserId = userId,
@@ -269,12 +287,21 @@ public sealed class BinollaAppService
                 link.ApprovalStatus = AdminApprovalStatus.Pending;
             }
 
-            await _links.UpsertAsync(link, ct);
+            await _links.UpsertAsync(link, workCt);
 
-            var access = await _access.CheckAsync(userId, ct);
+            var access = await _access.CheckAsync(userId, workCt);
             _logger.LogInformation(
                 "Binolla linked user={UserId} approval={ApprovalStatus} access={Access}",
                 userId, link.ApprovalStatus, access.Access);
+
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H120", "BinollaAppService.ConnectAsync", "link_persisted", new
+            {
+                access = access.Access.ToString(),
+                transportUp = client.IsTransportConnected,
+                hasBalance = balanceValue is not null
+            });
+            // #endregion
 
             return new BinollaConnectResponse(
                 Connected: true,
@@ -284,6 +311,56 @@ public sealed class BinollaAppService
                 ApprovalStatus: access.ApprovalStatus,
                 LastConnectedAt: link.LastConnectedAt,
                 Balance: balanceValue);
+        }
+        catch (OperationCanceledException) when (
+            _sessions.Get(userId.ToString()) is { } live &&
+            live.IsTransportConnected &&
+            live.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
+        {
+            // Client aborted HTTP after WS auth — session is live; salvage the link row.
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H120", "BinollaAppService.ConnectAsync", "http_abort_salvage", new
+            {
+                lifecycle = live.Lifecycle.ToString()
+            });
+            // #endregion
+            try
+            {
+                var now = DateTimeOffset.UtcNow;
+                var link = await _links.GetByUserIdAsync(userId, CancellationToken.None) ?? new BinollaLink
+                {
+                    Id = Guid.NewGuid(),
+                    UserId = userId,
+                    CreatedAt = now,
+                    AdminApproved = false,
+                    ApprovalStatus = AdminApprovalStatus.Pending
+                };
+                link.EncryptedSsid = encrypted;
+                if (!string.IsNullOrWhiteSpace(cookieHeader))
+                    link.EncryptedCookieHeader = _protector.Encrypt(cookieHeader.Trim());
+                link.AccountType = DomainAccount.Demo;
+                link.Status = BinollaLinkStatus.Connected;
+                link.LastConnectedAt = now;
+                link.UpdatedAt = now;
+                await _links.UpsertAsync(link, CancellationToken.None);
+                var access = await _access.CheckAsync(userId, CancellationToken.None);
+                return new BinollaConnectResponse(
+                    Connected: true,
+                    AccountType: "Demo",
+                    Access: AccountAppService.MapAccess(access.Access),
+                    AdminApproved: access.AdminApproved,
+                    ApprovalStatus: access.ApprovalStatus,
+                    LastConnectedAt: link.LastConnectedAt,
+                    Balance: null);
+            }
+            catch (Exception salvageEx)
+            {
+                _logger.LogWarning(salvageEx, "Binolla connect salvage failed for user {UserId}", userId);
+                throw new ApiException(
+                    ApiErrorCodes.BinollaConnectionFailed,
+                    "Binolla connected but login response was interrupted. Re-open the app.",
+                    502);
+            }
         }
         catch (ApiException)
         {
@@ -353,7 +430,7 @@ public sealed class BinollaAppService
         try
         {
             using var balCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            balCts.CancelAfter(TimeSpan.FromSeconds(8));
+            balCts.CancelAfter(TimeSpan.FromSeconds(15));
             var balance = await client.GetBalanceAsync(balCts.Token);
             // Real trading is disabled: never surface Real balance as actionable funds.
             return new BinollaBalanceDto(

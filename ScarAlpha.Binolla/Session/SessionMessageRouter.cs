@@ -22,7 +22,7 @@ internal sealed class SessionMessageRouter
     private int _everAuthorized;
     private int _unauthorizedReauthCount;
     private int _nsConnectSends;
-    private int _unauthorizedSeen;
+        private int _unauthorizedSeen;
     private int _authSignals;
     private long _lastSoftReauthTicks;
     private string? _lastInboundEvent;
@@ -398,36 +398,87 @@ internal sealed class SessionMessageRouter
 
     private Task ProcessEventPayloadAsync(string messageType, string content)
     {
+        // #region agent log
+        if (messageType.Contains("history", StringComparison.OrdinalIgnoreCase) ||
+            messageType.Contains("quote", StringComparison.OrdinalIgnoreCase) ||
+            messageType.Contains("balance", StringComparison.OrdinalIgnoreCase) ||
+            messageType.Contains("asset", StringComparison.OrdinalIgnoreCase))
+        {
+            LoginTrace.Write("H121", "SessionMessageRouter.ProcessEventPayloadAsync", "event", new
+            {
+                messageType = messageType.Length > 48 ? messageType[..48] : messageType,
+                contentLen = content?.Length ?? 0,
+                prefix = content is { Length: > 0 }
+                    ? content[..Math.Min(24, content.Length)]
+                    : ""
+            });
+        }
+        // #endregion
+
         switch (messageType)
         {
             case BinollaWire.EvBalanceUpdate:
-                ProcessBalanceUpdate(content);
+                ProcessBalanceUpdate(UnwrapPayload(content));
                 break;
             case BinollaWire.EvBalancesList:
-                ProcessBalanceList(content);
+                ProcessBalanceList(UnwrapPayload(content));
                 break;
             case BinollaWire.EvOrdersOpen:
-                ProcessOrderOpen(content);
+                ProcessOrderOpen(UnwrapPayload(content));
                 break;
             case BinollaWire.EvOrdersOpenFailed:
-                ProcessOrderFailed(content);
+                ProcessOrderFailed(UnwrapPayload(content));
                 break;
             case BinollaWire.EvOrdersClose:
             case BinollaWire.EvOrdersClosedList:
-                ProcessOrderClose(content);
+                ProcessOrderClose(UnwrapPayload(content));
                 break;
             case BinollaWire.EvAssetsList:
-                ProcessAssetsList(content);
+                ProcessAssetsList(UnwrapPayload(content));
                 break;
             case BinollaWire.EvQuotesList:
-                ProcessQuotesList(content);
+                ProcessQuotesList(UnwrapPayload(content));
                 break;
             case BinollaWire.EvHistoryLast:
-                ProcessHistoryLast(content);
+                ProcessHistoryLast(UnwrapPayload(content));
                 break;
         }
 
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Binary attachments sometimes arrive as a JSON string, or as ["event", payload].
+    /// </summary>
+    private static string UnwrapPayload(string content)
+    {
+        if (string.IsNullOrWhiteSpace(content))
+            return content;
+
+        var trimmed = content.Trim();
+        try
+        {
+            if (trimmed.StartsWith('"'))
+            {
+                var inner = JsonConvert.DeserializeObject<string>(trimmed);
+                if (!string.IsNullOrWhiteSpace(inner))
+                    trimmed = inner.Trim();
+            }
+
+            if (trimmed.StartsWith('['))
+            {
+                var arr = JsonConvert.DeserializeObject<JArray>(trimmed);
+                if (arr is { Count: >= 2 } && arr[1] is not null &&
+                    arr[1]!.Type is JTokenType.Object or JTokenType.Array)
+                    return arr[1]!.ToString(Formatting.None);
+            }
+        }
+        catch
+        {
+            // keep original
+        }
+
+        return trimmed;
     }
 
     private void ProcessBalanceUpdate(string content)
@@ -450,20 +501,49 @@ internal sealed class SessionMessageRouter
         try
         {
             var balanceData = JsonConvert.DeserializeObject<JObject>(content);
-            if (balanceData is null) return;
+            if (balanceData is null)
+            {
+                LoginTrace.Write("H122", "SessionMessageRouter.ProcessBalanceList", "balance_null", new { len = content?.Length ?? 0 });
+                return;
+            }
 
             decimal? demo = balanceData["demoBalance"]?.Value<decimal?>()
-                            ?? balanceData["demo"]?.Value<decimal?>();
+                            ?? balanceData["demo"]?.Value<decimal?>()
+                            ?? balanceData["DemoBalance"]?.Value<decimal?>();
             decimal? real = balanceData["liveBalance"]?.Value<decimal?>()
                             ?? balanceData["realBalance"]?.Value<decimal?>()
-                            ?? balanceData["live"]?.Value<decimal?>();
+                            ?? balanceData["live"]?.Value<decimal?>()
+                            ?? balanceData["real"]?.Value<decimal?>();
 
-            if (demo is null && real is null) return;
+            // Some payloads nest under "balance".
+            if (demo is null && real is null && balanceData["balance"] is JObject nested)
+            {
+                demo = nested["demo"]?.Value<decimal?>() ?? nested["demoBalance"]?.Value<decimal?>();
+                real = nested["live"]?.Value<decimal?>() ?? nested["liveBalance"]?.Value<decimal?>();
+            }
+
+            if (demo is null && real is null)
+            {
+                LoginTrace.Write("H122", "SessionMessageRouter.ProcessBalanceList", "balance_keys_miss", new
+                {
+                    keys = string.Join(",", balanceData.Properties().Select(p => p.Name).Take(8))
+                });
+                return;
+            }
+
             _state.UpdateBalance(demo, real);
+            LoginTrace.Write("H122", "SessionMessageRouter.ProcessBalanceList", "balance_ok", new
+            {
+                hasDemo = demo is not null,
+                hasReal = real is not null
+            });
         }
-        catch
+        catch (Exception ex)
         {
-            // ignore malformed balance payloads
+            LoginTrace.Write("H122", "SessionMessageRouter.ProcessBalanceList", "balance_parse_fail", new
+            {
+                type = ex.GetType().Name
+            });
         }
     }
 
