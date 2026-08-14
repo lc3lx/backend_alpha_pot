@@ -65,6 +65,14 @@ public sealed class BinollaSession : IBinollaClient
 
     public bool IsTransportConnected => _trading?.IsConnected == true;
 
+    public string DescribeMarketWireState()
+    {
+        var r = _router;
+        return string.Create(
+            System.Globalization.CultureInfo.InvariantCulture,
+            $"lc={Lifecycle} ws={IsTransportConnected} cookie={(string.IsNullOrEmpty(State.CookieHeader) ? 0 : 1)} unauth={r?.UnauthorizedSeen ?? 0} histHdr={r?.HistoryHeaderCount ?? 0} histStore={r?.HistoryStoredCount ?? 0} quoteHdr={r?.QuotesHeaderCount ?? 0} orphan={r?.OrphanBinaryCount ?? 0} histCache={State.HistoricalData.Count} quoteCache={State.LatestQuotes.Count} last={r?.LastInboundEvent ?? "-"}");
+    }
+
     /// <summary>
     /// Wait while another connect/reauth is in flight. Avoids stomping a live handshake.
     /// </summary>
@@ -774,7 +782,15 @@ public sealed class BinollaSession : IBinollaClient
             quotesCached = State.LatestQuotes.Count,
             historyKeys = State.HistoricalData.Keys.Take(8).ToArray(),
             httpWaitMs = httpWait.TotalMilliseconds,
-            timeoutSec = _options.MarketDataTimeout.TotalSeconds
+            timeoutSec = _options.MarketDataTimeout.TotalSeconds,
+            hasCookie = !string.IsNullOrEmpty(State.CookieHeader),
+            unauthorized = _router?.UnauthorizedSeen ?? 0,
+            historyHeaders = _router?.HistoryHeaderCount ?? 0,
+            historyStored = _router?.HistoryStoredCount ?? 0,
+            quotesHeaders = _router?.QuotesHeaderCount ?? 0,
+            orphanBinary = _router?.OrphanBinaryCount ?? 0,
+            lastInbound = _router?.LastInboundEvent,
+            wire = DescribeMarketWireState()
         });
         // #endregion
         throw new BinollaTimeoutException("History not available for asset/period.");

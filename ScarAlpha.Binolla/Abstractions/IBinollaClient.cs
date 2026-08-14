@@ -18,6 +18,9 @@ public interface IBinollaClient : IAsyncDisposable
     /// <summary>True when the trading WebSocket is open (not just Lifecycle.Connected).</summary>
     bool IsTransportConnected { get; }
 
+    /// <summary>Compact wire diagnostics for market soft-miss logs (no secrets).</summary>
+    string DescribeMarketWireState();
+
     Task<BalanceInfo> GetBalanceAsync(CancellationToken cancellationToken = default);
 
     Task ChangeAccountAsync(AccountType accountType, CancellationToken cancellationToken = default);

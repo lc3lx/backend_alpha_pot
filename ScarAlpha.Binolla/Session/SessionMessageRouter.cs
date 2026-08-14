@@ -24,6 +24,10 @@ internal sealed class SessionMessageRouter
     private int _nsConnectSends;
         private int _unauthorizedSeen;
     private int _authSignals;
+    private int _historyHeaderCount;
+    private int _historyStoredCount;
+    private int _quotesHeaderCount;
+    private int _orphanBinaryCount;
     private long _lastSoftReauthTicks;
     private string? _lastInboundEvent;
     private const int MaxUnauthorizedReauths = 3;
@@ -31,6 +35,10 @@ internal sealed class SessionMessageRouter
     public int NsConnectSends => Volatile.Read(ref _nsConnectSends);
     public int UnauthorizedSeen => Volatile.Read(ref _unauthorizedSeen);
     public int AuthSignals => Volatile.Read(ref _authSignals);
+    public int HistoryHeaderCount => Volatile.Read(ref _historyHeaderCount);
+    public int HistoryStoredCount => Volatile.Read(ref _historyStoredCount);
+    public int QuotesHeaderCount => Volatile.Read(ref _quotesHeaderCount);
+    public int OrphanBinaryCount => Volatile.Read(ref _orphanBinaryCount);
     public string? LastInboundEvent => _lastInboundEvent;
 
     public SessionMessageRouter(
@@ -189,10 +197,12 @@ internal sealed class SessionMessageRouter
         if (string.IsNullOrEmpty(_upcomingMessageType))
         {
             // #region agent log
+            Interlocked.Increment(ref _orphanBinaryCount);
             LoginTrace.Write("H141", "SessionMessageRouter.HandleBinaryAttachment", "orphan_binary_no_header", new
             {
                 len = message.Length,
-                prefix = message.Length > 24 ? message[..24] : message
+                prefix = message.Length > 24 ? message[..24] : message,
+                orphanTotal = Volatile.Read(ref _orphanBinaryCount)
             });
             // #endregion
             return;
@@ -479,11 +489,18 @@ internal sealed class SessionMessageRouter
             _upcomingMessageType = string.Empty;
         }
 
+        if (string.Equals(_upcomingMessageType, BinollaWire.EvHistoryLast, StringComparison.Ordinal))
+            Interlocked.Increment(ref _historyHeaderCount);
+        else if (string.Equals(_upcomingMessageType, BinollaWire.EvQuotesList, StringComparison.Ordinal))
+            Interlocked.Increment(ref _quotesHeaderCount);
+
         // #region agent log
         LoginTrace.Write("H141", "SessionMessageRouter.HandleBinaryHeader", "binary_header_set", new
         {
             upcoming = _upcomingMessageType,
-            raw = message.Length > 64 ? message[..64] : message
+            raw = message.Length > 64 ? message[..64] : message,
+            historyHeaders = Volatile.Read(ref _historyHeaderCount),
+            quotesHeaders = Volatile.Read(ref _quotesHeaderCount)
         });
         // #endregion
     }
@@ -962,6 +979,7 @@ internal sealed class SessionMessageRouter
             }
 
             _state.HistoricalData[$"{asset}:{period}"] = history;
+            Interlocked.Increment(ref _historyStoredCount);
             // #region agent log
             LoginTrace.Write("H113", "SessionMessageRouter.ProcessHistoryLast", "history_stored", new
             {
@@ -970,7 +988,8 @@ internal sealed class SessionMessageRouter
                 candleCount = history.Candles.Count,
                 tickCount = history.TickHistory.Count,
                 synthesized = history.Candles.Count > 0 && history.TickHistory.Count > 0,
-                cacheSize = _state.HistoricalData.Count
+                cacheSize = _state.HistoricalData.Count,
+                storedTotal = Volatile.Read(ref _historyStoredCount)
             });
             // #endregion
         }

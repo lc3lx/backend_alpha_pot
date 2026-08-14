@@ -36,6 +36,21 @@ public static class LoginTrace
                     // try next
                 }
             }
+
+            // #region agent log
+            // Mirror critical crumbs to stdout so PM2 out log captures them without scp'ing NDJSON.
+            try
+            {
+                var dataJson = data is null ? "{}" : JsonSerializer.Serialize(data);
+                if (dataJson.Length > 240)
+                    dataJson = dataJson[..240] + "…";
+                Console.WriteLine($"DBG660|{hypothesisId}|{message}|{dataJson}");
+            }
+            catch
+            {
+                // ignore
+            }
+            // #endregion
         }
         catch
         {

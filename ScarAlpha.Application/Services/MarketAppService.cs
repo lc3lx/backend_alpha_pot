@@ -268,15 +268,16 @@ public sealed class MarketAppService
         catch (BinollaTimeoutException)
         {
             // Soft empty — FE retries; hard 500 blocked the chart shell after assets already worked.
+            var wire = client.DescribeMarketWireState();
             _logger.LogInformation(
-                "Market candles not ready for user {UserId} asset={Asset} period={Period}; returning empty",
-                _currentUser.UserId, symbol, wirePeriod);
+                "Market candles not ready for user {UserId} asset={Asset} period={Period}; returning empty; wire={Wire}",
+                _currentUser.UserId, symbol, wirePeriod, wire);
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
                 "H131",
                 "MarketAppService.GetCandlesAsync",
                 "candles_soft_timeout",
-                new { symbol, period, wirePeriod, elapsedMs = sw.ElapsedMilliseconds });
+                new { symbol, period, wirePeriod, elapsedMs = sw.ElapsedMilliseconds, wire });
             // #endregion
             return new MarketCandlesResponse(symbol, wirePeriod, Array.Empty<MarketCandleDto>());
         }
