@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Threading.Channels;
 using ScarAlpha.Binolla.Abstractions;
 using ScarAlpha.Binolla.Models;
 using ScarAlpha.Binolla.Protocol;
@@ -14,11 +15,21 @@ public sealed class BinollaSession : IBinollaClient
     private readonly BinollaSessionManagerOptions _options;
     private readonly WebSocketTransportFactory _transportFactory;
     private readonly SemaphoreSlim _lifecycleLock = new(1, 1);
-    private readonly SemaphoreSlim _inboundGate = new(1, 1);
     private readonly SemaphoreSlim _subscribeLock = new(1, 1);
     private readonly ConcurrentDictionary<string, byte> _warmInFlight = new(StringComparer.OrdinalIgnoreCase);
     private readonly OrderCorrelationHub _orders = new();
     private int _alertsPrimed;
+
+    /// <summary>
+    /// Strict FIFO inbound queue. Fire-and-forget + SemaphoreSlim was non-FIFO and could
+    /// process binary history/quote payloads BEFORE their 451-[type] headers — dropping
+    /// s_history/last forever (PM2: assets OK, history_stored never).
+    /// </summary>
+    private Channel<(string Message, bool IsBinary)>? _inboundChannel;
+    private Task? _inboundPumpTask;
+    private string? _lastSubscribeKey;
+    private long _lastSubscribeTicks;
+    private const int SubscribeDebounceMs = 3000;
 
     private IWebSocketTransport? _trading;
     private IWebSocketTransport? _chart;
@@ -140,6 +151,12 @@ public sealed class BinollaSession : IBinollaClient
                 throw new BinollaAuthenticationException(
                     $"Authentication did not complete (state={Lifecycle}).");
             }
+        }
+        catch (OperationCanceledException)
+        {
+            SetLifecycle(SessionLifecycleState.Disconnected, "Connect canceled.");
+            await SafeCloseSocketsAsync().ConfigureAwait(false);
+            throw;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -391,12 +408,37 @@ public sealed class BinollaSession : IBinollaClient
         {
             // Remember before send — soft unauthorized reauth re-nudges SubscribedPairs.
             State.RememberSubscription(pair);
+
+            // Concurrent candles+price+RSI polls were re-sending asset/change every few seconds,
+            // cancelling Binolla's in-flight s_history/last push before history_stored.
+            var subKey = $"{pair}:{wirePeriod}";
+            var now = Environment.TickCount64;
+            if (string.Equals(_lastSubscribeKey, subKey, StringComparison.OrdinalIgnoreCase) &&
+                now - _lastSubscribeTicks < SubscribeDebounceMs)
+            {
+                // #region agent log
+                ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H140", "BinollaSession.SubscribePairAsync", "subscribe_debounced", new
+                {
+                    pair,
+                    wirePeriod,
+                    ageMs = now - _lastSubscribeTicks,
+                    historyKeys = State.HistoricalData.Keys.Take(8).ToArray(),
+                    quoteKeys = State.LatestQuotes.Keys.Take(8).ToArray()
+                });
+                // #endregion
+                return;
+            }
+
+            _lastSubscribeKey = subKey;
+            _lastSubscribeTicks = now;
+
             // Match upstream exactly: alerts before every asset/change (not once per session).
             await transport.SendAsync(BinollaFraming.BuildAlertList(), CancellationToken.None).ConfigureAwait(false);
             await transport.SendAsync(BinollaFraming.BuildAlertClosedList(), CancellationToken.None).ConfigureAwait(false);
             // ONE asset/change only. Sending 14400 after 60 cancels the reliable OTC history push
             // (PM2: history never arrives for EURUSD_otc period=14400 within 30s).
-            await transport.SendAsync(BinollaFraming.BuildAssetChange(pair, wirePeriod), CancellationToken.None)
+            var frame = BinollaFraming.BuildAssetChange(pair, wirePeriod);
+            await transport.SendAsync(frame, CancellationToken.None)
                 .ConfigureAwait(false);
 
             // #region agent log
@@ -406,10 +448,13 @@ public sealed class BinollaSession : IBinollaClient
                 requestedPeriod,
                 wirePeriod,
                 clamped = requestedPeriod != wirePeriod,
+                frame,
                 lifecycle = Lifecycle.ToString(),
                 subscribed = State.SubscribedPairs.Count,
                 unauthorized = _router?.UnauthorizedSeen ?? 0,
-                assetsCached = State.Assets.Count
+                assetsCached = State.Assets.Count,
+                historyCached = State.HistoricalData.Count,
+                quotesCached = State.LatestQuotes.Count
             });
             // #endregion
         }
@@ -880,7 +925,7 @@ public sealed class BinollaSession : IBinollaClient
         }
 
         _lifecycleLock.Dispose();
-        _inboundGate.Dispose();
+        _subscribeLock.Dispose();
         _sessionCts?.Dispose();
     }
 
@@ -907,10 +952,15 @@ public sealed class BinollaSession : IBinollaClient
             });
 
         // Fresh transport each connect — still unsubscribe first so reconnect never double-fires.
-        _trading.TextMessageReceived -= OnTradingMessage;
+        _trading.TextMessageReceived -= OnTradingTextMessage;
+        _trading.BinaryMessageReceived -= OnTradingBinaryMessage;
         _trading.Closed -= OnTradingClosed;
-        _trading.TextMessageReceived += OnTradingMessage;
+        _trading.TextMessageReceived += OnTradingTextMessage;
+        _trading.BinaryMessageReceived += OnTradingBinaryMessage;
         _trading.Closed += OnTradingClosed;
+
+        // Start FIFO pump BEFORE ConnectAsync so Engine.IO open/auth frames are never dropped.
+        StartInboundPump(cancellationToken);
 
         _authTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         _balanceTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -954,47 +1004,112 @@ public sealed class BinollaSession : IBinollaClient
         }
     }
 
-    private void OnTradingMessage(string message)
+    private void StartInboundPump(CancellationToken cancellationToken)
     {
-        var router = _router;
-        if (router is null) return;
-
-        // Serialize protocol handling per session so 451 header + payload pairs never interleave.
-        var ct = _sessionCts?.Token ?? CancellationToken.None;
-        _ = ProcessInboundAsync(router, message, ct);
+        _inboundChannel = Channel.CreateUnbounded<(string Message, bool IsBinary)>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            AllowSynchronousContinuations = false
+        });
+        var reader = _inboundChannel.Reader;
+        _inboundPumpTask = Task.Run(() => InboundPumpAsync(reader, cancellationToken), CancellationToken.None);
     }
 
-    private async Task ProcessInboundAsync(SessionMessageRouter router, string message, CancellationToken ct)
+    private async Task StopInboundPumpAsync()
     {
-        await _inboundGate.WaitAsync(ct).ConfigureAwait(false);
+        try { _inboundChannel?.Writer.TryComplete(); } catch { /* ignore */ }
+
+        var pump = _inboundPumpTask;
+        _inboundPumpTask = null;
+        _inboundChannel = null;
+        if (pump is null)
+            return;
+
+        try { await pump.ConfigureAwait(false); }
+        catch { /* ignore */ }
+    }
+
+    private void OnTradingTextMessage(string message) => EnqueueInbound(message, isBinary: false);
+
+    private void OnTradingBinaryMessage(string message) => EnqueueInbound(message, isBinary: true);
+
+    private void EnqueueInbound(string message, bool isBinary)
+    {
+        // Enqueue only — never process here. Upstream awaits each frame in the receive loop;
+        // we mirror that with a single-reader channel so 451 + binary stay ordered.
+        var ch = _inboundChannel;
+        if (ch is null)
+            return;
+        if (!ch.Writer.TryWrite((message, isBinary)))
+        {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H140", "BinollaSession.EnqueueInbound", "inbound_drop", new
+            {
+                isBinary,
+                len = message.Length,
+                prefix = message.Length > 16 ? message[..16] : message
+            });
+            // #endregion
+        }
+    }
+
+    private async Task InboundPumpAsync(ChannelReader<(string Message, bool IsBinary)> reader, CancellationToken ct)
+    {
         try
         {
-            await router.HandleRawAsync(message, ct).ConfigureAwait(false);
-
-            if (State.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
-                _authTcs?.TrySetResult(true);
-
-            if (State.Lifecycle == SessionLifecycleState.AuthenticationFailed)
+            await foreach (var (message, isBinary) in reader.ReadAllAsync(ct).ConfigureAwait(false))
             {
-                _authTcs?.TrySetException(new BinollaAuthenticationException("SSID not authorized."));
-                OnSessionExpired?.Invoke();
-            }
+                var router = _router;
+                if (router is null)
+                    continue;
 
-            if (State.BalanceUpdatedAt is not null)
-                _balanceTcs?.TrySetResult(true);
+                try
+                {
+                    await ProcessInboundAsync(router, message, isBinary, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    // #region agent log
+                    ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H140", "BinollaSession.InboundPumpAsync", "inbound_error", new
+                    {
+                        type = ex.GetType().Name,
+                        isBinary
+                    });
+                    // #endregion
+                    _authTcs?.TrySetException(ex);
+                }
+            }
         }
         catch (OperationCanceledException)
         {
-            // session shutting down
+            // session shutting down / reconnect
         }
-        catch (Exception ex)
+    }
+
+    private async Task ProcessInboundAsync(
+        SessionMessageRouter router,
+        string message,
+        bool isBinary,
+        CancellationToken ct)
+    {
+        await router.HandleRawAsync(message, isBinary, ct).ConfigureAwait(false);
+
+        if (State.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
+            _authTcs?.TrySetResult(true);
+
+        if (State.Lifecycle == SessionLifecycleState.AuthenticationFailed)
         {
-            _authTcs?.TrySetException(ex);
+            _authTcs?.TrySetException(new BinollaAuthenticationException("SSID not authorized."));
+            OnSessionExpired?.Invoke();
         }
-        finally
-        {
-            _inboundGate.Release();
-        }
+
+        if (State.BalanceUpdatedAt is not null)
+            _balanceTcs?.TrySetResult(true);
     }
 
     private void OnTradingClosed(Exception? error)
@@ -1087,12 +1202,14 @@ public sealed class BinollaSession : IBinollaClient
     {
         var tcs = _authTcs ?? throw new InvalidOperationException("Auth waiter missing.");
 
-        // Do NOT link to the caller/HTTP/restore CT. Lazy restore used an 18s CTS that cancelled
-        // auth mid-handshake while a parallel status restore later succeeded (PM2 assets 18s
-        // BINOLLA_NOT_CONNECTED, then "Session restore: connected").
+        // Timeout and caller-cancel are separate:
+        // - AuthenticationTimeout → BinollaTimeoutException (never OCE)
+        // - caller CT → OperationCanceledException (ConnectAsync contract / tests)
+        // Do NOT CancelAfter on a linked CTS with the HTTP RequestAborted alone as the only
+        // bound — restore callers must pass CancellationToken.None or a long-lived token.
         using var timeoutCts = new CancellationTokenSource(_options.AuthenticationTimeout);
 
-        await using var reg = timeoutCts.Token.Register(() =>
+        await using var timeoutReg = timeoutCts.Token.Register(() =>
         {
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H101", "BinollaSession.WaitForAuthenticationAsync", "auth_timeout", new
@@ -1109,6 +1226,9 @@ public sealed class BinollaSession : IBinollaClient
             // #endregion
             tcs.TrySetException(new BinollaTimeoutException("Authentication timed out."));
         });
+
+        // Honor ConnectAsync CT (tests + abandoned login). Restore/market must pass None or long CTS.
+        await using var cancelReg = cancellationToken.Register(() => tcs.TrySetCanceled(cancellationToken));
 
         try
         {
@@ -1145,11 +1265,14 @@ public sealed class BinollaSession : IBinollaClient
     {
         if (_trading is not null)
         {
-            _trading.TextMessageReceived -= OnTradingMessage;
+            _trading.TextMessageReceived -= OnTradingTextMessage;
+            _trading.BinaryMessageReceived -= OnTradingBinaryMessage;
             _trading.Closed -= OnTradingClosed;
             try { await _trading.DisposeAsync().ConfigureAwait(false); } catch { /* ignore */ }
             _trading = null;
         }
+
+        await StopInboundPumpAsync().ConfigureAwait(false);
 
         if (_chart is not null)
         {
@@ -1158,6 +1281,8 @@ public sealed class BinollaSession : IBinollaClient
         }
 
         _router = null;
+        _lastSubscribeKey = null;
+        _lastSubscribeTicks = 0;
     }
 
     private void SetLifecycle(SessionLifecycleState state, string? error = null)

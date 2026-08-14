@@ -47,8 +47,20 @@ internal sealed class SessionMessageRouter
         _onAuthorized = onAuthorized;
     }
 
-    public async Task HandleRawAsync(string message, CancellationToken cancellationToken)
+    public async Task HandleRawAsync(string message, CancellationToken cancellationToken) =>
+        await HandleRawAsync(message, isBinary: false, cancellationToken).ConfigureAwait(false);
+
+    public async Task HandleRawAsync(string message, bool isBinary, CancellationToken cancellationToken)
     {
+        // Upstream: WebSocket Binary frames are ALWAYS treated as the pending 451 attachment.
+        // Text frames are control/events. Collapsing Binary→Text previously let fire-and-forget
+        // races drop s_history/last / s_quotes/list while s_assets/list sometimes survived.
+        if (isBinary)
+        {
+            await HandleBinaryAttachmentAsync(message).ConfigureAwait(false);
+            return;
+        }
+
         // Engine.IO OPEN — do not require "sid" substring (packet may vary).
         if (message.StartsWith('0'))
         {
@@ -137,7 +149,7 @@ internal sealed class SessionMessageRouter
             return;
         }
 
-        // Binary payload following 451-[type] (WS binary decoded to UTF-8).
+        // Text fallback: some gateways deliver binary attachments as UTF-8 text frames.
         // Never treat Engine.IO / Socket.IO control or event frames as attachment payloads —
         // that previously corrupted balances/quotes/history waits.
         if (!string.IsNullOrEmpty(_upcomingMessageType))
@@ -154,17 +166,64 @@ internal sealed class SessionMessageRouter
             }
             else
             {
-                var type = _upcomingMessageType;
-                _upcomingMessageType = string.Empty;
-                if (string.Equals(type, BinollaWire.EvAuthorization, StringComparison.Ordinal) ||
-                    IsPostAuthSignal(type))
-                {
-                    await EnsureAuthorizedAsync(cancellationToken).ConfigureAwait(false);
-                }
-
-                await ProcessEventPayloadAsync(type, message).ConfigureAwait(false);
+                await HandleBinaryAttachmentAsync(message).ConfigureAwait(false);
             }
+
+            return;
         }
+
+        // #region agent log
+        if (LooksLikeJsonPayload(message))
+        {
+            LoginTrace.Write("H141", "SessionMessageRouter.HandleRaw", "orphan_json_payload", new
+            {
+                len = message.Length,
+                prefix = message.Length > 24 ? message[..24] : message
+            });
+        }
+        // #endregion
+    }
+
+    private async Task HandleBinaryAttachmentAsync(string message)
+    {
+        if (string.IsNullOrEmpty(_upcomingMessageType))
+        {
+            // #region agent log
+            LoginTrace.Write("H141", "SessionMessageRouter.HandleBinaryAttachment", "orphan_binary_no_header", new
+            {
+                len = message.Length,
+                prefix = message.Length > 24 ? message[..24] : message
+            });
+            // #endregion
+            return;
+        }
+
+        var type = _upcomingMessageType;
+        _upcomingMessageType = string.Empty;
+        // #region agent log
+        LoginTrace.Write("H141", "SessionMessageRouter.HandleBinaryAttachment", "binary_payload_attached", new
+        {
+            type,
+            len = message.Length,
+            prefix = message.Length > 24 ? message[..24] : message
+        });
+        // #endregion
+
+        if (string.Equals(type, BinollaWire.EvAuthorization, StringComparison.Ordinal) ||
+            IsPostAuthSignal(type))
+        {
+            await EnsureAuthorizedAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+
+        await ProcessEventPayloadAsync(type, message).ConfigureAwait(false);
+    }
+
+    private static bool LooksLikeJsonPayload(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return false;
+        var c = message.TrimStart()[0];
+        return c is '{' or '[';
     }
 
     private async Task HandleUnauthorizedAsync(CancellationToken cancellationToken)
@@ -412,11 +471,21 @@ internal sealed class SessionMessageRouter
             var arr = JsonConvert.DeserializeObject<List<object>>(jsonPart);
             if (arr is { Count: > 0 })
                 _upcomingMessageType = arr[0]?.ToString() ?? string.Empty;
+            else
+                _upcomingMessageType = string.Empty;
         }
         catch
         {
             _upcomingMessageType = string.Empty;
         }
+
+        // #region agent log
+        LoginTrace.Write("H141", "SessionMessageRouter.HandleBinaryHeader", "binary_header_set", new
+        {
+            upcoming = _upcomingMessageType,
+            raw = message.Length > 64 ? message[..64] : message
+        });
+        // #endregion
     }
 
     private Task ProcessEventPayloadAsync(string messageType, string content)
@@ -465,6 +534,20 @@ internal sealed class SessionMessageRouter
             case BinollaWire.EvHistoryLast:
                 ProcessHistoryLast(UnwrapPayload(content));
                 break;
+            default:
+                // #region agent log
+                if (messageType.Contains("history", StringComparison.OrdinalIgnoreCase) ||
+                    messageType.Contains("quote", StringComparison.OrdinalIgnoreCase) ||
+                    messageType.Contains("candle", StringComparison.OrdinalIgnoreCase))
+                {
+                    LoginTrace.Write("H141", "SessionMessageRouter.ProcessEventPayloadAsync", "unknown_market_event", new
+                    {
+                        messageType = messageType.Length > 64 ? messageType[..64] : messageType,
+                        contentLen = content?.Length ?? 0
+                    });
+                }
+                // #endregion
+                break;
         }
 
         return Task.CompletedTask;
@@ -481,6 +564,11 @@ internal sealed class SessionMessageRouter
             return content;
 
         var trimmed = content.Trim();
+        // Strip leading non-JSON control bytes some gateways prepend on binary WS frames.
+        var jsonStart = trimmed.IndexOfAny(['{', '[', '"']);
+        if (jsonStart > 0)
+            trimmed = trimmed[jsonStart..];
+
         try
         {
             if (trimmed.StartsWith('"'))
@@ -694,8 +782,19 @@ internal sealed class SessionMessageRouter
     private void ProcessQuotesList(string content)
     {
         var quotesData = JsonConvert.DeserializeObject<List<List<object>>>(content);
-        if (quotesData is null) return;
+        if (quotesData is null)
+        {
+            // #region agent log
+            LoginTrace.Write("H142", "SessionMessageRouter.ProcessQuotesList", "quotes_null", new
+            {
+                len = content?.Length ?? 0,
+                prefix = content is { Length: > 0 } ? content[..Math.Min(40, content.Length)] : ""
+            });
+            // #endregion
+            return;
+        }
 
+        var stored = 0;
         foreach (var quoteArray in quotesData)
         {
             try
@@ -715,12 +814,25 @@ internal sealed class SessionMessageRouter
                     AdditionalData = additional,
                     ReceivedAt = DateTimeOffset.UtcNow
                 };
+                stored++;
             }
             catch
             {
                 // skip
             }
         }
+
+        // #region agent log
+        if (stored > 0)
+        {
+            LoginTrace.Write("H142", "SessionMessageRouter.ProcessQuotesList", "quotes_stored", new
+            {
+                stored,
+                cacheSize = _state.LatestQuotes.Count,
+                sample = _state.LatestQuotes.Keys.Take(6).ToArray()
+            });
+        }
+        // #endregion
     }
 
     private void ProcessHistoryLast(string content)

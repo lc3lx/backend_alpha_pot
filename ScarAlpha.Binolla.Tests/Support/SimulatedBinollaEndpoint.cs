@@ -183,7 +183,7 @@ internal sealed class SimulatedBinollaEndpoint
         lock (_emitGate)
         {
             _transport.InjectServerMessage("451-[\"" + eventType + "\"]");
-            _transport.InjectServerMessage(jsonPayload);
+            _transport.InjectServerMessage(jsonPayload, asBinary: true);
         }
     }
 }

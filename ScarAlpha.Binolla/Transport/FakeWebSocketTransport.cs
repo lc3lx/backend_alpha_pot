@@ -19,6 +19,7 @@ public sealed class FakeWebSocketTransport : IWebSocketTransport
     public bool IsConnected => Interlocked.CompareExchange(ref _connected, 0, 0) == 1;
 
     public event Action<string>? TextMessageReceived;
+    public event Action<string>? BinaryMessageReceived;
     public event Action<Exception?>? Closed;
 
     /// <summary>Invoked when the "client" sends a message (for simulate server).</summary>
@@ -53,12 +54,12 @@ public sealed class FakeWebSocketTransport : IWebSocketTransport
     }
 
     /// <summary>Inject a message as if received from Binolla.</summary>
-    public void InjectServerMessage(string message)
+    public void InjectServerMessage(string message, bool asBinary = false)
     {
         if (!IsConnected)
             return;
 
-        _inbound.Writer.TryWrite(message);
+        _inbound.Writer.TryWrite(asBinary ? "\u0001" + message : message);
     }
 
     public async Task CloseAsync(CancellationToken cancellationToken)
@@ -82,7 +83,10 @@ public sealed class FakeWebSocketTransport : IWebSocketTransport
         {
             await foreach (var msg in _inbound.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
             {
-                TextMessageReceived?.Invoke(msg);
+                if (msg.Length > 0 && msg[0] == '\u0001')
+                    BinaryMessageReceived?.Invoke(msg[1..]);
+                else
+                    TextMessageReceived?.Invoke(msg);
             }
         }
         catch (OperationCanceledException)

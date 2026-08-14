@@ -20,6 +20,7 @@ public sealed class ClientWebSocketTransport : IWebSocketTransport
                                && _socket?.State == WebSocketState.Open;
 
     public event Action<string>? TextMessageReceived;
+    public event Action<string>? BinaryMessageReceived;
     public event Action<Exception?>? Closed;
 
     public async Task ConnectAsync(
@@ -112,16 +113,30 @@ public sealed class ClientWebSocketTransport : IWebSocketTransport
 
                 if (result.MessageType is WebSocketMessageType.Text or WebSocketMessageType.Binary)
                 {
+                    var frameType = result.MessageType;
                     messageBuffer.Write(buffer, 0, result.Count);
-                    if (!result.EndOfMessage)
-                        continue;
+                    while (!result.EndOfMessage)
+                    {
+                        result = await socket.ReceiveAsync(buffer, cancellationToken).ConfigureAwait(false);
+                        if (result.MessageType == WebSocketMessageType.Close)
+                        {
+                            messageBuffer.SetLength(0);
+                            return;
+                        }
+
+                        messageBuffer.Write(buffer, 0, result.Count);
+                    }
 
                     var text = Encoding.UTF8.GetString(messageBuffer.GetBuffer(), 0, (int)messageBuffer.Length);
                     messageBuffer.SetLength(0);
                     if (string.IsNullOrWhiteSpace(text))
                         continue;
 
-                    TextMessageReceived?.Invoke(text);
+                    // Preserve Binary vs Text — matches BinollaApiDotNetPro ProcessMessageAsync.
+                    if (frameType == WebSocketMessageType.Binary)
+                        BinaryMessageReceived?.Invoke(text);
+                    else
+                        TextMessageReceived?.Invoke(text);
                 }
             }
         }

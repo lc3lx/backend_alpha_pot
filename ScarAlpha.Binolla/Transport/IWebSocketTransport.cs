@@ -8,7 +8,15 @@ public interface IWebSocketTransport : IAsyncDisposable
 {
     bool IsConnected { get; }
 
+    /// <summary>Engine.IO / Socket.IO control and text event frames.</summary>
     event Action<string>? TextMessageReceived;
+
+    /// <summary>
+    /// Socket.IO binary attachments (payload after 451-[event]).
+    /// Upstream only routes WebSocketMessageType.Binary into history/quotes processors.
+    /// </summary>
+    event Action<string>? BinaryMessageReceived;
+
     event Action<Exception?>? Closed;
 
     Task ConnectAsync(
