@@ -28,7 +28,6 @@ internal sealed class SessionMessageRouter
     private int _historyStoredCount;
     private int _quotesHeaderCount;
     private int _orphanBinaryCount;
-    private long _lastSoftReauthTicks;
     private string? _lastInboundEvent;
     private const int MaxUnauthorizedReauths = 3;
 
@@ -248,47 +247,27 @@ internal sealed class SessionMessageRouter
             lifecycle = lifecycle.ToString(),
             hadAuth = Volatile.Read(ref _authorized) == 1,
             everAuth,
-            reauthCount = Volatile.Read(ref _unauthorizedReauthCount)
+            reauthCount = Volatile.Read(ref _unauthorizedReauthCount),
+            unauthorizedSeen = Volatile.Read(ref _unauthorizedSeen)
         });
         // #endregion
 
-        // After the first successful auth, transient unauthorized frames are normal around
-        // asset/change. Clearing _authorized forced EnsureAuthorized → full bootstrap again,
-        // which stormed unauthorized and starved s_history/last / s_quotes/list (PM2: assets=103
-        // OK, candles/price MARKET_UNAVAILABLE after exactly MarketDataTimeout).
-        if (everAuth && !string.IsNullOrEmpty(_state.Ssid))
+        // PROVEN (PM2 DBG660): after auth+assets, Binolla floods 42["unauthorized"] for
+        // deferred lists / alerts. Soft SSID reauth every 1.5s made it worse — last=unauthorized,
+        // histHdr=0 forever, candles empty. Upstream only records NotAuthorized; it does NOT
+        // re-spam SSID. Ignore post-auth unauthorized so asset/change can deliver history.
+        if (everAuth)
         {
-            var now = Environment.TickCount64;
-            var last = Interlocked.Read(ref _lastSoftReauthTicks);
-            if (now - last < 1_500)
+            // #region agent log
+            LoginTrace.Write("H109", "SessionMessageRouter.HandleUnauthorized", "unauthorized_ignored_post_auth", new
             {
-                // #region agent log
-                LoginTrace.Write("H109", "SessionMessageRouter.HandleUnauthorized", "soft_reauth_throttled", new
-                {
-                    lifecycle = lifecycle.ToString(),
-                    subscribed = _state.SubscribedPairs.Count
-                });
-                // #endregion
-                return;
-            }
-
-            Interlocked.Exchange(ref _lastSoftReauthTicks, now);
-            // Keep Connected + _authorized=1 so we do NOT re-run PostAuthBootstrap.
-            LoginTrace.Write("H109", "SessionMessageRouter.HandleUnauthorized", "soft_reauth_ssid_only", new
-            {
-                fromLifecycle = lifecycle.ToString(),
+                lifecycle = lifecycle.ToString(),
                 subscribed = _state.SubscribedPairs.Count,
                 historyCached = _state.HistoricalData.Count,
-                quotesCached = _state.LatestQuotes.Count
+                quotesCached = _state.LatestQuotes.Count,
+                unauthorizedSeen = Volatile.Read(ref _unauthorizedSeen)
             });
-            await _sendAsync(_state.Ssid, cancellationToken).ConfigureAwait(false);
-            foreach (var pair in _state.SubscribedPairs)
-            {
-                await _sendAsync(BinollaFraming.BuildAssetChange(pair, 60), cancellationToken)
-                    .ConfigureAwait(false);
-                await Task.Delay(20, cancellationToken).ConfigureAwait(false);
-            }
-
+            // #endregion
             return;
         }
 
@@ -333,9 +312,8 @@ internal sealed class SessionMessageRouter
     }
 
     private static bool IsUnauthorizedMessage(string message) =>
-        message.Contains("NotAuthorized", StringComparison.OrdinalIgnoreCase) ||
-        // Exact-ish Socket.IO unauthorized event — avoid matching unrelated payloads.
-        message.Contains("\"unauthorized\"", StringComparison.OrdinalIgnoreCase);
+        // Upstream: 42…NotAuthorized. Event name "unauthorized" handled via IsUnauthorizedEventName.
+        message.Contains("NotAuthorized", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsUnauthorizedEventName(string? eventName) =>
         !string.IsNullOrEmpty(eventName) &&
@@ -435,25 +413,30 @@ internal sealed class SessionMessageRouter
 
     private async Task SendPostAuthBootstrapAsync(CancellationToken cancellationToken)
     {
-        // Minimal bootstrap first — full list spam after auth often triggers a second unauthorized
-        // before the session is stable.
+        // Essential only. Deferred orders/alerts/indicator/drawing spam caused production
+        // unauthorized floods (DBG660: unauth→30+, histHdr=0) and blocked s_history/last.
         foreach (var command in BinollaWire.PostAuthBootstrapCommandsEssential)
-        {
-            await _sendAsync(command, cancellationToken).ConfigureAwait(false);
-            await Task.Delay(25, cancellationToken).ConfigureAwait(false);
-        }
-
-        foreach (var command in BinollaWire.PostAuthBootstrapCommandsDeferred)
         {
             await _sendAsync(command, cancellationToken).ConfigureAwait(false);
             await Task.Delay(40, cancellationToken).ConfigureAwait(false);
         }
 
+        // #region agent log
+        LoginTrace.Write("H150", "SessionMessageRouter.SendPostAuthBootstrapAsync", "bootstrap_essential_only", new
+        {
+            commands = BinollaWire.PostAuthBootstrapCommandsEssential.Length,
+            subscribed = _state.SubscribedPairs.Count
+        });
+        // #endregion
+
         // Re-subscribe previously subscribed pairs after reconnect
         foreach (var pair in _state.SubscribedPairs)
         {
+            await _sendAsync(BinollaFraming.BuildAlertList(), cancellationToken).ConfigureAwait(false);
+            await _sendAsync(BinollaFraming.BuildAlertClosedList(), cancellationToken).ConfigureAwait(false);
             await _sendAsync(BinollaFraming.BuildAssetChange(pair, 60), cancellationToken)
                 .ConfigureAwait(false);
+            await Task.Delay(40, cancellationToken).ConfigureAwait(false);
         }
     }
 

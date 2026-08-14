@@ -440,9 +440,14 @@ public sealed class BinollaSession : IBinollaClient
             _lastSubscribeKey = subKey;
             _lastSubscribeTicks = now;
 
-            // Match upstream exactly: alerts before every asset/change (not once per session).
-            await transport.SendAsync(BinollaFraming.BuildAlertList(), CancellationToken.None).ConfigureAwait(false);
-            await transport.SendAsync(BinollaFraming.BuildAlertClosedList(), CancellationToken.None).ConfigureAwait(false);
+            // Alerts once per session — re-sending alert/list on every poll flooded unauthorized
+            // (PM2: unauth climbing while histHdr stayed 0).
+            if (Interlocked.CompareExchange(ref _alertsPrimed, 1, 0) == 0)
+            {
+                await transport.SendAsync(BinollaFraming.BuildAlertList(), CancellationToken.None).ConfigureAwait(false);
+                await transport.SendAsync(BinollaFraming.BuildAlertClosedList(), CancellationToken.None).ConfigureAwait(false);
+            }
+
             // ONE asset/change only. Sending 14400 after 60 cancels the reliable OTC history push
             // (PM2: history never arrives for EURUSD_otc period=14400 within 30s).
             var frame = BinollaFraming.BuildAssetChange(pair, wirePeriod);
