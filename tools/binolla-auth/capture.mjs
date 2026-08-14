@@ -4,12 +4,17 @@
  * Usage:
  *   node capture.mjs --mode login --email a@b.com --password secret
  *   node capture.mjs --mode signup --email a@b.com --password secret
- * Prints JSON: { "ok": true, "token": "..." } or { "ok": false, "error": "..." }
+ * Prints JSON: { "ok": true, "token": "...", "tokenSource": "ws-auth"|"api"|..., "cookies"? }
+ *   or { "ok": false, "error": "..." }
  *
  * Strategy:
  * 1) Open Binolla page in Playwright (passes Cloudflare cookie jar)
  * 2) Prefer in-page fetch to /api/auth/login|register (same-origin + CF cookies)
- * 3) Fall back to DOM form fill + network/WS/storage token capture
+ * 3) After API login, open trading page and capture Socket.IO authorization WS token
+ * 4) Fall back to DOM form fill + network/WS/storage token capture
+ *
+ * IMPORTANT: API/storage session tokens are NOT the live trading Socket.IO token.
+ * Prefer wsToken from 42["authorization",{"token":"..."}] over apiToken.
  */
 import { chromium } from 'playwright';
 
@@ -63,6 +68,24 @@ async function buildCookieHeader(context) {
     return relevant.map((c) => `${c.name}=${c.value}`).join('; ');
   } catch {
     return undefined;
+  }
+}
+
+function extractWsAuthorizationToken(payload) {
+  if (!payload || typeof payload !== 'string') return null;
+  // Outbound/inbound Socket.IO: 42["authorization",{"isDemo":true,"token":"..."}]
+  const idx = payload.indexOf('[');
+  if (idx < 0) return null;
+  try {
+    const arr = JSON.parse(payload.slice(idx));
+    if (!Array.isArray(arr) || arr.length < 2) return null;
+    const event = String(arr[0] ?? '');
+    const data = arr[1];
+    if (!/authorization|authorize|^auth$/i.test(event)) return null;
+    if (!data || typeof data !== 'object') return null;
+    return normalizeToken(typeof data.token === 'string' ? data.token : null);
+  } catch {
+    return null;
   }
 }
 
@@ -341,10 +364,12 @@ async function main() {
   const headless = arg('headless', 'true') !== 'false';
   const loginUrl = arg('loginUrl', 'https://binolla.com/login/');
   const signupUrl = arg('signupUrl', 'https://binolla.com/signup/?lid=15968');
+  const tradingUrl = arg('tradingUrl', 'https://binolla.com/trading');
   const timeoutMs = Number(arg('timeoutMs', '45000')) || 45000;
   // Leave headroom so C# WaitForExit (timeoutMs+15s) does not kill us mid-exit.
-  // Exit as soon as token appears — do not burn extra seconds after a successful API login.
   const waitBudgetMs = Math.max(3_000, Math.min(timeoutMs - 20_000, 5_000));
+  // Wait for Socket.IO authorization frame after navigating to trading (API token ≠ WS token).
+  const wsAuthWaitMs = Math.max(8_000, Math.min(Number(arg('wsAuthWaitMs', '20000')) || 20_000, 25_000));
   const captureStarted = Date.now();
   const agentLog = (hypothesisId, location, message, data) => {
     fetch('http://127.0.0.1:7892/ingest/aea6d51e-f3e9-4c7e-b6b4-db55c4306e97', {
@@ -378,9 +403,12 @@ async function main() {
     /* keep default */
   }
 
-  let token = null;
+  // Separate API/session token from live Socket.IO trading token (H1 fix).
+  let apiToken = null;
+  let apiTokenSource = null;
+  let wsToken = null;
+  let wsTokenSource = null;
   const authHits = [];
-
 
   let browser;
   try {
@@ -448,11 +476,20 @@ async function main() {
 
     const page = await context.newPage();
 
-    const tryCapture = (candidate, source) => {
-      if (token) return;
+    const tryCaptureApi = (candidate, source) => {
+      if (apiToken) return;
       const normalized = normalizeToken(candidate);
       if (!normalized) return;
-      token = normalized;
+      apiToken = normalized;
+      apiTokenSource = source;
+    };
+
+    const tryCaptureWs = (candidate, source) => {
+      if (wsToken) return;
+      const normalized = normalizeToken(candidate);
+      if (!normalized) return;
+      wsToken = normalized;
+      wsTokenSource = source;
     };
 
     page.on('response', async (response) => {
@@ -462,11 +499,13 @@ async function main() {
         if (/\/api\/.*auth|\/login|\/register|\/signup/i.test(u)) {
           authHits.push({ url: u.replace(/\?.*/, ''), status });
         }
-        if (token) return;
+        // Do not stop HTTP capture once API token exists — still harmless;
+        // WS path must keep listening regardless (see websocket handler).
+        if (apiToken) return;
         const ct = response.headers()['content-type'] || '';
         if (!ct.includes('application/json') && !ct.includes('text/plain')) return;
         const text = await response.text();
-        tryCapture(extractToken(text), `http:${status}`);
+        tryCaptureApi(extractToken(text), `http:${status}`);
       } catch {
         /* ignore */
       }
@@ -474,39 +513,55 @@ async function main() {
 
     page.on('websocket', (ws) => {
       const onFrame = (payload) => {
-        if (token) return;
-        tryCapture(extractToken(payload), 'ws');
+        // H1 fix: NEVER skip WS auth frames when apiToken is already set.
+        const fromAuth = extractWsAuthorizationToken(
+          typeof payload === 'string' ? payload : String(payload ?? ''),
+        );
+        if (fromAuth) {
+          tryCaptureWs(fromAuth, 'ws-auth');
+          return;
+        }
+        // Secondary: other WS payloads may still yield a session token before trading opens.
+        if (!apiToken) {
+          tryCaptureApi(extractToken(typeof payload === 'string' ? payload : ''), 'ws');
+        }
       };
       ws.on('framereceived', (frame) => onFrame(frame.payload));
       ws.on('framesent', (frame) => onFrame(frame.payload));
     });
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+    // #region agent log
     agentLog('H103', 'capture.mjs:goto', 'page_loaded', { elapsedMs: Date.now() - captureStarted, isSignup });
-
+    // #endregion
 
     // --- Preferred path: in-page auth API (CF cookies already set) ---
     const apiResult = await tryInPageAuthApi(page, { isSignup, email, password, lid });
     for (const attempt of apiResult.attempts || []) {
-      if (attempt.body) tryCapture(extractToken(attempt.body), `api:${attempt.path}:${attempt.status}`);
+      if (attempt.body) tryCaptureApi(extractToken(attempt.body), `api:${attempt.path}:${attempt.status}`);
     }
 
     // API may set cookies/storage without putting token in the JSON body.
-    if (!token && apiResult.okStatus) {
+    if (!apiToken && apiResult.okStatus) {
       const started = Date.now();
-      while (!token && Date.now() - started < 800) {
+      while (!apiToken && Date.now() - started < 800) {
         await page.waitForTimeout(100);
-        tryCapture(await scanStorage(page), 'storage-after-api');
+        tryCaptureApi(await scanStorage(page), 'storage-after-api');
       }
     }
+    // #region agent log
     agentLog('H103', 'capture.mjs:api', 'after_api', {
       elapsedMs: Date.now() - captureStarted,
-      hasToken: Boolean(token),
+      hasApiToken: Boolean(apiToken),
+      apiTokenLen: apiToken ? apiToken.length : 0,
+      hasWsToken: Boolean(wsToken),
+      wsTokenLen: wsToken ? wsToken.length : 0,
       apiOk: Boolean(apiResult.okStatus),
       attempts: (apiResult.attempts || []).map((a) => `${a.path}:${a.status}`).slice(0, 6),
     });
+    // #endregion
 
-    if (!token) {
+    if (!apiToken && !wsToken) {
       // --- Fallback: DOM form ---
       const emailOk = await fillFirst(
         page,
@@ -532,7 +587,6 @@ async function main() {
         password,
       );
       if (!passOk) throw new Error('Could not find Binolla password field');
-
 
       if (isSignup) {
         await fillFirst(
@@ -569,17 +623,76 @@ async function main() {
       }
 
       const clicked = await clickSubmit(page, isSignup);
+      void clicked;
 
       const started = Date.now();
-      while (!token && Date.now() - started < waitBudgetMs) {
+      while (!apiToken && !wsToken && Date.now() - started < waitBudgetMs) {
         await page.waitForTimeout(150);
-        if (!token) tryCapture(await scanStorage(page), 'storage-poll');
+        if (!apiToken) tryCaptureApi(await scanStorage(page), 'storage-poll');
       }
     }
 
-    if (!token) {
-      tryCapture(await scanStorage(page), 'storage-final');
+    if (!apiToken && !wsToken) {
+      tryCaptureApi(await scanStorage(page), 'storage-final');
     }
+
+    // After API/session login, open trading so the live Socket.IO client sends authorization.
+    if ((apiResult.okStatus || apiToken) && !wsToken) {
+      const tradingCandidates = [
+        tradingUrl,
+        'https://binolla.com/trading',
+        'https://binolla.com/trading/',
+        'https://binolla.com/en/trading',
+      ];
+      let navigated = false;
+      for (const tUrl of tradingCandidates) {
+        try {
+          await page.goto(tUrl, { waitUntil: 'domcontentloaded', timeout: Math.min(timeoutMs, 25_000) });
+          navigated = true;
+          // #region agent log
+          agentLog('H1', 'capture.mjs:trading', 'navigated_trading', {
+            elapsedMs: Date.now() - captureStarted,
+            urlHost: (() => {
+              try {
+                return new URL(page.url()).pathname;
+              } catch {
+                return 'unknown';
+              }
+            })(),
+          });
+          // #endregion
+          break;
+        } catch {
+          /* try next */
+        }
+      }
+
+      if (navigated || apiToken) {
+        const wsStarted = Date.now();
+        while (!wsToken && Date.now() - wsStarted < wsAuthWaitMs) {
+          await page.waitForTimeout(200);
+          if (!apiToken) tryCaptureApi(await scanStorage(page), 'storage-during-ws-wait');
+        }
+        // #region agent log
+        agentLog('H1', 'capture.mjs:trading', 'ws_auth_wait_done', {
+          elapsedMs: Date.now() - captureStarted,
+          waitedMs: Date.now() - wsStarted,
+          hasWsToken: Boolean(wsToken),
+          wsTokenLen: wsToken ? wsToken.length : 0,
+          hasApiToken: Boolean(apiToken),
+          apiTokenLen: apiToken ? apiToken.length : 0,
+          tokensDiffer: Boolean(wsToken && apiToken && wsToken !== apiToken),
+        });
+        // #endregion
+      }
+    }
+
+    const token = wsToken || apiToken;
+    const tokenSource = wsToken
+      ? wsTokenSource || 'ws-auth'
+      : apiToken
+        ? apiTokenSource || 'api'
+        : null;
 
     if (!token) {
       const diag = await readPageDiagnostics(page).catch(() => null);
@@ -622,16 +735,26 @@ async function main() {
     }
 
     const cookies = await buildCookieHeader(context);
+    // #region agent log
     agentLog('H103', 'capture.mjs:done', 'token_captured', {
       elapsedMs: Date.now() - captureStarted,
       hasCookies: Boolean(cookies),
       cookieLen: cookies ? cookies.length : 0,
+      tokenSource,
+      tokenLen: token.length,
+      apiTokenLen: apiToken ? apiToken.length : 0,
+      wsTokenLen: wsToken ? wsToken.length : 0,
+      usedWs: Boolean(wsToken),
     });
-    process.stdout.write(JSON.stringify({
-      ok: true,
-      token,
-      cookies,
-    }));
+    // #endregion
+    process.stdout.write(
+      JSON.stringify({
+        ok: true,
+        token,
+        tokenSource,
+        cookies,
+      }),
+    );
   } catch (err) {
     process.stdout.write(
       JSON.stringify({

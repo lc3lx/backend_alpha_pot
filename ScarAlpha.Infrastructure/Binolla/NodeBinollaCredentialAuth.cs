@@ -210,10 +210,13 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
                 400);
         }
 
+        // tokenSource is optional (older capture.mjs may omit it); token field remains required.
         _logger.LogInformation(
-            "Binolla credential {Mode} captured session token (cookiesPresent={HasCookies})",
+            "Binolla credential {Mode} captured session token (cookiesPresent={HasCookies}, tokenSource={TokenSource}, tokenLen={TokenLen})",
             mode,
-            !string.IsNullOrWhiteSpace(result.Cookies));
+            !string.IsNullOrWhiteSpace(result.Cookies),
+            string.IsNullOrWhiteSpace(result.TokenSource) ? "unspecified" : result.TokenSource,
+            result.Token.Length);
         return result;
     }
 
@@ -347,5 +350,14 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         PropertyNameCaseInsensitive = true
     };
 
-    private sealed record CaptureResult(bool Ok, string? Token, string? Cookies, string? Error);
+    /// <summary>
+    /// Capture JSON from capture.mjs. <see cref="TokenSource"/> is optional (ws-auth|api|…).
+    /// Extra JSON fields are ignored by default System.Text.Json options.
+    /// </summary>
+    private sealed record CaptureResult(
+        bool Ok,
+        string? Token,
+        string? Cookies,
+        string? Error,
+        string? TokenSource = null);
 }

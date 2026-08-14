@@ -36,7 +36,11 @@ internal sealed class SessionMessageRouter
     private int _orphanBinaryCount;
     private int _sawSAuthorization;
     private string? _lastInboundEvent;
+    private long _ssidSentTickMs;
+    private int _postSsidTypeLogCount;
     private const int MaxUnauthorizedReauths = 3;
+    private const int PostSsidTypeLogWindowMs = 10_000;
+    private const int PostSsidTypeLogCap = 48;
 
     public int NsConnectSends => Volatile.Read(ref _nsConnectSends);
     public int UnauthorizedSeen => Volatile.Read(ref _unauthorizedSeen);
@@ -83,6 +87,9 @@ internal sealed class SessionMessageRouter
         // Engine.IO OPEN — do not require "sid" substring (packet may vary).
         if (message.StartsWith('0'))
         {
+            // #region agent log
+            MaybeLogPostSsidInboundType("eio_open");
+            // #endregion
             await _sendAsync("40", cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -96,6 +103,8 @@ internal sealed class SessionMessageRouter
             Interlocked.Increment(ref _nsConnectSends);
             _lastInboundEvent = "ns_connect";
             // #region agent log
+            Interlocked.Exchange(ref _ssidSentTickMs, Environment.TickCount64);
+            Interlocked.Exchange(ref _postSsidTypeLogCount, 0);
             LoginTrace.Write("H102", "SessionMessageRouter.HandleRaw", "ns_connect_send_ssid", new
             {
                 lifecycle = _state.Lifecycle.ToString(),
@@ -108,6 +117,9 @@ internal sealed class SessionMessageRouter
 
         if (message == "2")
         {
+            // #region agent log
+            MaybeLogPostSsidInboundType("eio_ping");
+            // #endregion
             await _sendAsync("3", cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -116,6 +128,12 @@ internal sealed class SessionMessageRouter
         // Must accept 451, 452, … — not only 451 (older code dropped multi-attach headers).
         if (IsSocketIoBinaryEventHeader(message))
         {
+            // #region agent log
+            if (TryParseBinaryHeaderName(message, out var binName))
+                MaybeLogPostSsidInboundType("bin:" + TruncateType(binName));
+            else
+                MaybeLogPostSsidInboundType("bin_header");
+            // #endregion
             HandleBinaryHeader(message);
             return;
         }
@@ -127,6 +145,9 @@ internal sealed class SessionMessageRouter
                 (TryParseSocketIoEvent(message, out var unauthName, out _) &&
                  IsUnauthorizedEventName(unauthName)))
             {
+                // #region agent log
+                MaybeLogPostSsidInboundType("unauthorized");
+                // #endregion
                 await HandleUnauthorizedAsync(message, cancellationToken).ConfigureAwait(false);
                 return;
             }
@@ -145,6 +166,9 @@ internal sealed class SessionMessageRouter
 
             if (TryParseSocketIoEvent(message, out var eventName, out var payload))
             {
+                // #region agent log
+                MaybeLogPostSsidInboundType("evt:" + TruncateType(eventName));
+                // #endregion
                 // Match upstream: ONLY s_authorization completes auth + bootstrap.
                 // Treating s_assets as auth marked Connected without real SSID accept
                 // (PM2: asset/change → unauthorized, histHdr=0).
@@ -161,8 +185,17 @@ internal sealed class SessionMessageRouter
             // Auth-only text frames without a parseable payload array.
             if (message.Contains(BinollaWire.EvAuthorization, StringComparison.Ordinal))
             {
+                // #region agent log
+                MaybeLogPostSsidInboundType("evt:s_authorization_raw");
+                // #endregion
                 Interlocked.Exchange(ref _sawSAuthorization, 1);
                 await EnsureAuthorizedAsync(cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                // #region agent log
+                MaybeLogPostSsidInboundType("evt42_unparsed");
+                // #endregion
             }
 
             return;
@@ -544,6 +577,62 @@ internal sealed class SessionMessageRouter
             return _upcomingMessageTypes.Count > 0 ? _upcomingMessageTypes.Dequeue() : null;
         }
     }
+
+    // #region agent log
+    /// <summary>Types-only crumbs for ~10s after SSID (H2/H3). Never logs payloads/secrets.</summary>
+    private void MaybeLogPostSsidInboundType(string kind)
+    {
+        var sent = Interlocked.Read(ref _ssidSentTickMs);
+        if (sent == 0)
+            return;
+        var elapsed = Environment.TickCount64 - sent;
+        if (elapsed < 0 || elapsed > PostSsidTypeLogWindowMs)
+            return;
+        var n = Interlocked.Increment(ref _postSsidTypeLogCount);
+        if (n > PostSsidTypeLogCap)
+            return;
+        LoginTrace.Write("H2", "SessionMessageRouter.HandleRaw", "post_ssid_inbound_type", new
+        {
+            kind,
+            n,
+            msAfterSsid = elapsed,
+            sawSAuth = Volatile.Read(ref _sawSAuthorization),
+            authorized = Volatile.Read(ref _authorized)
+        });
+    }
+
+    private static string TruncateType(string name) =>
+        name.Length > 40 ? name[..40] : name;
+
+    private static bool TryParseBinaryHeaderName(string message, out string name)
+    {
+        name = "";
+        try
+        {
+            var dash = message.IndexOf('-');
+            var jsonPart = dash >= 0 && dash + 1 < message.Length ? message[(dash + 1)..] : message;
+            var arr = JsonConvert.DeserializeObject<JArray>(jsonPart);
+            if (arr is null || arr.Count == 0)
+                return false;
+            foreach (var item in arr)
+            {
+                if (item.Type != JTokenType.String)
+                    continue;
+                var s = item.ToString();
+                if (string.IsNullOrEmpty(s))
+                    continue;
+                name = s;
+                return true;
+            }
+        }
+        catch
+        {
+            // ignore
+        }
+
+        return false;
+    }
+    // #endregion
 
     private int PeekUpcomingCount()
     {

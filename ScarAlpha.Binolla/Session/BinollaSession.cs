@@ -1242,6 +1242,7 @@ public sealed class BinollaSession : IBinollaClient
                 nsConnects = _router?.NsConnectSends ?? 0,
                 unauthorized = _router?.UnauthorizedSeen ?? 0,
                 authSignals = _router?.AuthSignals ?? 0,
+                sawSAuth = _router?.SawSAuthorization ?? 0,
                 lastEvent = _router?.LastInboundEvent
             });
             // #endregion
