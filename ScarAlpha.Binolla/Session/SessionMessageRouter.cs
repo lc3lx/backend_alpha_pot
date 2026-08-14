@@ -17,17 +17,24 @@ internal sealed class SessionMessageRouter
     private readonly Func<string, CancellationToken, Task> _sendAsync;
     private readonly Action<TradeOutcome>? _onOrderClosed;
     private readonly Action? _onAuthorized;
-    private string _upcomingMessageType = string.Empty;
+    /// <summary>
+    /// Socket.IO may send consecutive 451/452 headers before payloads. A single string
+    /// overwritten s_authorization with s_assets/list (PM2: Connected via assets, then
+    /// every asset/change → unauthorized, histHdr=0).
+    /// </summary>
+    private readonly Queue<string> _upcomingMessageTypes = new();
+    private readonly object _upcomingGate = new();
     private int _authorized;
     private int _everAuthorized;
     private int _unauthorizedReauthCount;
     private int _nsConnectSends;
-        private int _unauthorizedSeen;
+    private int _unauthorizedSeen;
     private int _authSignals;
     private int _historyHeaderCount;
     private int _historyStoredCount;
     private int _quotesHeaderCount;
     private int _orphanBinaryCount;
+    private int _sawSAuthorization;
     private string? _lastInboundEvent;
     private const int MaxUnauthorizedReauths = 3;
 
@@ -38,7 +45,12 @@ internal sealed class SessionMessageRouter
     public int HistoryStoredCount => Volatile.Read(ref _historyStoredCount);
     public int QuotesHeaderCount => Volatile.Read(ref _quotesHeaderCount);
     public int OrphanBinaryCount => Volatile.Read(ref _orphanBinaryCount);
+    public int SawSAuthorization => Volatile.Read(ref _sawSAuthorization);
     public string? LastInboundEvent => _lastInboundEvent;
+    public int UpcomingQueued
+    {
+        get { lock (_upcomingGate) return _upcomingMessageTypes.Count; }
+    }
 
     public SessionMessageRouter(
         BinollaSessionState state,
@@ -100,14 +112,11 @@ internal sealed class SessionMessageRouter
             return;
         }
 
-        if (message.StartsWith("451-[", StringComparison.Ordinal))
+        // Socket.IO BINARY_EVENT: 45<n>-[...event names...] then n binary payloads.
+        // Must accept 451, 452, … — not only 451 (older code dropped multi-attach headers).
+        if (IsSocketIoBinaryEventHeader(message))
         {
             HandleBinaryHeader(message);
-
-            // Auth success payload — do not bootstrap on the 451 header alone (that raced
-            // bootstrap commands and produced live 42["unauthorized"] storms).
-            // Authorization is completed when the binary attachment arrives.
-
             return;
         }
 
@@ -118,7 +127,7 @@ internal sealed class SessionMessageRouter
                 (TryParseSocketIoEvent(message, out var unauthName, out _) &&
                  IsUnauthorizedEventName(unauthName)))
             {
-                await HandleUnauthorizedAsync(cancellationToken).ConfigureAwait(false);
+                await HandleUnauthorizedAsync(message, cancellationToken).ConfigureAwait(false);
                 return;
             }
 
@@ -136,9 +145,12 @@ internal sealed class SessionMessageRouter
 
             if (TryParseSocketIoEvent(message, out var eventName, out var payload))
             {
-                if (string.Equals(eventName, BinollaWire.EvAuthorization, StringComparison.Ordinal) ||
-                    IsPostAuthSignal(eventName))
+                // Match upstream: ONLY s_authorization completes auth + bootstrap.
+                // Treating s_assets as auth marked Connected without real SSID accept
+                // (PM2: asset/change → unauthorized, histHdr=0).
+                if (string.Equals(eventName, BinollaWire.EvAuthorization, StringComparison.Ordinal))
                 {
+                    Interlocked.Exchange(ref _sawSAuthorization, 1);
                     await EnsureAuthorizedAsync(cancellationToken).ConfigureAwait(false);
                 }
 
@@ -147,9 +159,9 @@ internal sealed class SessionMessageRouter
             }
 
             // Auth-only text frames without a parseable payload array.
-            if (message.Contains(BinollaWire.EvAuthorization, StringComparison.Ordinal) ||
-                IsPostAuthSignal(message))
+            if (message.Contains(BinollaWire.EvAuthorization, StringComparison.Ordinal))
             {
+                Interlocked.Exchange(ref _sawSAuthorization, 1);
                 await EnsureAuthorizedAsync(cancellationToken).ConfigureAwait(false);
             }
 
@@ -159,14 +171,14 @@ internal sealed class SessionMessageRouter
         // Text fallback: some gateways deliver binary attachments as UTF-8 text frames.
         // Never treat Engine.IO / Socket.IO control or event frames as attachment payloads —
         // that previously corrupted balances/quotes/history waits.
-        if (!string.IsNullOrEmpty(_upcomingMessageType))
+        if (PeekUpcomingCount() > 0)
         {
             if (LooksLikeEngineIoPacket(message))
             {
                 // #region agent log
                 LoginTrace.Write("H126", "SessionMessageRouter.HandleRaw", "binary_skipped_eio", new
                 {
-                    upcoming = _upcomingMessageType,
+                    upcoming = PeekUpcoming(),
                     prefix = message.Length > 12 ? message[..12] : message
                 });
                 // #endregion
@@ -193,7 +205,8 @@ internal sealed class SessionMessageRouter
 
     private async Task HandleBinaryAttachmentAsync(string message)
     {
-        if (string.IsNullOrEmpty(_upcomingMessageType))
+        var type = DequeueUpcoming();
+        if (string.IsNullOrEmpty(type))
         {
             // #region agent log
             Interlocked.Increment(ref _orphanBinaryCount);
@@ -207,20 +220,19 @@ internal sealed class SessionMessageRouter
             return;
         }
 
-        var type = _upcomingMessageType;
-        _upcomingMessageType = string.Empty;
         // #region agent log
         LoginTrace.Write("H141", "SessionMessageRouter.HandleBinaryAttachment", "binary_payload_attached", new
         {
             type,
             len = message.Length,
-            prefix = message.Length > 24 ? message[..24] : message
+            prefix = message.Length > 24 ? message[..24] : message,
+            queueLeft = PeekUpcomingCount()
         });
         // #endregion
 
-        if (string.Equals(type, BinollaWire.EvAuthorization, StringComparison.Ordinal) ||
-            IsPostAuthSignal(type))
+        if (string.Equals(type, BinollaWire.EvAuthorization, StringComparison.Ordinal))
         {
+            Interlocked.Exchange(ref _sawSAuthorization, 1);
             await EnsureAuthorizedAsync(CancellationToken.None).ConfigureAwait(false);
         }
 
@@ -235,12 +247,13 @@ internal sealed class SessionMessageRouter
         return c is '{' or '[';
     }
 
-    private async Task HandleUnauthorizedAsync(CancellationToken cancellationToken)
+    private async Task HandleUnauthorizedAsync(string rawMessage, CancellationToken cancellationToken)
     {
         Interlocked.Increment(ref _unauthorizedSeen);
         _lastInboundEvent = "unauthorized";
         var lifecycle = _state.Lifecycle;
         var everAuth = Volatile.Read(ref _everAuthorized) == 1;
+        var prefix = rawMessage.Length > 80 ? rawMessage[..80] : rawMessage;
         // #region agent log
         ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H83", "SessionMessageRouter.HandleUnauthorized", "unauthorized_received", new
         {
@@ -248,14 +261,15 @@ internal sealed class SessionMessageRouter
             hadAuth = Volatile.Read(ref _authorized) == 1,
             everAuth,
             reauthCount = Volatile.Read(ref _unauthorizedReauthCount),
-            unauthorizedSeen = Volatile.Read(ref _unauthorizedSeen)
+            unauthorizedSeen = Volatile.Read(ref _unauthorizedSeen),
+            sawSAuth = Volatile.Read(ref _sawSAuthorization),
+            prefix
         });
         // #endregion
 
-        // PROVEN (PM2 DBG660): after auth+assets, Binolla floods 42["unauthorized"] for
-        // deferred lists / alerts. Soft SSID reauth every 1.5s made it worse — last=unauthorized,
-        // histHdr=0 forever, candles empty. Upstream only records NotAuthorized; it does NOT
-        // re-spam SSID. Ignore post-auth unauthorized so asset/change can deliver history.
+        // PROVEN (PM2 DBG660): after false auth via assets, Binolla rejects asset/change with
+        // unauthorized. Soft SSID reauth made it worse. Ignore post-auth noise; real fix is
+        // requiring s_authorization before bootstrap (see EnsureAuthorized triggers).
         if (everAuth)
         {
             // #region agent log
@@ -265,7 +279,9 @@ internal sealed class SessionMessageRouter
                 subscribed = _state.SubscribedPairs.Count,
                 historyCached = _state.HistoricalData.Count,
                 quotesCached = _state.LatestQuotes.Count,
-                unauthorizedSeen = Volatile.Read(ref _unauthorizedSeen)
+                unauthorizedSeen = Volatile.Read(ref _unauthorizedSeen),
+                sawSAuth = Volatile.Read(ref _sawSAuthorization),
+                prefix
             });
             // #endregion
             return;
@@ -399,18 +415,6 @@ internal sealed class SessionMessageRouter
         await SendPostAuthBootstrapAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private static bool IsPostAuthSignal(string? value)
-    {
-        if (string.IsNullOrEmpty(value))
-            return false;
-        // Only balance/assets/authorization prove the session is usable for market data.
-        // s_orders alone previously triggered early bootstrap and unauthorized storms.
-        return value.Contains("s_balances/", StringComparison.Ordinal)
-               || value.Contains("s_assets/", StringComparison.Ordinal)
-               || value.Contains("s_account/", StringComparison.Ordinal)
-               || value.Contains(BinollaWire.EvAuthorization, StringComparison.Ordinal);
-    }
-
     private async Task SendPostAuthBootstrapAsync(CancellationToken cancellationToken)
     {
         // Essential only. Deferred orders/alerts/indicator/drawing spam caused production
@@ -425,7 +429,8 @@ internal sealed class SessionMessageRouter
         LoginTrace.Write("H150", "SessionMessageRouter.SendPostAuthBootstrapAsync", "bootstrap_essential_only", new
         {
             commands = BinollaWire.PostAuthBootstrapCommandsEssential.Length,
-            subscribed = _state.SubscribedPairs.Count
+            subscribed = _state.SubscribedPairs.Count,
+            sawSAuth = Volatile.Read(ref _sawSAuthorization)
         });
         // #endregion
 
@@ -456,36 +461,100 @@ internal sealed class SessionMessageRouter
         return c is '{' or '/' or ',';
     }
 
+    /// <summary>Socket.IO BINARY_EVENT packet: 45&lt;count&gt;-[...]</summary>
+    internal static bool IsSocketIoBinaryEventHeader(string message)
+    {
+        if (string.IsNullOrEmpty(message) || message.Length < 4)
+            return false;
+        if (message[0] != '4' || message[1] != '5')
+            return false;
+        var dash = message.IndexOf('-');
+        if (dash < 2)
+            return false;
+        // digits between 45 and -
+        for (var i = 2; i < dash; i++)
+        {
+            if (!char.IsDigit(message[i]))
+                return false;
+        }
+
+        return message[dash + 1] == '[';
+    }
+
     private void HandleBinaryHeader(string message)
     {
+        var queued = new List<string>();
         try
         {
-            var jsonPart = message.Split('-', 2)[1];
-            var arr = JsonConvert.DeserializeObject<List<object>>(jsonPart);
-            if (arr is { Count: > 0 })
-                _upcomingMessageType = arr[0]?.ToString() ?? string.Empty;
-            else
-                _upcomingMessageType = string.Empty;
+            var dash = message.IndexOf('-');
+            var jsonPart = dash >= 0 && dash + 1 < message.Length ? message[(dash + 1)..] : message;
+            var arr = JsonConvert.DeserializeObject<JArray>(jsonPart);
+            if (arr is not null)
+            {
+                foreach (var item in arr)
+                {
+                    if (item.Type != JTokenType.String)
+                        continue;
+                    var name = item.ToString();
+                    if (string.IsNullOrEmpty(name))
+                        continue;
+                    queued.Add(name);
+                }
+            }
         }
         catch
         {
-            _upcomingMessageType = string.Empty;
+            // ignore parse errors
         }
 
-        if (string.Equals(_upcomingMessageType, BinollaWire.EvHistoryLast, StringComparison.Ordinal))
-            Interlocked.Increment(ref _historyHeaderCount);
-        else if (string.Equals(_upcomingMessageType, BinollaWire.EvQuotesList, StringComparison.Ordinal))
-            Interlocked.Increment(ref _quotesHeaderCount);
+        lock (_upcomingGate)
+        {
+            foreach (var name in queued)
+                _upcomingMessageTypes.Enqueue(name);
+        }
+
+        foreach (var name in queued)
+        {
+            if (string.Equals(name, BinollaWire.EvHistoryLast, StringComparison.Ordinal))
+                Interlocked.Increment(ref _historyHeaderCount);
+            else if (string.Equals(name, BinollaWire.EvQuotesList, StringComparison.Ordinal))
+                Interlocked.Increment(ref _quotesHeaderCount);
+            else if (string.Equals(name, BinollaWire.EvAuthorization, StringComparison.Ordinal))
+                Interlocked.Exchange(ref _sawSAuthorization, 1);
+        }
 
         // #region agent log
         LoginTrace.Write("H141", "SessionMessageRouter.HandleBinaryHeader", "binary_header_set", new
         {
-            upcoming = _upcomingMessageType,
+            upcoming = queued.Count > 0 ? queued[0] : "",
+            queuedCount = queued.Count,
+            queueDepth = PeekUpcomingCount(),
             raw = message.Length > 64 ? message[..64] : message,
             historyHeaders = Volatile.Read(ref _historyHeaderCount),
-            quotesHeaders = Volatile.Read(ref _quotesHeaderCount)
+            quotesHeaders = Volatile.Read(ref _quotesHeaderCount),
+            sawSAuth = Volatile.Read(ref _sawSAuthorization)
         });
         // #endregion
+    }
+
+    private string? DequeueUpcoming()
+    {
+        lock (_upcomingGate)
+        {
+            return _upcomingMessageTypes.Count > 0 ? _upcomingMessageTypes.Dequeue() : null;
+        }
+    }
+
+    private int PeekUpcomingCount()
+    {
+        lock (_upcomingGate)
+            return _upcomingMessageTypes.Count;
+    }
+
+    private string? PeekUpcoming()
+    {
+        lock (_upcomingGate)
+            return _upcomingMessageTypes.Count > 0 ? _upcomingMessageTypes.Peek() : null;
     }
 
     private Task ProcessEventPayloadAsync(string messageType, string content)
@@ -774,8 +843,18 @@ internal sealed class SessionMessageRouter
         LoginTrace.Write("H124", "SessionMessageRouter.ProcessAssetsList", "assets_parsed", new
         {
             count = list.Count,
-            sample = list.Take(5).Select(a => a.Name).ToArray()
+            sample = list.Take(5).Select(a => a.Name).ToArray(),
+            sawSAuth = Volatile.Read(ref _sawSAuthorization),
+            authorized = Volatile.Read(ref _authorized)
         });
+        if (Volatile.Read(ref _sawSAuthorization) == 0)
+        {
+            LoginTrace.Write("H151", "SessionMessageRouter.ProcessAssetsList", "assets_before_s_authorization", new
+            {
+                count = list.Count,
+                lifecycle = _state.Lifecycle.ToString()
+            });
+        }
         // #endregion
     }
 

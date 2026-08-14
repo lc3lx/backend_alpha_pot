@@ -70,7 +70,7 @@ public sealed class BinollaSession : IBinollaClient
         var r = _router;
         return string.Create(
             System.Globalization.CultureInfo.InvariantCulture,
-            $"lc={Lifecycle} ws={IsTransportConnected} cookie={(string.IsNullOrEmpty(State.CookieHeader) ? 0 : 1)} unauth={r?.UnauthorizedSeen ?? 0} histHdr={r?.HistoryHeaderCount ?? 0} histStore={r?.HistoryStoredCount ?? 0} quoteHdr={r?.QuotesHeaderCount ?? 0} orphan={r?.OrphanBinaryCount ?? 0} histCache={State.HistoricalData.Count} quoteCache={State.LatestQuotes.Count} last={r?.LastInboundEvent ?? "-"}");
+            $"lc={Lifecycle} ws={IsTransportConnected} cookie={(string.IsNullOrEmpty(State.CookieHeader) ? 0 : 1)} unauth={r?.UnauthorizedSeen ?? 0} sAuth={r?.SawSAuthorization ?? 0} histHdr={r?.HistoryHeaderCount ?? 0} histStore={r?.HistoryStoredCount ?? 0} quoteHdr={r?.QuotesHeaderCount ?? 0} orphan={r?.OrphanBinaryCount ?? 0} histCache={State.HistoricalData.Count} quoteCache={State.LatestQuotes.Count} last={r?.LastInboundEvent ?? "-"}");
     }
 
     /// <summary>
