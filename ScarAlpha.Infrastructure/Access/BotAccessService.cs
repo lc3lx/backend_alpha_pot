@@ -11,19 +11,33 @@ public sealed class BotAccessService : IBotAccessService
     private readonly IBinollaLinkRepository _links;
     private readonly IBinollaSessionManager _sessions;
     private readonly IBinollaSessionRestorer _restorer;
+    private readonly IUserRepository _users;
 
     public BotAccessService(
         IBinollaLinkRepository links,
         IBinollaSessionManager sessions,
-        IBinollaSessionRestorer restorer)
+        IBinollaSessionRestorer restorer,
+        IUserRepository users)
     {
         _links = links;
         _sessions = sessions;
         _restorer = restorer;
+        _users = users;
     }
 
     public async Task<BotAccessResult> CheckAsync(Guid userId, CancellationToken ct = default)
     {
+        var user = await _users.GetByIdAsync(userId, ct);
+        if (user?.IsMarketingDemo == true)
+        {
+            return new BotAccessResult(
+                BotAccessState.Allowed,
+                BinollaConnected: true,
+                AdminApproved: true,
+                AccountType: BinollaAccountType.Demo.ToString(),
+                ApprovalStatus: AdminApprovalStatus.Approved.ToString());
+        }
+
         var link = await _links.GetByUserIdAsync(userId, ct);
         var client = _sessions.Get(userId.ToString());
 

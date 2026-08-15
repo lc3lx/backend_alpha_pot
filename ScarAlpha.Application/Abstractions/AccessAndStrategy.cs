@@ -1,3 +1,4 @@
+using ScarAlpha.Domain.Entities;
 using ScarAlpha.Domain.Enums;
 
 namespace ScarAlpha.Application.Abstractions;
@@ -83,5 +84,43 @@ public interface IAuditService
         string? previousState,
         string? newState,
         string? detail = null,
+        CancellationToken ct = default);
+
+    Task<IReadOnlyList<AuditEvent>> ListForTargetUserAsync(Guid targetUserId, int take, CancellationToken ct = default);
+
+    Task<(IReadOnlyList<AuditEvent> Items, int Total)> SearchAsync(
+        Guid? targetUserId,
+        string? action,
+        DateTimeOffset? from,
+        DateTimeOffset? to,
+        int page,
+        int pageSize,
+        CancellationToken ct = default);
+}
+
+public interface INotificationRepository
+{
+    Task AddAsync(UserNotification notification, CancellationToken ct = default);
+    Task<IReadOnlyList<UserNotification>> ListByUserAsync(Guid userId, int take, CancellationToken ct = default);
+    Task<UserNotification?> GetByIdAsync(Guid id, Guid userId, CancellationToken ct = default);
+    Task<int> CountUnreadAsync(Guid userId, CancellationToken ct = default);
+    Task UpdateAsync(UserNotification notification, CancellationToken ct = default);
+    Task MarkAllReadAsync(Guid userId, CancellationToken ct = default);
+    Task<(IReadOnlyList<UserNotification> Items, int Total)> SearchAdminAsync(
+        Guid? userId,
+        int page,
+        int pageSize,
+        CancellationToken ct = default);
+}
+
+public interface INotificationWriter
+{
+    Task AddAsync(
+        Guid userId,
+        string variant,
+        string title,
+        string description,
+        Guid? tradeId = null,
+        string? actionPath = null,
         CancellationToken ct = default);
 }

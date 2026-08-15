@@ -29,7 +29,7 @@ try
 
     var corsOrigins = builder.Configuration["CORS_ORIGINS"]
                       ?? builder.Configuration["Cors:Origins"]
-                      ?? "http://localhost:5173";
+                      ?? "http://localhost:5173,http://localhost:5174,http://127.0.0.1:5173,http://127.0.0.1:5174";
 
     builder.Services.AddCors(options =>
     {
@@ -162,6 +162,7 @@ try
     app.MapAccountEndpoints();
     app.MapStrategyEndpoints();
     app.MapAdminEndpoints();
+    app.MapNotificationEndpoints();
     app.MapTradeEndpoints().RequireRateLimiting("trades");
 
     app.Run();

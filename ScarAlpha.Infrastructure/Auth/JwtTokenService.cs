@@ -35,11 +35,15 @@ public sealed class JwtTokenService : IJwtTokenService
         {
             new(JwtRegisteredClaimNames.Sub, user.Id.ToString()),
             new(ClaimTypes.NameIdentifier, user.Id.ToString()),
-            new("telegram_user_id", user.TelegramUserId.ToString()),
             new(ClaimTypes.Role, user.Role.ToString()),
             new("role", user.Role.ToString()),
             new(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString())
         };
+
+        if (user.TelegramUserId.HasValue)
+            claims.Add(new Claim("telegram_user_id", user.TelegramUserId.Value.ToString()));
+        if (!string.IsNullOrWhiteSpace(user.Email))
+            claims.Add(new Claim(JwtRegisteredClaimNames.Email, user.Email));
 
         if (!string.IsNullOrWhiteSpace(user.Username))
             claims.Add(new Claim("username", user.Username));

@@ -21,6 +21,8 @@ public sealed class TradeAppService
     private readonly IIdempotencyGate _idempotencyGate;
     private readonly IBotAccessService _botAccess;
     private readonly StrategyAppService _strategies;
+    private readonly INotificationWriter _notifications;
+    private readonly IMarketingDemoService _demo;
     private readonly ILogger<TradeAppService> _logger;
 
     public TradeAppService(
@@ -32,6 +34,8 @@ public sealed class TradeAppService
         IIdempotencyGate idempotencyGate,
         IBotAccessService botAccess,
         StrategyAppService strategies,
+        INotificationWriter notifications,
+        IMarketingDemoService demo,
         ILogger<TradeAppService> logger)
     {
         _currentUser = currentUser;
@@ -42,6 +46,8 @@ public sealed class TradeAppService
         _idempotencyGate = idempotencyGate;
         _botAccess = botAccess;
         _strategies = strategies;
+        _notifications = notifications;
+        _demo = demo;
         _logger = logger;
     }
 
@@ -54,6 +60,12 @@ public sealed class TradeAppService
         _strategies.EnsureStrategyEnabled(request.StrategyId);
 
         var userId = _currentUser.UserId;
+        if (await _demo.IsMarketingDemoAsync(userId, ct))
+        {
+            // Simulated only — never touches Binolla.
+            return _demo.PlaceSimulatedTrade(userId, request, idempotencyKey.Trim());
+        }
+
         var key = idempotencyKey.Trim();
 
         await using var gate = await _idempotencyGate.AcquireAsync(userId, key, ct);
@@ -161,6 +173,16 @@ public sealed class TradeAppService
             _logger.LogInformation(
                 "Trade accepted user={UserId} tradeId={TradeId} binollaOrderId={BinollaOrderId} placeMs={ElapsedMs}",
                 userId, trade.Id, order.OrderId, sw.ElapsedMilliseconds);
+
+            await _notifications.AddAsync(
+                userId,
+                "live-trade",
+                "Live trade",
+                $"{trade.Asset} {trade.Direction} {trade.Amount:0.##} opened.",
+                trade.Id,
+                $"/trading/{trade.Id}",
+                ct);
+
             return Map(trade);
         }
         catch (BinollaOrderException ex)
@@ -194,6 +216,11 @@ public sealed class TradeAppService
     {
         page = Math.Max(1, page);
         pageSize = Math.Clamp(pageSize, 1, 100);
+
+        var userId = _currentUser.UserId;
+        if (await _demo.IsMarketingDemoAsync(userId, ct))
+            return _demo.BuildTrades(userId, page, pageSize, status, asset);
+
         TradeStatus? parsedStatus = null;
         if (!string.IsNullOrWhiteSpace(status))
         {
@@ -202,7 +229,6 @@ public sealed class TradeAppService
             parsedStatus = s;
         }
 
-        var userId = _currentUser.UserId;
         var total = await _trades.CountByUserAsync(userId, parsedStatus, asset, ct);
         var trades = await _trades.ListByUserAsync(userId, pageSize, (page - 1) * pageSize, parsedStatus, asset, ct);
         return new TradeListResponse(trades.Select(Map).ToList(), total, page, pageSize);
@@ -210,6 +236,12 @@ public sealed class TradeAppService
 
     public async Task<TradeDto> GetTradeAsync(Guid tradeId, CancellationToken ct)
     {
+        if (await _demo.IsMarketingDemoAsync(_currentUser.UserId, ct))
+        {
+            return _demo.FindTrade(_currentUser.UserId, tradeId)
+                   ?? throw new ApiException(ApiErrorCodes.NotFound, "Trade not found.", 404);
+        }
+
         var trade = await _trades.GetByIdAsync(tradeId, _currentUser.UserId, ct)
                     ?? throw new ApiException(ApiErrorCodes.NotFound, "Trade not found.", 404);
         return Map(trade);

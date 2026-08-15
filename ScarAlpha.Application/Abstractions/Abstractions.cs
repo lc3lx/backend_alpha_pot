@@ -7,6 +7,15 @@ public interface IUserRepository
 {
     Task<User?> GetByIdAsync(Guid id, CancellationToken ct = default);
     Task<User?> GetByTelegramUserIdAsync(long telegramUserId, CancellationToken ct = default);
+    Task<User?> GetByEmailAsync(string email, CancellationToken ct = default);
+    Task<IReadOnlyList<User>> ListMarketingDemoUsersAsync(bool? activeOnly = true, CancellationToken ct = default);
+    Task<(IReadOnlyList<User> Items, int Total)> SearchAsync(
+        string? q,
+        UserRole? role,
+        bool? isMarketingDemo,
+        int page,
+        int pageSize,
+        CancellationToken ct = default);
     Task<User> AddAsync(User user, CancellationToken ct = default);
     Task UpdateAsync(User user, CancellationToken ct = default);
 }
@@ -16,6 +25,12 @@ public interface IBinollaLinkRepository
     Task<BinollaLink?> GetByUserIdAsync(Guid userId, CancellationToken ct = default);
     Task<BinollaLink?> GetByIdAsync(Guid id, CancellationToken ct = default);
     Task<IReadOnlyList<BinollaLink>> ListAsync(AdminApprovalStatus? approvalStatus = null, CancellationToken ct = default);
+    Task<(IReadOnlyList<BinollaLink> Items, int Total)> SearchAsync(
+        AdminApprovalStatus? approvalStatus,
+        string? q,
+        int page,
+        int pageSize,
+        CancellationToken ct = default);
     Task UpsertAsync(BinollaLink link, CancellationToken ct = default);
 }
 
@@ -58,6 +73,12 @@ public interface IJwtTokenService
     string CreateToken(User user);
 }
 
+public interface IUserPasswordHasher
+{
+    string Hash(string password);
+    bool Verify(string hash, string password);
+}
+
 public interface ISecretProtector
 {
     string Encrypt(string plaintext);
@@ -67,7 +88,7 @@ public interface ISecretProtector
 public interface ICurrentUser
 {
     Guid UserId { get; }
-    long TelegramUserId { get; }
+    long? TelegramUserId { get; }
     bool IsAdmin { get; }
 }
 

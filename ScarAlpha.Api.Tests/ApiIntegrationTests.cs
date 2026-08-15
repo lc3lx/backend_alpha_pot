@@ -302,6 +302,90 @@ public sealed class AuthApiTests : IClassFixture<ApiFactory>
         var json = await res.Content.ReadFromJsonAsync<JsonElement>();
         return json.GetProperty("accessToken").GetString()!;
     }
+
+    [Fact]
+    public async Task Email_register_login_profile_and_password_work_without_telegram()
+    {
+        var email = $"web-{Guid.NewGuid():N}@scaralpha.test";
+        var register = await _client.PostAsJsonAsync("/api/auth/register", new
+        {
+            email,
+            password = "correct-horse",
+            fullName = "Web Trader",
+            country = "Jordan"
+        });
+        register.EnsureSuccessStatusCode();
+        var registered = await register.Content.ReadFromJsonAsync<JsonElement>();
+        var token = registered.GetProperty("accessToken").GetString()!;
+        token.Should().NotBeNullOrWhiteSpace();
+
+        using var meReq = new HttpRequestMessage(HttpMethod.Get, "/api/me");
+        meReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        var meRes = await _client.SendAsync(meReq);
+        meRes.EnsureSuccessStatusCode();
+        var me = await meRes.Content.ReadFromJsonAsync<JsonElement>();
+        me.GetProperty("email").GetString().Should().Be(email);
+        me.GetProperty("hasPassword").GetBoolean().Should().BeTrue();
+        me.GetProperty("fullName").GetString().Should().Be("Web Trader");
+        me.TryGetProperty("telegramUserId", out var telegramId).Should().BeTrue();
+        telegramId.ValueKind.Should().Be(JsonValueKind.Null);
+
+        using var loginReq = await _client.PostAsJsonAsync("/api/auth/login", new
+        {
+            email,
+            password = "correct-horse"
+        });
+        loginReq.EnsureSuccessStatusCode();
+
+        var bad = await _client.PostAsJsonAsync("/api/auth/login", new { email, password = "wrong-password-1" });
+        bad.StatusCode.Should().Be(System.Net.HttpStatusCode.Unauthorized);
+
+        using var profileReq = new HttpRequestMessage(HttpMethod.Put, "/api/me")
+        {
+            Content = JsonContent.Create(new { fullName = "Updated Trader", country = "UAE", username = "@webtrader" })
+        };
+        profileReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        (await _client.SendAsync(profileReq)).EnsureSuccessStatusCode();
+
+        using var pwdReq = new HttpRequestMessage(HttpMethod.Post, "/api/auth/change-password")
+        {
+            Content = JsonContent.Create(new { currentPassword = "correct-horse", newPassword = "new-horse-battery" })
+        };
+        pwdReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        (await _client.SendAsync(pwdReq)).EnsureSuccessStatusCode();
+
+        var relogin = await _client.PostAsJsonAsync("/api/auth/login", new
+        {
+            email,
+            password = "new-horse-battery"
+        });
+        relogin.EnsureSuccessStatusCode();
+
+        using var notifReq = new HttpRequestMessage(HttpMethod.Get, "/api/notifications");
+        notifReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        var notifRes = await _client.SendAsync(notifReq);
+        notifRes.EnsureSuccessStatusCode();
+
+        using var subReq = new HttpRequestMessage(HttpMethod.Get, "/api/account/subscription");
+        subReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        (await _client.SendAsync(subReq)).EnsureSuccessStatusCode();
+
+        using var histReq = new HttpRequestMessage(HttpMethod.Get, "/api/account/activation-history");
+        histReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        (await _client.SendAsync(histReq)).EnsureSuccessStatusCode();
+    }
+
+    [Fact]
+    public async Task Duplicate_email_register_is_rejected()
+    {
+        var email = $"dup-{Guid.NewGuid():N}@scaralpha.test";
+        var first = await _client.PostAsJsonAsync("/api/auth/register", new { email, password = "correct-horse" });
+        first.EnsureSuccessStatusCode();
+        var second = await _client.PostAsJsonAsync("/api/auth/register", new { email, password = "correct-horse" });
+        second.StatusCode.Should().Be(System.Net.HttpStatusCode.Conflict);
+        var body = await second.Content.ReadAsStringAsync();
+        body.Should().Contain("EMAIL_TAKEN");
+    }
 }
 
 public sealed class BinollaApiTests : IClassFixture<ApiFactory>

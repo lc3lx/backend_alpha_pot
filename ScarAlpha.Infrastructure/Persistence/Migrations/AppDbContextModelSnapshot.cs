@@ -221,6 +221,52 @@ namespace ScarAlpha.Infrastructure.Persistence.Migrations
                     b.ToTable("trades", (string)null);
                 });
 
+            modelBuilder.Entity("ScarAlpha.Domain.Entities.UserNotification", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("ActionPath")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("Description")
+                        .IsRequired()
+                        .HasMaxLength(1024)
+                        .HasColumnType("character varying(1024)");
+
+                    b.Property<bool>("Read")
+                        .HasColumnType("boolean");
+
+                    b.Property<string>("Title")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.Property<Guid?>("TradeId")
+                        .HasColumnType("uuid");
+
+                    b.Property<Guid>("UserId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("Variant")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("UserId", "CreatedAt");
+
+                    b.HasIndex("UserId", "Read");
+
+                    b.ToTable("user_notifications", (string)null);
+                });
+
             modelBuilder.Entity("ScarAlpha.Domain.Entities.User", b =>
                 {
                     b.Property<Guid>("Id")
@@ -234,14 +280,30 @@ namespace ScarAlpha.Infrastructure.Persistence.Migrations
                     b.Property<DateTimeOffset>("CreatedAt")
                         .HasColumnType("timestamp with time zone");
 
+                    b.Property<string>("Email")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
                     b.Property<string>("FullName")
                         .HasMaxLength(256)
                         .HasColumnType("character varying(256)");
 
+                    b.Property<bool>("IsMarketingDemo")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("boolean")
+                        .HasDefaultValue(false);
+
+                    b.Property<string>("MarketingDemoConfigJson")
+                        .HasColumnType("text");
+
+                    b.Property<string>("PasswordHash")
+                        .HasMaxLength(512)
+                        .HasColumnType("character varying(512)");
+
                     b.Property<int>("Role")
                         .HasColumnType("integer");
 
-                    b.Property<long>("TelegramUserId")
+                    b.Property<long?>("TelegramUserId")
                         .HasColumnType("bigint");
 
                     b.Property<DateTimeOffset>("UpdatedAt")
@@ -253,8 +315,15 @@ namespace ScarAlpha.Infrastructure.Persistence.Migrations
 
                     b.HasKey("Id");
 
+                    b.HasIndex("Email")
+                        .IsUnique()
+                        .HasFilter("\"Email\" IS NOT NULL");
+
+                    b.HasIndex("IsMarketingDemo");
+
                     b.HasIndex("TelegramUserId")
-                        .IsUnique();
+                        .IsUnique()
+                        .HasFilter("\"TelegramUserId\" IS NOT NULL");
 
                     b.ToTable("users", (string)null);
                 });
@@ -292,9 +361,22 @@ namespace ScarAlpha.Infrastructure.Persistence.Migrations
                     b.Navigation("User");
                 });
 
+            modelBuilder.Entity("ScarAlpha.Domain.Entities.UserNotification", b =>
+                {
+                    b.HasOne("ScarAlpha.Domain.Entities.User", "User")
+                        .WithMany("Notifications")
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("User");
+                });
+
             modelBuilder.Entity("ScarAlpha.Domain.Entities.User", b =>
                 {
                     b.Navigation("BinollaLink");
+
+                    b.Navigation("Notifications");
 
                     b.Navigation("Subscriptions");
 

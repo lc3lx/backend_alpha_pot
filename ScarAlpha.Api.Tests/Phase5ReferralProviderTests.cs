@@ -45,7 +45,18 @@ public sealed class Phase5AccessUnitTests
         restorer.Setup(r => r.EnsureBackgroundRestore(It.IsAny<Guid>()));
         restorer.Setup(r => r.ClearAuthFailure(It.IsAny<Guid>()));
 
-        var botAccess = new BotAccessService(links.Object, sessions.Object, restorer.Object);
+        var users = new Mock<IUserRepository>(MockBehavior.Strict);
+        users.Setup(r => r.GetByIdAsync(userId, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new User
+            {
+                Id = userId,
+                Role = UserRole.User,
+                IsMarketingDemo = false,
+                CreatedAt = DateTimeOffset.UtcNow,
+                UpdatedAt = DateTimeOffset.UtcNow
+            });
+
+        var botAccess = new BotAccessService(links.Object, sessions.Object, restorer.Object, users.Object);
         var result = await botAccess.CheckAsync(userId);
 
         result.Access.Should().Be(BotAccessState.AdminApprovalRequired);

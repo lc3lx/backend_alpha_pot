@@ -14,6 +14,7 @@ public sealed class MarketAppService
     private readonly IBinollaSessionManager _sessions;
     private readonly IBotAccessService _botAccess;
     private readonly IBinollaSessionRestorer _restorer;
+    private readonly IMarketingDemoService _demo;
     private readonly ILogger<MarketAppService> _logger;
 
     public MarketAppService(
@@ -21,17 +22,22 @@ public sealed class MarketAppService
         IBinollaSessionManager sessions,
         IBotAccessService botAccess,
         IBinollaSessionRestorer restorer,
+        IMarketingDemoService demo,
         ILogger<MarketAppService> logger)
     {
         _currentUser = currentUser;
         _sessions = sessions;
         _botAccess = botAccess;
         _restorer = restorer;
+        _demo = demo;
         _logger = logger;
     }
 
     public async Task<MarketAssetsResponse> GetAssetsAsync(CancellationToken ct)
     {
+        if (await _demo.IsMarketingDemoAsync(_currentUser.UserId, ct))
+            return _demo.BuildAssets();
+
         await EnsureBotAccessAsync(ct);
         var client = await EnsureLiveClientAsync(ct);
         if (client is null)
@@ -112,6 +118,9 @@ public sealed class MarketAppService
         if (string.IsNullOrWhiteSpace(asset))
             throw new ApiException(ApiErrorCodes.ValidationError, "asset is required.");
 
+        if (await _demo.IsMarketingDemoAsync(_currentUser.UserId, ct))
+            return _demo.BuildPrice(asset);
+
         await EnsureBotAccessAsync(ct);
         var client = await EnsureLiveClientAsync(ct);
         var symbol = asset.Trim();
@@ -190,6 +199,9 @@ public sealed class MarketAppService
             throw new ApiException(ApiErrorCodes.ValidationError, "asset is required.");
         if (period is < 1 or > 14400)
             throw new ApiException(ApiErrorCodes.ValidationError, "period must be between 1 and 14400 seconds.");
+
+        if (await _demo.IsMarketingDemoAsync(_currentUser.UserId, ct))
+            return _demo.BuildCandles(asset, period);
 
         await EnsureBotAccessAsync(ct);
         var client = await EnsureLiveClientAsync(ct);

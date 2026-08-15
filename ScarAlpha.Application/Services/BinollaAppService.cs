@@ -20,6 +20,7 @@ public sealed class BinollaAppService
     private readonly IBotAccessService _access;
     private readonly IBinollaCredentialAuth _credentialAuth;
     private readonly IBinollaSessionRestorer _restorer;
+    private readonly IMarketingDemoService _demo;
     private readonly ILogger<BinollaAppService> _logger;
 
     public BinollaAppService(
@@ -30,6 +31,7 @@ public sealed class BinollaAppService
         IBotAccessService access,
         IBinollaCredentialAuth credentialAuth,
         IBinollaSessionRestorer restorer,
+        IMarketingDemoService demo,
         ILogger<BinollaAppService> logger)
     {
         _currentUser = currentUser;
@@ -39,6 +41,7 @@ public sealed class BinollaAppService
         _access = access;
         _credentialAuth = credentialAuth;
         _restorer = restorer;
+        _demo = demo;
         _logger = logger;
     }
 
@@ -46,6 +49,7 @@ public sealed class BinollaAppService
         BinollaCredentialRequest request,
         CancellationToken ct)
     {
+        await EnsureNotMarketingDemoAsync(ct);
         if (request is null)
             throw new ApiException(ApiErrorCodes.ValidationError, "Request body is required.");
         ValidateCredentialRequest(request);
@@ -162,6 +166,7 @@ public sealed class BinollaAppService
         BinollaCredentialRequest request,
         CancellationToken ct)
     {
+        await EnsureNotMarketingDemoAsync(ct);
         if (request is null)
             throw new ApiException(ApiErrorCodes.ValidationError, "Request body is required.");
         ValidateCredentialRequest(request);
@@ -205,6 +210,7 @@ public sealed class BinollaAppService
         CancellationToken ct,
         string? cookieHeader = null)
     {
+        await EnsureNotMarketingDemoAsync(ct);
         if (string.IsNullOrWhiteSpace(request.Ssid))
             throw new ApiException(ApiErrorCodes.ValidationError, "ssid is required.");
 
@@ -396,6 +402,9 @@ public sealed class BinollaAppService
     public async Task<BinollaStatusDto> GetStatusAsync(CancellationToken ct)
     {
         var userId = _currentUser.UserId;
+        if (await _demo.IsMarketingDemoAsync(userId, ct))
+            return _demo.BuildStatus(userId);
+
         var link = await _links.GetByUserIdAsync(userId, ct);
         var client = _sessions.Get(userId.ToString());
 
@@ -423,6 +432,9 @@ public sealed class BinollaAppService
 
     public async Task<BinollaBalanceDto> GetBalanceAsync(CancellationToken ct)
     {
+        if (await _demo.IsMarketingDemoAsync(_currentUser.UserId, ct))
+            return _demo.BuildBalance(_currentUser.UserId);
+
         var access = await _access.CheckAsync(_currentUser.UserId, ct);
         AccountAppService.EnsureConnectedForMarket(access);
 
@@ -496,6 +508,7 @@ public sealed class BinollaAppService
 
     public async Task<BinollaStatusDto> ChangeAccountTypeAsync(BinollaAccountTypeRequest request, CancellationToken ct)
     {
+        await EnsureNotMarketingDemoAsync(ct);
         var accountType = ParseAccountType(request.AccountType);
         if (accountType == DomainAccount.Real)
             throw new ApiException(ApiErrorCodes.RealTradingDisabled, "Real trading is disabled in this phase.", 403);
@@ -516,6 +529,7 @@ public sealed class BinollaAppService
 
     public async Task DisconnectAsync(CancellationToken ct)
     {
+        await EnsureNotMarketingDemoAsync(ct);
         var userId = _currentUser.UserId;
         await _sessions.DisconnectAsync(userId.ToString(), ct);
 
@@ -525,6 +539,17 @@ public sealed class BinollaAppService
             link.Status = BinollaLinkStatus.Disconnected;
             link.UpdatedAt = DateTimeOffset.UtcNow;
             await _links.UpsertAsync(link, ct);
+        }
+    }
+
+    private async Task EnsureNotMarketingDemoAsync(CancellationToken ct)
+    {
+        if (await _demo.IsMarketingDemoAsync(_currentUser.UserId, ct))
+        {
+            throw new ApiException(
+                ApiErrorCodes.Forbidden,
+                "Marketing demo accounts use simulated data and cannot connect to Binolla.",
+                403);
         }
     }
 

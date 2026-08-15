@@ -206,6 +206,25 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
         };
 
         await ApplyStatusAsync(trades, trade, next, outcome.ProfitLoss, null, ct);
+
+        var notifications = scope.ServiceProvider.GetRequiredService<INotificationWriter>();
+        var (variant, title, description) = next switch
+        {
+            TradeStatus.Profit => ("trade-profit", "Trade profit", $"{trade.Asset} closed in profit."),
+            TradeStatus.Loss => ("trade-loss", "Trade loss", $"{trade.Asset} closed in loss."),
+            TradeStatus.Tie => ("live-trade", "Trade tied", $"{trade.Asset} closed as a tie."),
+            TradeStatus.Failed => ("trade-loss", "Trade failed", $"{trade.Asset} could not be completed."),
+            _ => ("live-trade", "Trade updated", $"{trade.Asset} status: {next}.")
+        };
+        await notifications.AddAsync(
+            trade.UserId,
+            variant,
+            title,
+            description,
+            trade.Id,
+            $"/trading/{trade.Id}",
+            ct);
+
         _logger.LogInformation(
             "Trade outcome tradeId={TradeId} binollaOrderId={BinollaOrderId} status={Status} pnl={Pnl} elapsedMs={ElapsedMs}",
             trade.Id, item.BinollaOrderId, next, outcome.ProfitLoss, sw.ElapsedMilliseconds);

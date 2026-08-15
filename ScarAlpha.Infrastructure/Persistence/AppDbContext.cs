@@ -12,6 +12,7 @@ public sealed class AppDbContext : DbContext
     public DbSet<Subscription> Subscriptions => Set<Subscription>();
     public DbSet<Trade> Trades => Set<Trade>();
     public DbSet<AuditEvent> AuditEvents => Set<AuditEvent>();
+    public DbSet<UserNotification> UserNotifications => Set<UserNotification>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -19,11 +20,21 @@ public sealed class AppDbContext : DbContext
         {
             e.ToTable("users");
             e.HasKey(x => x.Id);
-            e.HasIndex(x => x.TelegramUserId).IsUnique();
+            e.HasIndex(x => x.TelegramUserId)
+                .IsUnique()
+                .HasFilter("\"TelegramUserId\" IS NOT NULL");
+            e.HasIndex(x => x.Email)
+                .IsUnique()
+                .HasFilter("\"Email\" IS NOT NULL");
+            e.Property(x => x.Email).HasMaxLength(256);
+            e.Property(x => x.PasswordHash).HasMaxLength(512);
             e.Property(x => x.Username).HasMaxLength(128);
             e.Property(x => x.FullName).HasMaxLength(256);
             e.Property(x => x.Country).HasMaxLength(128);
             e.Property(x => x.Role).HasConversion<int>();
+            e.Property(x => x.IsMarketingDemo).HasDefaultValue(false);
+            e.HasIndex(x => x.IsMarketingDemo);
+            e.Property(x => x.MarketingDemoConfigJson).HasColumnType("text");
             e.HasOne(x => x.BinollaLink).WithOne(x => x.User).HasForeignKey<BinollaLink>(x => x.UserId);
         });
 
@@ -74,6 +85,19 @@ public sealed class AppDbContext : DbContext
             e.Property(x => x.PreviousState).HasMaxLength(128);
             e.Property(x => x.NewState).HasMaxLength(128);
             e.Property(x => x.Detail).HasMaxLength(512);
+        });
+
+        modelBuilder.Entity<UserNotification>(e =>
+        {
+            e.ToTable("user_notifications");
+            e.HasKey(x => x.Id);
+            e.HasIndex(x => new { x.UserId, x.CreatedAt });
+            e.HasIndex(x => new { x.UserId, x.Read });
+            e.Property(x => x.Variant).HasMaxLength(64).IsRequired();
+            e.Property(x => x.Title).HasMaxLength(256).IsRequired();
+            e.Property(x => x.Description).HasMaxLength(1024).IsRequired();
+            e.Property(x => x.ActionPath).HasMaxLength(256);
+            e.HasOne(x => x.User).WithMany(x => x.Notifications).HasForeignKey(x => x.UserId);
         });
     }
 }

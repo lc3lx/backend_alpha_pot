@@ -13,19 +13,22 @@ public sealed class RsiSignalAppService
     private readonly IBotAccessService _botAccess;
     private readonly IRsiSignalService _signalService;
     private readonly IBinollaSessionRestorer _restorer;
+    private readonly IMarketingDemoService _demo;
 
     public RsiSignalAppService(
         ICurrentUser currentUser,
         IBinollaSessionManager sessions,
         IBotAccessService botAccess,
         IRsiSignalService signalService,
-        IBinollaSessionRestorer restorer)
+        IBinollaSessionRestorer restorer,
+        IMarketingDemoService demo)
     {
         _currentUser = currentUser;
         _sessions = sessions;
         _botAccess = botAccess;
         _signalService = signalService;
         _restorer = restorer;
+        _demo = demo;
     }
 
     public async Task<StrategySignal> GetSignalAsync(
@@ -37,6 +40,9 @@ public sealed class RsiSignalAppService
             throw new ApiException(ApiErrorCodes.ValidationError, "asset is required.");
         if (periodSeconds is < 1 or > 14400)
             throw new ApiException(ApiErrorCodes.ValidationError, "period must be between 1 and 14400 seconds.");
+
+        if (await _demo.IsMarketingDemoAsync(_currentUser.UserId, ct))
+            return _demo.BuildRsiSignal(asset, periodSeconds);
 
         var access = await _botAccess.CheckAsync(_currentUser.UserId, ct);
         AccountAppService.EnsureConnectedForMarket(access);

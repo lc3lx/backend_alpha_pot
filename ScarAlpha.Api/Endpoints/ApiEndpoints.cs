@@ -19,6 +19,43 @@ public static class AuthEndpoints
             return Results.Ok(new { accessToken = result.AccessToken, userId = result.UserId });
         });
 
+        group.MapPost("/register", async (
+            [FromBody] EmailAuthRequest request,
+            AuthAppService auth,
+            CancellationToken ct) =>
+        {
+            var result = await auth.RegisterAsync(request, ct);
+            return Results.Ok(new { accessToken = result.AccessToken, userId = result.UserId });
+        });
+
+        group.MapPost("/login", async (
+            [FromBody] EmailAuthRequest request,
+            AuthAppService auth,
+            CancellationToken ct) =>
+        {
+            var result = await auth.LoginAsync(request, ct);
+            return Results.Ok(new { accessToken = result.AccessToken, userId = result.UserId });
+        });
+
+        group.MapPost("/change-password", async (
+            [FromBody] ChangePasswordRequest request,
+            AuthAppService auth,
+            CancellationToken ct) =>
+        {
+            await auth.ChangePasswordAsync(request, ct);
+            return Results.Ok(new { changed = true });
+        }).RequireAuthorization();
+
+        // Bind Telegram Mini App identity to the current JWT user (email/demo → bot).
+        group.MapPost("/link-telegram", async (
+            [FromBody] TelegramAuthRequest request,
+            AuthAppService auth,
+            CancellationToken ct) =>
+        {
+            var result = await auth.LinkTelegramAsync(request, ct);
+            return Results.Ok(new { accessToken = result.AccessToken, userId = result.UserId });
+        }).RequireAuthorization();
+
         return group;
     }
 }
@@ -30,6 +67,11 @@ public static class MeEndpoints
         var group = app.MapGroup("/api").WithTags("Me").RequireAuthorization();
         group.MapGet("/me", async (MeAppService me, CancellationToken ct) =>
             Results.Ok(await me.GetMeAsync(ct)));
+        group.MapPut("/me", async (
+            [FromBody] UpdateProfileRequest request,
+            MeAppService me,
+            CancellationToken ct) =>
+            Results.Ok(await me.UpdateAsync(request, ct)));
         return group;
     }
 }
@@ -136,6 +178,10 @@ public static class AccountEndpoints
         var group = app.MapGroup("/api/account").WithTags("Account").RequireAuthorization();
         group.MapGet("/status", async (AccountAppService svc, CancellationToken ct) =>
             Results.Ok(await svc.GetStatusAsync(ct)));
+        group.MapGet("/subscription", async (AccountAppService svc, CancellationToken ct) =>
+            Results.Ok(await svc.GetSubscriptionAsync(ct)));
+        group.MapGet("/activation-history", async (AccountAppService svc, CancellationToken ct) =>
+            Results.Ok(await svc.GetActivationHistoryAsync(ct)));
         return group;
     }
 }
@@ -169,8 +215,11 @@ public static class AdminEndpoints
         group.MapGet("/", async (
             AdminAppService svc,
             CancellationToken ct,
-            [FromQuery] string? status = null) =>
-            Results.Ok(await svc.ListAsync(status, ct)));
+            [FromQuery] string? status = null,
+            [FromQuery] string? q = null,
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 50) =>
+            Results.Ok(await svc.ListAsync(status, ct, q, page, pageSize)));
 
         group.MapGet("/{id:guid}", async (Guid id, AdminAppService svc, CancellationToken ct) =>
             Results.Ok(await svc.GetAsync(id, ct)));
@@ -180,6 +229,125 @@ public static class AdminEndpoints
 
         group.MapPost("/{id:guid}/reject", async (Guid id, AdminAppService svc, CancellationToken ct) =>
             Results.Ok(await svc.RejectAsync(id, ct)));
+
+        var demo = app.MapGroup("/api/admin/demo-users")
+            .WithTags("Admin")
+            .RequireAuthorization("AdminOnly");
+
+        demo.MapGet("/", async (
+            AdminAppService svc,
+            CancellationToken ct,
+            [FromQuery] string? active = "true",
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 50) =>
+        {
+            bool? activeFilter = active?.Trim().ToLowerInvariant() switch
+            {
+                "false" => false,
+                "all" => null,
+                _ => true,
+            };
+            return Results.Ok(await svc.ListMarketingDemoUsersAsync(ct, activeFilter, page, pageSize));
+        });
+
+        demo.MapPost("/", async (
+            [FromBody] CreateMarketingDemoUserRequest request,
+            AdminAppService svc,
+            CancellationToken ct) =>
+            Results.Ok(await svc.CreateMarketingDemoUserAsync(request, ct)));
+
+        demo.MapPatch("/{id:guid}", async (
+            Guid id,
+            [FromBody] SetMarketingDemoRequest request,
+            AdminAppService svc,
+            CancellationToken ct) =>
+            Results.Ok(await svc.SetMarketingDemoAsync(id, request, ct)));
+
+        demo.MapPut("/{id:guid}/config", async (
+            Guid id,
+            [FromBody] UpdateMarketingDemoConfigRequest request,
+            AdminAppService svc,
+            CancellationToken ct) =>
+            Results.Ok(await svc.UpdateMarketingDemoConfigAsync(id, request, ct)));
+
+        var users = app.MapGroup("/api/admin/users")
+            .WithTags("Admin")
+            .RequireAuthorization("AdminOnly");
+
+        users.MapGet("/", async (
+            AdminAppService svc,
+            CancellationToken ct,
+            [FromQuery] string? q = null,
+            [FromQuery] string? role = null,
+            [FromQuery] bool? isMarketingDemo = null,
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 50) =>
+            Results.Ok(await svc.ListUsersAsync(q, role, isMarketingDemo, page, pageSize, ct)));
+
+        users.MapGet("/{id:guid}", async (Guid id, AdminAppService svc, CancellationToken ct) =>
+            Results.Ok(await svc.GetUserAsync(id, ct)));
+
+        users.MapPatch("/{id:guid}", async (
+            Guid id,
+            [FromBody] PatchAdminUserRequest request,
+            AdminAppService svc,
+            CancellationToken ct) =>
+            Results.Ok(await svc.PatchUserAsync(id, request, ct)));
+
+        var audit = app.MapGroup("/api/admin/audit")
+            .WithTags("Admin")
+            .RequireAuthorization("AdminOnly");
+
+        audit.MapGet("/", async (
+            AdminAppService svc,
+            CancellationToken ct,
+            [FromQuery] Guid? userId = null,
+            [FromQuery] string? action = null,
+            [FromQuery] DateTimeOffset? from = null,
+            [FromQuery] DateTimeOffset? to = null,
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 50) =>
+            Results.Ok(await svc.ListAuditAsync(userId, action, from, to, page, pageSize, ct)));
+
+        var notifications = app.MapGroup("/api/admin/notifications")
+            .WithTags("Admin")
+            .RequireAuthorization("AdminOnly");
+
+        notifications.MapGet("/", async (
+            AdminAppService svc,
+            CancellationToken ct,
+            [FromQuery] Guid? userId = null,
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 50) =>
+            Results.Ok(await svc.ListNotificationsAsync(userId, page, pageSize, ct)));
+
+        notifications.MapPost("/", async (
+            [FromBody] AdminSendNotificationRequest request,
+            AdminAppService svc,
+            CancellationToken ct) =>
+            Results.Ok(await svc.SendNotificationsAsync(request, ct)));
+
+        return group;
+    }
+}
+
+public static class NotificationEndpoints
+{
+    public static RouteGroupBuilder MapNotificationEndpoints(this IEndpointRouteBuilder app)
+    {
+        var group = app.MapGroup("/api/notifications").WithTags("Notifications").RequireAuthorization();
+
+        group.MapGet("/", async (NotificationAppService svc, CancellationToken ct) =>
+            Results.Ok(await svc.ListAsync(ct)));
+
+        group.MapGet("/{id:guid}", async (Guid id, NotificationAppService svc, CancellationToken ct) =>
+            Results.Ok(await svc.GetAsync(id, ct)));
+
+        group.MapPost("/{id:guid}/read", async (Guid id, NotificationAppService svc, CancellationToken ct) =>
+            Results.Ok(await svc.MarkReadAsync(id, ct)));
+
+        group.MapPost("/read-all", async (NotificationAppService svc, CancellationToken ct) =>
+            Results.Ok(await svc.MarkAllReadAsync(ct)));
 
         return group;
     }

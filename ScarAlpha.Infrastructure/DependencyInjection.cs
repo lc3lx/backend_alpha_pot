@@ -17,6 +17,7 @@ using ScarAlpha.Infrastructure.Persistence;
 using ScarAlpha.Infrastructure.Security;
 using ScarAlpha.Infrastructure.Strategies;
 using ScarAlpha.Infrastructure.Telegram;
+using ScarAlpha.Infrastructure.Notifications;
 using ScarAlpha.Infrastructure.Workers;
 
 namespace ScarAlpha.Infrastructure;
@@ -47,14 +48,18 @@ public static class DependencyInjection
         services.AddScoped<IUserRepository, UserRepository>();
         services.AddScoped<IBinollaLinkRepository, BinollaLinkRepository>();
         services.AddScoped<ITradeRepository, TradeRepository>();
+        services.AddScoped<INotificationRepository, NotificationRepository>();
+        services.AddScoped<INotificationWriter, NotificationWriter>();
         services.AddScoped<ICurrentUser, HttpCurrentUser>();
         services.AddSingleton<ITelegramAuthService, TelegramAuthService>();
         services.AddSingleton<IJwtTokenService, JwtTokenService>();
+        services.AddSingleton<IUserPasswordHasher, UserPasswordHasher>();
         services.AddSingleton<ISecretProtector, AesGcmSecretProtector>();
         services.AddSingleton<IIdempotencyGate, IdempotencyGate>();
         services.AddSingleton<IStrategyRegistry, StrategyRegistry>();
         services.AddScoped<IBotAccessService, BotAccessService>();
         services.AddScoped<IAuditService, AuditService>();
+        services.AddScoped<IMarketingDemoService, MarketingDemoService>();
 
         services.AddScoped<AuthAppService>();
         services.AddScoped<MeAppService>();
@@ -65,6 +70,7 @@ public static class DependencyInjection
         services.AddScoped<RsiSignalAppService>();
         services.AddScoped<TradeAppService>();
         services.AddScoped<AdminAppService>();
+        services.AddScoped<NotificationAppService>();
 
         services.AddSingleton<IBinollaCredentialAuth, NodeBinollaCredentialAuth>();
 

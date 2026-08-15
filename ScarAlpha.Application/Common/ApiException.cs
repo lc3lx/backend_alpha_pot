@@ -4,6 +4,10 @@ public static class ApiErrorCodes
 {
     public const string Unauthorized = "UNAUTHORIZED";
     public const string TelegramAuthInvalid = "TELEGRAM_AUTH_INVALID";
+    public const string EmailTaken = "EMAIL_TAKEN";
+    public const string TelegramTaken = "TELEGRAM_TAKEN";
+    public const string InvalidCredentials = "INVALID_CREDENTIALS";
+    public const string PasswordNotSet = "PASSWORD_NOT_SET";
     public const string BinollaNotConnected = "BINOLLA_NOT_CONNECTED";
     public const string BinollaSessionExpired = "BINOLLA_SESSION_EXPIRED";
     public const string BinollaConnectionFailed = "BINOLLA_CONNECTION_FAILED";

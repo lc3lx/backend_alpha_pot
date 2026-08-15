@@ -24,14 +24,14 @@ public sealed class HttpCurrentUser : ICurrentUser
         }
     }
 
-    public long TelegramUserId
+    public long? TelegramUserId
     {
         get
         {
             var raw = _http.HttpContext?.User?.FindFirstValue("telegram_user_id");
             if (long.TryParse(raw, out var id))
                 return id;
-            throw new ApiException(ApiErrorCodes.Unauthorized, "Missing telegram identity.", 401);
+            return null;
         }
     }
 
