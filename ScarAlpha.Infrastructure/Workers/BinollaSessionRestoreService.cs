@@ -26,6 +26,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
     private readonly ConcurrentDictionary<Guid, byte> _authFailed = new();
     private readonly ConcurrentDictionary<Guid, SemaphoreSlim> _userGates = new();
     private readonly ConcurrentDictionary<Guid, byte> _bgRestoreQueued = new();
+    private readonly ConcurrentDictionary<Guid, DateTimeOffset> _retryAfterUtc = new();
     private readonly TaskCompletionSource _initialDone = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private CancellationTokenSource? _cts;
 
@@ -148,15 +149,25 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
         if (_authFailed.ContainsKey(userId))
             return false;
 
+        if (IsCoolingDown(userId))
+            return false;
+
         return await RestoreOneAsync(userId, maxAttempts: Math.Max(1, _options.LazyMaxAttempts), ct)
             .ConfigureAwait(false);
     }
 
-    public void ClearAuthFailure(Guid userId) => _authFailed.TryRemove(userId, out _);
+    public void ClearAuthFailure(Guid userId)
+    {
+        _authFailed.TryRemove(userId, out _);
+        _retryAfterUtc.TryRemove(userId, out _);
+    }
 
     public void EnsureBackgroundRestore(Guid userId)
     {
         if (!_options.Enabled || IsLive(userId) || _authFailed.ContainsKey(userId))
+            return;
+
+        if (IsCoolingDown(userId))
             return;
 
         if (!_bgRestoreQueued.TryAdd(userId, 1))
@@ -222,6 +233,9 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                 return true;
 
             if (_authFailed.ContainsKey(userId))
+                return false;
+
+            if (IsCoolingDown(userId))
                 return false;
 
             string? ciphertext = null;
@@ -332,6 +346,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
 
                     await TouchLastConnectedAsync(userId, CancellationToken.None).ConfigureAwait(false);
                     _authFailed.TryRemove(userId, out _);
+                    _retryAfterUtc.TryRemove(userId, out _);
 
                     _logger.LogInformation(
                         "Session restore: connected user {UserId} link={LinkId} attempt={Attempt}",
@@ -342,6 +357,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                 {
                     // Expired / invalid SSID — do not retry storm; mark and skip.
                     _authFailed[userId] = 1;
+                    _retryAfterUtc.TryRemove(userId, out _);
                     _logger.LogWarning(
                         ex,
                         "Session restore: authentication failed for user {UserId} link={LinkId} (SSID invalid/expired); skipping further attempts",
@@ -368,7 +384,10 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                         userId, linkId, attempt, maxAttempts);
 
                     if (attempt >= maxAttempts)
+                    {
+                        SetFailureCooldown(userId);
                         return IsLive(userId);
+                    }
 
                     try
                     {
@@ -411,6 +430,24 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
         {
             _logger.LogWarning(ex, "Session restore: failed updating LastConnectedAt for user {UserId}", userId);
         }
+    }
+
+    private bool IsCoolingDown(Guid userId)
+    {
+        if (!_retryAfterUtc.TryGetValue(userId, out var retryAfter))
+            return false;
+
+        if (retryAfter > DateTimeOffset.UtcNow)
+            return true;
+
+        _retryAfterUtc.TryRemove(userId, out _);
+        return false;
+    }
+
+    private void SetFailureCooldown(Guid userId)
+    {
+        _retryAfterUtc[userId] = DateTimeOffset.UtcNow.AddSeconds(
+            Math.Max(1, _options.FailureCooldownSeconds));
     }
 
     private async Task MarkLinkDisconnectedAsync(Guid userId, string reason, CancellationToken ct)

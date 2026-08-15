@@ -102,6 +102,7 @@ public static class DependencyInjection
             options.InitialDelayMs = configuration.GetValue("Binolla:SessionRestore:InitialDelayMs", 500);
             options.MaxDelayMs = configuration.GetValue("Binolla:SessionRestore:MaxDelayMs", 30_000);
             options.LazyMaxAttempts = configuration.GetValue("Binolla:SessionRestore:LazyMaxAttempts", 1);
+            options.FailureCooldownSeconds = configuration.GetValue("Binolla:SessionRestore:FailureCooldownSeconds", 30);
         });
         services.AddSingleton<BinollaSessionRestoreService>();
         services.AddSingleton<IBinollaSessionRestorer>(sp => sp.GetRequiredService<BinollaSessionRestoreService>());

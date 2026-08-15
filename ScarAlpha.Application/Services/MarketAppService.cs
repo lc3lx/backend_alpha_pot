@@ -331,46 +331,17 @@ public sealed class MarketAppService
     }
 
     /// <summary>
-    /// Prefer live in-memory session; if cold, block on restore (independent of HTTP abort)
-    /// so market calls do not race background restore and return BINOLLA_NOT_CONNECTED.
+    /// Prefer a live in-memory session. Restore is background-only so a rejected upstream
+    /// credential never turns browser polling into a socket-handshake wait.
     /// </summary>
-    private async Task<IBinollaClient?> EnsureLiveClientAsync(CancellationToken ct)
+    private Task<IBinollaClient?> EnsureLiveClientAsync(CancellationToken ct)
     {
         var live = FindLiveClient();
         if (live is not null)
-            return live;
+            return Task.FromResult<IBinollaClient?>(live);
 
-        // #region agent log
-        ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
-            "H125",
-            "MarketAppService.EnsureLiveClientAsync",
-            "restore_blocking_begin",
-            new { });
-        // #endregion
-
-        try
-        {
-            using var restoreCts = new CancellationTokenSource(TimeSpan.FromSeconds(45));
-            await _restorer.TryRestoreUserAsync(_currentUser.UserId, restoreCts.Token);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogDebug(ex, "Market ensure-live restore ended for user {UserId}", _currentUser.UserId);
-        }
-
-        live = FindLiveClient();
-        // #region agent log
-        ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(
-            "H125",
-            "MarketAppService.EnsureLiveClientAsync",
-            live is null ? "restore_blocking_miss" : "restore_blocking_ok",
-            new
-            {
-                lifecycle = live?.Lifecycle.ToString() ?? "None",
-                transportUp = live?.IsTransportConnected == true
-            });
-        // #endregion
-        return live;
+        _restorer.EnsureBackgroundRestore(_currentUser.UserId);
+        return Task.FromResult<IBinollaClient?>(null);
     }
 
     private IBinollaClient? FindLiveClient()

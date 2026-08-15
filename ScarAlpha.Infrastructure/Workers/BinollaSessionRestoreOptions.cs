@@ -21,4 +21,7 @@ public sealed class BinollaSessionRestoreOptions
 
     /// <summary>Lazy restore (access check) uses at most this many attempts.</summary>
     public int LazyMaxAttempts { get; set; } = 3;
+
+    /// <summary>Minimum delay before retrying a transient failure for the same user.</summary>
+    public int FailureCooldownSeconds { get; set; } = 30;
 }

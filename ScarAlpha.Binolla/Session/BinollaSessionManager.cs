@@ -52,6 +52,8 @@ public sealed class BinollaSessionManager : IBinollaSessionManager
             return existing.Session;
         }
 
+        BinollaSession session;
+        SessionEntry entry;
         await _createGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -67,8 +69,8 @@ public sealed class BinollaSessionManager : IBinollaSessionManager
                 throw new BinollaException(
                     $"Max concurrent sessions reached ({_options.MaxConcurrentSessions}).");
 
-            var session = new BinollaSession(userId, _options, _transportFactory);
-            var entry = new SessionEntry(session);
+            session = new BinollaSession(userId, _options, _transportFactory);
+            entry = new SessionEntry(session);
             if (!_sessions.TryAdd(userId, entry))
             {
                 await session.DisposeAsync().ConfigureAwait(false);
@@ -78,13 +80,17 @@ public sealed class BinollaSessionManager : IBinollaSessionManager
                 return raced;
             }
 
-            await session.ConnectAsync(ssid, cancellationToken, cookieHeader).ConfigureAwait(false);
-            return session;
         }
         finally
         {
             _createGate.Release();
         }
+
+        // Do not hold the global creation gate during a remote WebSocket handshake.
+        // Each session has its own lifecycle lock, so users can authenticate in parallel
+        // without allowing duplicate connections for the same user.
+        await session.ConnectAsync(ssid, cancellationToken, cookieHeader).ConfigureAwait(false);
+        return session;
     }
 
     /// <summary>

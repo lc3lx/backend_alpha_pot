@@ -133,34 +133,27 @@ public sealed class RsiSignalAppService
             CandleTime: DateTimeOffset.UtcNow,
             Timeframe: periodSeconds.ToString());
 
-    private async Task<IBinollaClient?> EnsureLiveClientAsync(CancellationToken ct)
+    private Task<IBinollaClient?> EnsureLiveClientAsync(CancellationToken ct)
     {
         var client = _sessions.Get(_currentUser.UserId.ToString());
         if (client is not null &&
             client.IsTransportConnected &&
             client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
         {
-            return client;
+            return Task.FromResult<IBinollaClient?>(client);
         }
 
-        try
-        {
-            using var restoreCts = new CancellationTokenSource(TimeSpan.FromSeconds(45));
-            await _restorer.TryRestoreUserAsync(_currentUser.UserId, restoreCts.Token);
-        }
-        catch
-        {
-            // soft
-        }
+        // Signal polling is latency-sensitive; reconnect without blocking this request.
+        _restorer.EnsureBackgroundRestore(_currentUser.UserId);
 
         client = _sessions.Get(_currentUser.UserId.ToString());
         if (client is not null &&
             client.IsTransportConnected &&
             client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
         {
-            return client;
+            return Task.FromResult<IBinollaClient?>(client);
         }
 
-        return null;
+        return Task.FromResult<IBinollaClient?>(null);
     }
 }

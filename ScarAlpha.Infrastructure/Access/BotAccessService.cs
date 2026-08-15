@@ -76,8 +76,6 @@ public sealed class BotAccessService : IBotAccessService
         // Non-blocking: keep the socket warm in the background. Status must stay fast.
         if (linkReady && (!connected || deadSession))
         {
-            if (deadSession)
-                _restorer.ClearAuthFailure(userId);
             _restorer.EnsureBackgroundRestore(userId);
         }
 

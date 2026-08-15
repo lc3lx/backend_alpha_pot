@@ -169,6 +169,19 @@ internal sealed class SessionMessageRouter
                 // #region agent log
                 MaybeLogPostSsidInboundType("evt:" + TruncateType(eventName));
                 // #endregion
+                // Binolla sends f_authorization then closes the socket for a rejected SSID.
+                // Treat it as a credential failure so restore does not retry it as network noise.
+                if (IsAuthorizationFailureEventName(eventName))
+                {
+                    _lastInboundEvent = eventName;
+                    _state.ResetMarketCaches();
+                    _state.ClearSubscriptions();
+                    _state.SetLifecycle(SessionLifecycleState.AuthenticationFailed,
+                        "Binolla rejected the SSID.");
+                    Interlocked.Exchange(ref _authorized, 0);
+                    return;
+                }
+
                 // Match upstream: ONLY s_authorization completes auth + bootstrap.
                 // Treating s_assets as auth marked Connected without real SSID accept
                 // (PM2: asset/change → unauthorized, histHdr=0).
@@ -368,6 +381,11 @@ internal sealed class SessionMessageRouter
         !string.IsNullOrEmpty(eventName) &&
         (eventName.Equals("unauthorized", StringComparison.OrdinalIgnoreCase) ||
          eventName.Equals("NotAuthorized", StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsAuthorizationFailureEventName(string? eventName) =>
+        !string.IsNullOrWhiteSpace(eventName) &&
+        (eventName.Equals("f_authorization", StringComparison.OrdinalIgnoreCase) ||
+         eventName.Equals("authorization_failed", StringComparison.OrdinalIgnoreCase));
 
     private static bool LooksLikeEngineIoPacket(string message)
     {
