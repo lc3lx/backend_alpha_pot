@@ -3,7 +3,7 @@ namespace ScarAlpha.Application.Common;
 /// <summary>Normalize bot trading-pair lists (1..Max pairs).</summary>
 public static class BotAssetList
 {
-    public const int MaxAssets = 8;
+    public const int MaxAssets = 50;
 
     public static IReadOnlyList<string> Normalize(string? asset, IEnumerable<string>? assets)
     {
