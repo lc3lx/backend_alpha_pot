@@ -208,11 +208,12 @@ public sealed class RsiSignalAppService
                     DurationSeconds: bot.DurationSeconds,
                     StrategyId: "rsi"), key, ct);
                 // #region agent log
+                var tradeIdShort = trade.Id.Length >= 8 ? trade.Id[..8] : trade.Id;
                 ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
                     "OT1",
                     "RsiSignalAppService.ExecuteIfRequestedAsync",
                     "placed_one_trade",
-                    new { tradeId = trade.Id.ToString("N")[..8], asset = signal.Asset, signal = signal.Signal });
+                    new { tradeId = tradeIdShort, asset = signal.Asset, signal = signal.Signal });
                 // #endregion
                 return signal with { AutomatedTradeId = trade.Id };
             }
