@@ -92,6 +92,10 @@ public sealed record StrategyDto(
 
 public sealed record StrategiesResponse(IReadOnlyList<StrategyDto> Strategies);
 
+public sealed record BotStartRequest(string Asset, decimal Amount = 25m, int DurationSeconds = 300, decimal DailyProfitTarget = 50m, decimal DailyLossLimit = 30m);
+public sealed record BotApplyRequest(string? Asset = null, decimal? Amount = null, int? DurationSeconds = null, decimal? DailyProfitTarget = null, decimal? DailyLossLimit = null);
+public sealed record BotRuntimeDto(string State, string? Asset, decimal Amount, int DurationSeconds, decimal DailyProfitTarget, decimal DailyLossLimit, DateTimeOffset UpdatedAt);
+
 public sealed record BinollaStatusDto(
     bool Connected,
     string AccountType,
@@ -317,6 +321,54 @@ public sealed record AdminNotificationDto(
 
 public sealed record AdminNotificationListResponse(
     IReadOnlyList<AdminNotificationDto> Items,
+    int Total,
+    int Page,
+    int PageSize);
+
+public sealed record AdminBotRuntimeDto(
+    string UserId,
+    string? Email,
+    string? FullName,
+    long? TelegramUserId,
+    string BotAccess,
+    string State,
+    string? Asset,
+    decimal Amount,
+    int DurationSeconds,
+    decimal DailyProfitTarget,
+    decimal DailyLossLimit,
+    DateTimeOffset UpdatedAt,
+    bool IsMarketingDemo);
+
+public sealed record AdminBotListResponse(
+    IReadOnlyList<AdminBotRuntimeDto> Items,
+    int Total,
+    int Page,
+    int PageSize);
+
+public sealed record AdminBotControlRequest(
+    string Action,
+    string? Asset = null,
+    decimal? Amount = null,
+    int? DurationSeconds = null,
+    decimal? DailyProfitTarget = null,
+    decimal? DailyLossLimit = null);
+
+public sealed record AdminTradeDto(
+    string Id,
+    string UserId,
+    string? Email,
+    string? FullName,
+    string Asset,
+    string Direction,
+    decimal Amount,
+    string Status,
+    decimal? Pnl,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset? ClosedAt);
+
+public sealed record AdminTradeListResponse(
+    IReadOnlyList<AdminTradeDto> Items,
     int Total,
     int Page,
     int PageSize);

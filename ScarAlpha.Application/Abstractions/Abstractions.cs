@@ -51,6 +51,13 @@ public interface ITradeRepository
         string? asset = null,
         CancellationToken ct = default);
     Task<IReadOnlyList<Trade>> ListOpenTradesAsync(CancellationToken ct = default);
+    Task<(IReadOnlyList<Trade> Items, int Total)> SearchAdminAsync(
+        Guid? userId,
+        TradeStatus? status,
+        string? asset,
+        int page,
+        int pageSize,
+        CancellationToken ct = default);
     Task AddAsync(Trade trade, CancellationToken ct = default);
     Task UpdateAsync(Trade trade, CancellationToken ct = default);
 }

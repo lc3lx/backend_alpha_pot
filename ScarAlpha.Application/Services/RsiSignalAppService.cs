@@ -16,6 +16,7 @@ public sealed class RsiSignalAppService
     private readonly IBinollaSessionRestorer _restorer;
     private readonly IMarketingDemoService _demo;
     private readonly TradeAppService _trades;
+    private readonly IBotRuntimeService _botRuntime;
 
     public RsiSignalAppService(
         ICurrentUser currentUser,
@@ -24,7 +25,8 @@ public sealed class RsiSignalAppService
         IRsiSignalService signalService,
         IBinollaSessionRestorer restorer,
         IMarketingDemoService demo,
-        TradeAppService trades)
+        TradeAppService trades,
+        IBotRuntimeService botRuntime)
     {
         _currentUser = currentUser;
         _sessions = sessions;
@@ -33,6 +35,7 @@ public sealed class RsiSignalAppService
         _restorer = restorer;
         _demo = demo;
         _trades = trades;
+        _botRuntime = botRuntime;
     }
 
     public async Task<StrategySignal> GetSignalAsync(
@@ -144,7 +147,8 @@ public sealed class RsiSignalAppService
         bool autoExecute,
         CancellationToken ct)
     {
-        if (!autoExecute || signal.Signal is not ("Call" or "Put"))
+        var bot = _botRuntime.Get(_currentUser.UserId);
+        if (!autoExecute || bot.State != BotRunState.Running || signal.Signal is not ("Call" or "Put"))
             return signal;
 
         var key = $"bot:rsi:{signal.Asset.Trim().ToUpperInvariant()}:{signal.CandleTime.ToUnixTimeSeconds()}:{signal.Signal}";
@@ -153,8 +157,8 @@ public sealed class RsiSignalAppService
             var trade = await _trades.PlaceTradeAsync(new PlaceTradeRequest(
                 Asset: signal.Asset,
                 Direction: signal.Signal.ToUpperInvariant(),
-                Amount: 25m,
-                DurationSeconds: 300,
+                Amount: bot.Amount,
+                DurationSeconds: bot.DurationSeconds,
                 StrategyId: "rsi"), key, ct);
             return signal with { AutomatedTradeId = trade.Id };
         }

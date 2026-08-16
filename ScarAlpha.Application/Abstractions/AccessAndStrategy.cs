@@ -68,6 +68,33 @@ public sealed record StrategyInfo(
     StrategyCatalogStatus Status,
     bool Enabled);
 
+public enum BotRunState
+{
+    Stopped,
+    Running,
+    Paused
+}
+
+public sealed record BotRuntimeConfig(
+    Guid UserId,
+    BotRunState State,
+    string? Asset,
+    decimal Amount,
+    int DurationSeconds,
+    decimal DailyProfitTarget,
+    decimal DailyLossLimit,
+    DateTimeOffset UpdatedAt);
+
+public interface IBotRuntimeService
+{
+    BotRuntimeConfig Get(Guid userId);
+    BotRuntimeConfig Start(Guid userId, string asset, decimal amount = 25m, int durationSeconds = 300, decimal dailyProfitTarget = 50m, decimal dailyLossLimit = 30m);
+    BotRuntimeConfig Pause(Guid userId);
+    BotRuntimeConfig Stop(Guid userId);
+    BotRuntimeConfig Apply(Guid userId, string? asset, decimal? amount, int? durationSeconds, decimal? dailyProfitTarget, decimal? dailyLossLimit);
+    IReadOnlyList<BotRuntimeConfig> ListKnown();
+}
+
 public interface IStrategyRegistry
 {
     IReadOnlyList<StrategyInfo> GetStrategies();

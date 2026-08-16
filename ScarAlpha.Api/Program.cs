@@ -161,6 +161,7 @@ try
     app.MapMarketEndpoints();
     app.MapAccountEndpoints();
     app.MapStrategyEndpoints();
+    app.MapBotEndpoints();
     app.MapAdminEndpoints();
     app.MapNotificationEndpoints();
     app.MapTradeEndpoints().RequireRateLimiting("trades");

@@ -58,6 +58,7 @@ public static class DependencyInjection
         services.AddSingleton<IIdempotencyGate, IdempotencyGate>();
         services.AddSingleton<IStrategyRegistry, StrategyRegistry>();
         services.AddScoped<IBotAccessService, BotAccessService>();
+        services.AddSingleton<IBotRuntimeService, BotRuntimeService>();
         services.AddScoped<IAuditService, AuditService>();
         services.AddScoped<IMarketingDemoService, MarketingDemoService>();
 
@@ -71,6 +72,7 @@ public static class DependencyInjection
         services.AddScoped<TradeAppService>();
         services.AddScoped<AdminAppService>();
         services.AddScoped<NotificationAppService>();
+        services.AddScoped<BotControlAppService>();
 
         services.AddSingleton<IBinollaCredentialAuth, NodeBinollaCredentialAuth>();
 

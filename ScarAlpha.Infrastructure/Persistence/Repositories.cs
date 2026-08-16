@@ -217,6 +217,33 @@ public sealed class TradeRepository : ITradeRepository
             .Where(x => x.Status == TradeStatus.Pending || x.Status == TradeStatus.Running)
             .ToListAsync(ct);
 
+    public async Task<(IReadOnlyList<Trade> Items, int Total)> SearchAdminAsync(
+        Guid? userId,
+        TradeStatus? status,
+        string? asset,
+        int page,
+        int pageSize,
+        CancellationToken ct = default)
+    {
+        page = Math.Max(1, page);
+        pageSize = Math.Clamp(pageSize, 1, 100);
+        var q = _db.Trades.AsQueryable();
+        if (userId is Guid uid)
+            q = q.Where(x => x.UserId == uid);
+        if (status is TradeStatus st)
+            q = q.Where(x => x.Status == st);
+        if (!string.IsNullOrWhiteSpace(asset))
+            q = q.Where(x => x.Asset == asset);
+
+        var total = await q.CountAsync(ct);
+        var items = await q
+            .OrderByDescending(x => x.CreatedAt)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync(ct);
+        return (items, total);
+    }
+
     public async Task AddAsync(Trade trade, CancellationToken ct = default)
     {
         _db.Trades.Add(trade);

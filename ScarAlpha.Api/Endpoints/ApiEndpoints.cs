@@ -220,6 +220,21 @@ public static class StrategyEndpoints
     }
 }
 
+public static class BotEndpoints
+{
+    public static RouteGroupBuilder MapBotEndpoints(this IEndpointRouteBuilder app)
+    {
+        var group = app.MapGroup("/api/bot").WithTags("Bot").RequireAuthorization();
+        group.MapGet("/status", (BotControlAppService svc) => Results.Ok(svc.Get()));
+        group.MapPost("/start", async ([FromBody] BotStartRequest request, BotControlAppService svc, CancellationToken ct) =>
+            Results.Ok(await svc.StartAsync(request, ct)));
+        group.MapPost("/pause", (BotControlAppService svc) => Results.Ok(svc.Pause()));
+        group.MapPost("/stop", (BotControlAppService svc) => Results.Ok(svc.Stop()));
+        group.MapPost("/apply", ([FromBody] BotApplyRequest request, BotControlAppService svc) => Results.Ok(svc.Apply(request)));
+        return group;
+    }
+}
+
 public static class AdminEndpoints
 {
     public static RouteGroupBuilder MapAdminEndpoints(this IEndpointRouteBuilder app)
@@ -342,6 +357,43 @@ public static class AdminEndpoints
             AdminAppService svc,
             CancellationToken ct) =>
             Results.Ok(await svc.SendNotificationsAsync(request, ct)));
+
+        var bots = app.MapGroup("/api/admin/bots")
+            .WithTags("Admin")
+            .RequireAuthorization("AdminOnly");
+
+        bots.MapGet("/", async (
+            AdminAppService svc,
+            CancellationToken ct,
+            [FromQuery] string? state = null,
+            [FromQuery] string? q = null,
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 50) =>
+            Results.Ok(await svc.ListBotsAsync(state, q, page, pageSize, ct)));
+
+        bots.MapGet("/{userId:guid}", async (Guid userId, AdminAppService svc, CancellationToken ct) =>
+            Results.Ok(await svc.GetBotAsync(userId, ct)));
+
+        bots.MapPost("/{userId:guid}/control", async (
+            Guid userId,
+            [FromBody] AdminBotControlRequest request,
+            AdminAppService svc,
+            CancellationToken ct) =>
+            Results.Ok(await svc.ControlBotAsync(userId, request, ct)));
+
+        var trades = app.MapGroup("/api/admin/trades")
+            .WithTags("Admin")
+            .RequireAuthorization("AdminOnly");
+
+        trades.MapGet("/", async (
+            AdminAppService svc,
+            CancellationToken ct,
+            [FromQuery] Guid? userId = null,
+            [FromQuery] string? status = null,
+            [FromQuery] string? asset = null,
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 50) =>
+            Results.Ok(await svc.ListTradesAsync(userId, status, asset, page, pageSize, ct)));
 
         return group;
     }

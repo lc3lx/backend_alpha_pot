@@ -19,6 +19,9 @@ public sealed class AdminAppService
     private readonly IAuditService _audit;
     private readonly INotificationWriter _notifications;
     private readonly INotificationRepository _notificationRepo;
+    private readonly IBotRuntimeService _botRuntime;
+    private readonly IBotAccessService _botAccess;
+    private readonly ITradeRepository _trades;
     private readonly ILogger<AdminAppService> _logger;
 
     public AdminAppService(
@@ -29,6 +32,9 @@ public sealed class AdminAppService
         IAuditService audit,
         INotificationWriter notifications,
         INotificationRepository notificationRepo,
+        IBotRuntimeService botRuntime,
+        IBotAccessService botAccess,
+        ITradeRepository trades,
         ILogger<AdminAppService> logger)
     {
         _currentUser = currentUser;
@@ -38,6 +44,9 @@ public sealed class AdminAppService
         _audit = audit;
         _notifications = notifications;
         _notificationRepo = notificationRepo;
+        _botRuntime = botRuntime;
+        _botAccess = botAccess;
+        _trades = trades;
         _logger = logger;
     }
 
@@ -431,6 +440,204 @@ public sealed class AdminAppService
             ActionPath: n.ActionPath,
             CreatedAt: n.CreatedAt)).ToList();
         return new AdminNotificationListResponse(items, total, page, pageSize);
+    }
+
+    public async Task<AdminBotListResponse> ListBotsAsync(
+        string? state,
+        string? q,
+        int page,
+        int pageSize,
+        CancellationToken ct)
+    {
+        await EnsureAdminAsync(ct);
+        page = Math.Max(1, page);
+        pageSize = Math.Clamp(pageSize, 1, 100);
+
+        BotRunState? stateFilter = null;
+        if (!string.IsNullOrWhiteSpace(state))
+        {
+            if (!Enum.TryParse<BotRunState>(state, ignoreCase: true, out var parsed))
+                throw new ApiException(ApiErrorCodes.ValidationError, "state must be Stopped, Running, or Paused.");
+            stateFilter = parsed;
+        }
+
+        var known = _botRuntime.ListKnown().ToDictionary(x => x.UserId);
+        var (users, _) = await _users.SearchAsync(q, role: null, isMarketingDemo: null, page: 1, pageSize: 500, ct);
+        var userMap = users.ToDictionary(x => x.Id);
+
+        foreach (var runtime in known.Values)
+        {
+            if (userMap.ContainsKey(runtime.UserId)) continue;
+            var u = await _users.GetByIdAsync(runtime.UserId, ct);
+            if (u is not null) userMap[u.Id] = u;
+        }
+
+        var rows = new List<AdminBotRuntimeDto>();
+        foreach (var user in userMap.Values)
+        {
+            var runtime = known.TryGetValue(user.Id, out var r) ? r : _botRuntime.Get(user.Id);
+            if (stateFilter is BotRunState sf && runtime.State != sf)
+                continue;
+
+            var access = await _botAccess.CheckAsync(user.Id, ct);
+            rows.Add(new AdminBotRuntimeDto(
+                UserId: user.Id.ToString(),
+                Email: user.Email,
+                FullName: user.FullName,
+                TelegramUserId: user.TelegramUserId,
+                BotAccess: access.Access.ToString(),
+                State: runtime.State.ToString(),
+                Asset: runtime.Asset,
+                Amount: runtime.Amount,
+                DurationSeconds: runtime.DurationSeconds,
+                DailyProfitTarget: runtime.DailyProfitTarget,
+                DailyLossLimit: runtime.DailyLossLimit,
+                UpdatedAt: runtime.UpdatedAt,
+                IsMarketingDemo: user.IsMarketingDemo));
+        }
+
+        rows = rows
+            .OrderByDescending(x => x.State == "Running")
+            .ThenByDescending(x => x.UpdatedAt)
+            .ToList();
+
+        var total = rows.Count;
+        var pageItems = rows.Skip((page - 1) * pageSize).Take(pageSize).ToList();
+        return new AdminBotListResponse(pageItems, total, page, pageSize);
+    }
+
+    public async Task<AdminBotRuntimeDto> GetBotAsync(Guid userId, CancellationToken ct)
+    {
+        await EnsureAdminAsync(ct);
+        var user = await _users.GetByIdAsync(userId, ct)
+                   ?? throw new ApiException(ApiErrorCodes.NotFound, "User not found.", 404);
+        var runtime = _botRuntime.Get(userId);
+        var access = await _botAccess.CheckAsync(userId, ct);
+        return new AdminBotRuntimeDto(
+            UserId: user.Id.ToString(),
+            Email: user.Email,
+            FullName: user.FullName,
+            TelegramUserId: user.TelegramUserId,
+            BotAccess: access.Access.ToString(),
+            State: runtime.State.ToString(),
+            Asset: runtime.Asset,
+            Amount: runtime.Amount,
+            DurationSeconds: runtime.DurationSeconds,
+            DailyProfitTarget: runtime.DailyProfitTarget,
+            DailyLossLimit: runtime.DailyLossLimit,
+            UpdatedAt: runtime.UpdatedAt,
+            IsMarketingDemo: user.IsMarketingDemo);
+    }
+
+    public async Task<AdminBotRuntimeDto> ControlBotAsync(
+        Guid userId,
+        AdminBotControlRequest request,
+        CancellationToken ct)
+    {
+        await EnsureAdminAsync(ct);
+        if (request is null || string.IsNullOrWhiteSpace(request.Action))
+            throw new ApiException(ApiErrorCodes.ValidationError, "action is required (start|pause|stop|apply).");
+
+        var user = await _users.GetByIdAsync(userId, ct)
+                   ?? throw new ApiException(ApiErrorCodes.NotFound, "User not found.", 404);
+
+        var action = request.Action.Trim().ToLowerInvariant();
+        var previous = _botRuntime.Get(userId).State.ToString();
+        BotRuntimeConfig next;
+
+        switch (action)
+        {
+            case "start":
+            {
+                var asset = request.Asset?.Trim();
+                if (string.IsNullOrWhiteSpace(asset))
+                    throw new ApiException(ApiErrorCodes.ValidationError, "Asset is required to start the bot.");
+                var access = await _botAccess.CheckAsync(userId, ct);
+                if (access.Access != BotAccessState.Allowed && !user.IsMarketingDemo)
+                    throw new ApiException(ApiErrorCodes.Forbidden, $"User bot access is {access.Access}.", 403);
+                next = _botRuntime.Start(
+                    userId,
+                    asset,
+                    request.Amount ?? 25m,
+                    request.DurationSeconds ?? 300,
+                    request.DailyProfitTarget ?? 50m,
+                    request.DailyLossLimit ?? 30m);
+                break;
+            }
+            case "pause":
+                next = _botRuntime.Pause(userId);
+                break;
+            case "stop":
+                next = _botRuntime.Stop(userId);
+                break;
+            case "apply":
+                next = _botRuntime.Apply(
+                    userId,
+                    request.Asset,
+                    request.Amount,
+                    request.DurationSeconds,
+                    request.DailyProfitTarget,
+                    request.DailyLossLimit);
+                break;
+            default:
+                throw new ApiException(ApiErrorCodes.ValidationError, "action must be start, pause, stop, or apply.");
+        }
+
+        await _audit.RecordAsync(
+            action: $"AdminBot_{action}",
+            actorUserId: _currentUser.UserId,
+            targetUserId: userId,
+            targetBinollaLinkId: null,
+            previousState: previous,
+            newState: next.State.ToString(),
+            detail: $"asset={next.Asset};amount={next.Amount}",
+            ct: ct);
+
+        return await GetBotAsync(userId, ct);
+    }
+
+    public async Task<AdminTradeListResponse> ListTradesAsync(
+        Guid? userId,
+        string? status,
+        string? asset,
+        int page,
+        int pageSize,
+        CancellationToken ct)
+    {
+        await EnsureAdminAsync(ct);
+        page = Math.Max(1, page);
+        pageSize = Math.Clamp(pageSize, 1, 100);
+
+        TradeStatus? statusFilter = null;
+        if (!string.IsNullOrWhiteSpace(status))
+        {
+            if (!Enum.TryParse<TradeStatus>(status, ignoreCase: true, out var parsed))
+                throw new ApiException(ApiErrorCodes.ValidationError, "Invalid trade status.");
+            statusFilter = parsed;
+        }
+
+        var (trades, total) = await _trades.SearchAdminAsync(userId, statusFilter, asset, page, pageSize, ct);
+        var items = new List<AdminTradeDto>();
+        foreach (var trade in trades)
+        {
+            var tradeUser = await _users.GetByIdAsync(trade.UserId, ct);
+            items.Add(new AdminTradeDto(
+                Id: trade.Id.ToString(),
+                UserId: trade.UserId.ToString(),
+                Email: tradeUser?.Email,
+                FullName: tradeUser?.FullName,
+                Asset: trade.Asset,
+                Direction: trade.Direction.ToString(),
+                Amount: trade.Amount,
+                Status: trade.Status.ToString(),
+                Pnl: trade.Pnl,
+                CreatedAt: trade.CreatedAt,
+                ClosedAt: trade.Status is TradeStatus.Pending or TradeStatus.Running
+                    ? null
+                    : trade.UpdatedAt));
+        }
+
+        return new AdminTradeListResponse(items, total, page, pageSize);
     }
 
     public async Task<MarketingDemoUserDto> CreateMarketingDemoUserAsync(
