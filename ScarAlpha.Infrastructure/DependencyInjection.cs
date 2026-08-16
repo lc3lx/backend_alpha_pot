@@ -115,6 +115,9 @@ public static class DependencyInjection
         services.AddSingleton<ITradeOutcomeWorker>(sp => sp.GetRequiredService<TradeOutcomeWorker>());
         services.AddHostedService(sp => sp.GetRequiredService<TradeOutcomeWorker>());
 
+        services.AddSingleton<BotSignalWorker>();
+        services.AddHostedService(sp => sp.GetRequiredService<BotSignalWorker>());
+
         services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             .AddJwtBearer();
 

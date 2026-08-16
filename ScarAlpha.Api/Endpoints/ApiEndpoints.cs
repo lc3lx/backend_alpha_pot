@@ -91,6 +91,14 @@ public static class BinollaEndpoints
             Results.Ok(await svc.LoginWithCredentialsAsync(request, ct)))
             .RequireRateLimiting("connect");
 
+        group.MapPost("/reconnect", async (BinollaAppService svc, CancellationToken ct) =>
+        {
+            var result = await svc.TryReloginFromStoredCredentialsAsync(ct);
+            return result is null
+                ? Results.Conflict(new { code = "BINOLLA_CREDENTIALS_MISSING", message = "Saved Binolla login not found. Sign in with email/password once." })
+                : Results.Ok(result);
+        }).RequireRateLimiting("connect");
+
         group.MapPost("/signup", async ([FromBody] BinollaCredentialRequest request, BinollaAppService svc, CancellationToken ct) =>
             Results.Ok(await svc.SignUpWithCredentialsAsync(request, ct)))
             .RequireRateLimiting("connect");

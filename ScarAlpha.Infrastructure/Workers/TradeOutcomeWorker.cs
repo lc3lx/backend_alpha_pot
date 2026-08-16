@@ -32,7 +32,10 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
     }
 
     public void Enqueue(Guid tradeId, Guid userId, string binollaOrderId) =>
-        _queue.Writer.TryWrite(new WorkItem(tradeId, userId, binollaOrderId));
+        Enqueue(tradeId, userId, binollaOrderId, attempt: 0);
+
+    private void Enqueue(Guid tradeId, Guid userId, string binollaOrderId, int attempt) =>
+        _queue.Writer.TryWrite(new WorkItem(tradeId, userId, binollaOrderId, attempt));
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
@@ -117,11 +120,14 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
                 }
                 else
                 {
-                    // Honest limitation: cannot query Binolla for historical order result after process death.
-                    await ApplyStatusAsync(trades, trade, TradeStatus.Unknown, null, "RECOVERY_NO_SESSION", ct);
-                    _logger.LogWarning(
-                        "Recovery: trade {TradeId} user={UserId} order={BinollaOrderId} marked Unknown — no live session and no Binolla order query API",
-                        trade.Id, trade.UserId, trade.BinollaOrderId);
+                    // Leave Unknown/Failed as-is; only demote live open trades.
+                    if (trade.Status is TradeStatus.Pending or TradeStatus.Running)
+                    {
+                        await ApplyStatusAsync(trades, trade, TradeStatus.Unknown, null, "RECOVERY_NO_SESSION", ct);
+                        _logger.LogWarning(
+                            "Recovery: trade {TradeId} user={UserId} order={BinollaOrderId} marked Unknown — no live session and no Binolla order query API",
+                            trade.Id, trade.UserId, trade.BinollaOrderId);
+                    }
                 }
             }
         }
@@ -156,7 +162,7 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
             await using var orphanScope = _scopeFactory.CreateAsyncScope();
             var orphanTrades = orphanScope.ServiceProvider.GetRequiredService<ITradeRepository>();
             var orphan = await orphanTrades.GetByIdAsync(item.TradeId, item.UserId, ct);
-            if (orphan is not null && !TradeStateMachine.IsTerminal(orphan.Status))
+            if (orphan is not null && !TradeStateMachine.IsHardTerminal(orphan.Status))
             {
                 await ApplyStatusAsync(orphanTrades, orphan, TradeStatus.Unknown, null, "NO_SESSION_FOR_OUTCOME", ct);
                 // #region agent log
@@ -172,29 +178,29 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
             return;
         }
 
-        // Load duration before waiting so 5m (etc.) trades are not cut by a fixed 5m timeout.
         int durationSeconds = 60;
+        DateTimeOffset createdAt = DateTimeOffset.UtcNow;
         await using (var prepScope = _scopeFactory.CreateAsyncScope())
         {
             var prepTrades = prepScope.ServiceProvider.GetRequiredService<ITradeRepository>();
             var prepTrade = await prepTrades.GetByIdAsync(item.TradeId, item.UserId, ct);
             if (prepTrade is null) return;
-            if (TradeStateMachine.IsTerminal(prepTrade.Status))
+            if (TradeStateMachine.IsHardTerminal(prepTrade.Status))
             {
                 _logger.LogInformation(
-                    "Outcome ignored (already terminal) trade={TradeId} status={Status}",
+                    "Outcome ignored (already final) trade={TradeId} status={Status}",
                     prepTrade.Id, prepTrade.Status);
                 return;
             }
             durationSeconds = prepTrade.DurationSeconds > 0 ? prepTrade.DurationSeconds : 60;
+            createdAt = prepTrade.CreatedAt;
         }
 
-        // Close arrives at ~duration; add buffer for WS lag. Also honor configured floor.
         var waitBudget = TimeSpan.FromSeconds(Math.Clamp(durationSeconds, 5, 3600) + 120);
         if (waitBudget < TimeSpan.FromMinutes(15))
             waitBudget = TimeSpan.FromMinutes(15);
 
-        TradeOutcome outcome;
+        TradeOutcome? outcome = null;
         try
         {
             // #region agent log
@@ -206,7 +212,8 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
                 {
                     tradeId = item.TradeId.ToString("N"),
                     durationSeconds,
-                    waitSec = waitBudget.TotalSeconds
+                    waitSec = waitBudget.TotalSeconds,
+                    attempt = item.Attempt
                 });
             // #endregion
             outcome = await client.WaitOutcomeAsync(item.BinollaOrderId, waitBudget, ct);
@@ -214,45 +221,98 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "WaitOutcome failed for trade {TradeId}", item.TradeId);
-            await using var failScope = _scopeFactory.CreateAsyncScope();
-            var failTrades = failScope.ServiceProvider.GetRequiredService<ITradeRepository>();
-            var failTrade = await failTrades.GetByIdAsync(item.TradeId, item.UserId, ct);
-            if (failTrade is not null && !TradeStateMachine.IsTerminal(failTrade.Status))
+
+            // Close may already be buffered — peek cache once.
+            if (ex is BinollaTimeoutException)
             {
-                // Timeout/connection: Unknown (not Failed-as-loss) so UI does not show a false loss.
-                var nextFail = ex is BinollaTimeoutException ? TradeStatus.Unknown : TradeStatus.Failed;
-                var code = ex is BinollaTimeoutException ? "OUTCOME_TIMEOUT" : "BINOLLA_CONNECTION_FAILED";
-                await ApplyStatusAsync(failTrades, failTrade, nextFail, null, code, ct);
-                // #region agent log
-                ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-                    "H1",
-                    "TradeOutcomeWorker.ProcessAsync",
-                    "wait_failed",
-                    new
-                    {
-                        tradeId = item.TradeId.ToString("N"),
-                        err = ex.GetType().Name,
-                        next = nextFail.ToString(),
-                        durationSeconds
-                    });
-                // #endregion
+                try
+                {
+                    outcome = await client.WaitOutcomeAsync(
+                        item.BinollaOrderId, TimeSpan.FromSeconds(3), ct);
+                }
+                catch
+                {
+                    outcome = null;
+                }
             }
-            return;
+
+            if (outcome is null)
+            {
+                await using var failScope = _scopeFactory.CreateAsyncScope();
+                var failTrades = failScope.ServiceProvider.GetRequiredService<ITradeRepository>();
+                var failTrade = await failTrades.GetByIdAsync(item.TradeId, item.UserId, ct);
+                if (failTrade is null || TradeStateMachine.IsHardTerminal(failTrade.Status))
+                    return;
+
+                var deadline = createdAt.AddSeconds(durationSeconds + 900);
+                var canRetry = DateTimeOffset.UtcNow < deadline && item.Attempt < 4;
+                if (ex is BinollaTimeoutException && canRetry)
+                {
+                    if (failTrade.Status == TradeStatus.Unknown)
+                        await ApplyStatusAsync(failTrades, failTrade, TradeStatus.Running, null, null, ct);
+                    // #region agent log
+                    ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                        "H1",
+                        "TradeOutcomeWorker.ProcessAsync",
+                        "wait_retry",
+                        new
+                        {
+                            tradeId = item.TradeId.ToString("N"),
+                            attempt = item.Attempt + 1,
+                            deadlineUtc = deadline.ToUnixTimeSeconds()
+                        });
+                    // #endregion
+                    Enqueue(item.TradeId, item.UserId, item.BinollaOrderId, item.Attempt + 1);
+                    return;
+                }
+
+                if (!TradeStateMachine.IsHardTerminal(failTrade.Status))
+                {
+                    var nextFail = ex is BinollaTimeoutException ? TradeStatus.Unknown : TradeStatus.Failed;
+                    var code = ex is BinollaTimeoutException ? "OUTCOME_TIMEOUT" : "BINOLLA_CONNECTION_FAILED";
+                    await ApplyStatusAsync(failTrades, failTrade, nextFail, null, code, ct);
+                    // #region agent log
+                    ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                        "H1",
+                        "TradeOutcomeWorker.ProcessAsync",
+                        "wait_failed",
+                        new
+                        {
+                            tradeId = item.TradeId.ToString("N"),
+                            err = ex.GetType().Name,
+                            next = nextFail.ToString(),
+                            durationSeconds
+                        });
+                    // #endregion
+                }
+                return;
+            }
         }
 
+        await SettleAsync(item, outcome, durationSeconds, sw, ct);
+    }
+
+    private async Task SettleAsync(
+        WorkItem item,
+        TradeOutcome outcome,
+        int durationSeconds,
+        System.Diagnostics.Stopwatch sw,
+        CancellationToken ct)
+    {
         await using var scope = _scopeFactory.CreateAsyncScope();
         var trades = scope.ServiceProvider.GetRequiredService<ITradeRepository>();
         var trade = await trades.GetByIdAsync(item.TradeId, item.UserId, ct);
         if (trade is null) return;
 
-        if (TradeStateMachine.IsTerminal(trade.Status))
+        if (TradeStateMachine.IsHardTerminal(trade.Status))
         {
             _logger.LogInformation(
-                "Outcome ignored (already terminal) trade={TradeId} status={Status}",
+                "Outcome ignored (already final) trade={TradeId} status={Status}",
                 trade.Id, trade.Status);
             return;
         }
 
+        var prior = trade.Status;
         var next = outcome.Result switch
         {
             TradeResult.Win => TradeStatus.Profit,
@@ -261,12 +321,12 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
             _ => TradeStatus.Unknown
         };
 
-        await ApplyStatusAsync(trades, trade, next, outcome.ProfitLoss, null, ct);
+        await ApplyStatusAsync(trades, trade, next, outcome.ProfitLoss, null, ct, finalOutcome: true);
 
         // #region agent log
         ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
             "H1+H5",
-            "TradeOutcomeWorker.ProcessAsync",
+            "TradeOutcomeWorker.SettleAsync",
             "settled",
             new
             {
@@ -274,6 +334,7 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
                 result = outcome.Result.ToString(),
                 pnl = outcome.ProfitLoss,
                 next = next.ToString(),
+                prior = prior.ToString(),
                 durationSeconds,
                 elapsedMs = sw.ElapsedMilliseconds
             });
@@ -308,20 +369,35 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
         TradeStatus next,
         decimal? pnl,
         string? errorCode,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool finalOutcome = false)
     {
         var status = trade.Status;
-        if (!TradeStateMachine.TryTransition(ref status, next))
+        var applied = finalOutcome && next is TradeStatus.Profit or TradeStatus.Loss or TradeStatus.Tie
+            ? TradeStateMachine.TryApplyFinalOutcome(ref status, next)
+            : next == TradeStatus.Running && status == TradeStatus.Unknown
+                ? ApplyUnknownToRunning(ref status)
+                : TradeStateMachine.TryTransition(ref status, next);
+        if (!applied)
             return;
 
         trade.Status = status;
         if (pnl.HasValue) trade.Pnl = pnl;
         if (errorCode is not null) trade.ErrorCode = errorCode;
+        else if (next is TradeStatus.Profit or TradeStatus.Loss or TradeStatus.Tie)
+            trade.ErrorCode = null;
         trade.UpdatedAt = DateTimeOffset.UtcNow;
         await trades.UpdateAsync(trade, ct);
     }
 
-    private sealed record WorkItem(Guid TradeId, Guid UserId, string BinollaOrderId);
+    private static bool ApplyUnknownToRunning(ref TradeStatus status)
+    {
+        if (status != TradeStatus.Unknown) return false;
+        status = TradeStatus.Running;
+        return true;
+    }
+
+    private sealed record WorkItem(Guid TradeId, Guid UserId, string BinollaOrderId, int Attempt);
 
     private sealed class ChannelWorkQueue
     {

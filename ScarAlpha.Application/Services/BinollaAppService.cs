@@ -100,6 +100,7 @@ public sealed class BinollaAppService
                     new BinollaConnectRequest(captured.SsidFrame, request.AccountType),
                     workCt,
                     captured.CookieHeader);
+                await PersistBinollaCredentialsAsync(request.Email, request.Password, workCt);
                 // #region agent log
                 ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H100", "BinollaAppService.LoginWithCredentialsAsync", "login_ok", new
                 {
@@ -189,10 +190,12 @@ public sealed class BinollaAppService
                 400);
         }
 
-        return await ConnectAsync(
+        var connected = await ConnectAsync(
             new BinollaConnectRequest(captured.SsidFrame, request.AccountType),
             ct,
             captured.CookieHeader);
+        await PersistBinollaCredentialsAsync(request.Email, request.Password, ct);
+        return connected;
     }
 
     private static void ValidateCredentialRequest(BinollaCredentialRequest request)
@@ -539,6 +542,68 @@ public sealed class BinollaAppService
             link.Status = BinollaLinkStatus.Disconnected;
             link.UpdatedAt = DateTimeOffset.UtcNow;
             await _links.UpsertAsync(link, ct);
+        }
+    }
+
+    /// <summary>
+    /// Silent re-login using encrypted Binolla email/password saved on the link.
+    /// Used when SSID/session expires so the user is not forced to type credentials again.
+    /// </summary>
+    public async Task<BinollaConnectResponse?> TryReloginFromStoredCredentialsAsync(CancellationToken ct)
+    {
+        await EnsureNotMarketingDemoAsync(ct);
+        var userId = _currentUser.UserId;
+        var link = await _links.GetByUserIdAsync(userId, ct);
+        if (link is null ||
+            string.IsNullOrWhiteSpace(link.EncryptedBinollaEmail) ||
+            string.IsNullOrWhiteSpace(link.EncryptedBinollaPassword))
+        {
+            return null;
+        }
+
+        string email;
+        string password;
+        try
+        {
+            email = _protector.Decrypt(link.EncryptedBinollaEmail);
+            password = _protector.Decrypt(link.EncryptedBinollaPassword);
+        }
+        catch
+        {
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(password))
+            return null;
+
+        _restorer.ClearAuthFailure(userId);
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+            "BR1",
+            "BinollaAppService.TryReloginFromStoredCredentialsAsync",
+            "relogin_start",
+            new { hasEmail = email.Length > 0 });
+        // #endregion
+
+        return await LoginWithCredentialsAsync(
+            new BinollaCredentialRequest(email, password, link.AccountType.ToString()),
+            ct);
+    }
+
+    private async Task PersistBinollaCredentialsAsync(string email, string password, CancellationToken ct)
+    {
+        var link = await _links.GetByUserIdAsync(_currentUser.UserId, ct);
+        if (link is null) return;
+        try
+        {
+            link.EncryptedBinollaEmail = _protector.Encrypt(email.Trim());
+            link.EncryptedBinollaPassword = _protector.Encrypt(password);
+            link.UpdatedAt = DateTimeOffset.UtcNow;
+            await _links.UpsertAsync(link, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to persist Binolla credentials for user {UserId}", _currentUser.UserId);
         }
     }
 

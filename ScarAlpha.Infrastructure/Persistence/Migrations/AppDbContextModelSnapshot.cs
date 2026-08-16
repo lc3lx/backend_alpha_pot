@@ -102,6 +102,12 @@ namespace ScarAlpha.Infrastructure.Persistence.Migrations
                     b.Property<string>("EncryptedCookieHeader")
                         .HasColumnType("text");
 
+                    b.Property<string>("EncryptedBinollaEmail")
+                        .HasColumnType("text");
+
+                    b.Property<string>("EncryptedBinollaPassword")
+                        .HasColumnType("text");
+
                     b.Property<DateTimeOffset?>("LastConnectedAt")
                         .HasColumnType("timestamp with time zone");
 

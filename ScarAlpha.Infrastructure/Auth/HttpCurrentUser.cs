@@ -16,6 +16,9 @@ public sealed class HttpCurrentUser : ICurrentUser
     {
         get
         {
+            if (AmbientUserContext.OverrideUserId is Guid ambient)
+                return ambient;
+
             var sub = _http.HttpContext?.User?.FindFirstValue(ClaimTypes.NameIdentifier)
                       ?? _http.HttpContext?.User?.FindFirstValue("sub");
             if (Guid.TryParse(sub, out var id))

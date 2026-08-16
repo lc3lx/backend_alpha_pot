@@ -38,6 +38,10 @@ public class BinollaLink
     public string EncryptedSsid { get; set; } = string.Empty;
     /// <summary>Optional Playwright cookies (encrypted) — required for reliable WS restore after API restart.</summary>
     public string? EncryptedCookieHeader { get; set; }
+    /// <summary>Encrypted Binolla login email for silent re-auth when SSID expires.</summary>
+    public string? EncryptedBinollaEmail { get; set; }
+    /// <summary>Encrypted Binolla login password for silent re-auth when SSID expires.</summary>
+    public string? EncryptedBinollaPassword { get; set; }
     public string? BinollaAccountIdentifier { get; set; }
     public BinollaAccountType AccountType { get; set; } = BinollaAccountType.Demo;
     public BinollaLinkStatus Status { get; set; } = BinollaLinkStatus.Disconnected;

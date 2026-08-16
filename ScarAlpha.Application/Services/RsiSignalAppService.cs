@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Threading;
 using ScarAlpha.Application.Abstractions;
 using ScarAlpha.Application.Common;
 using ScarAlpha.Application.Contracts;
@@ -151,7 +153,8 @@ public sealed class RsiSignalAppService
         bool autoExecute,
         CancellationToken ct)
     {
-        var bot = _botRuntime.Get(_currentUser.UserId);
+        var userId = _currentUser.UserId;
+        var bot = _botRuntime.Get(userId);
         if (!autoExecute || bot.State != BotRunState.Running || signal.Signal is not ("Call" or "Put"))
             return signal;
 
@@ -162,26 +165,70 @@ public sealed class RsiSignalAppService
         var dailyLimit = await GetReachedDailyLimitAsync(bot, ct);
         if (dailyLimit is not null)
         {
-            _botRuntime.Stop(_currentUser.UserId);
+            _botRuntime.Stop(userId);
             return signal with { AutomationError = dailyLimit };
         }
 
-        var key = $"bot:rsi:{signal.Asset.Trim().ToUpperInvariant()}:{signal.CandleTime.ToUnixTimeSeconds()}:{signal.Signal}";
+        // One open trade at a time — never stack 2+ concurrent bot trades.
+        var openCount = await _tradeRepository.CountByUserAsync(
+            userId, TradeStatus.Running, ct: ct);
+        var pendingCount = await _tradeRepository.CountByUserAsync(
+            userId, TradeStatus.Pending, ct: ct);
+        if (openCount + pendingCount > 0)
+        {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                "OT1",
+                "RsiSignalAppService.ExecuteIfRequestedAsync",
+                "skip_open_trade_exists",
+                new { openCount, pendingCount, asset = signal.Asset });
+            // #endregion
+            return signal with { AutomationError = "OPEN_TRADE_EXISTS" };
+        }
+
+        var gate = await _autoTradeGates.GetOrAdd(userId, _ => new SemaphoreSlim(1, 1))
+            .WaitAsync(0, ct);
+        if (!gate)
+            return signal with { AutomationError = "AUTO_TRADE_BUSY" };
+
         try
         {
-            var trade = await _trades.PlaceTradeAsync(new PlaceTradeRequest(
-                Asset: signal.Asset,
-                Direction: signal.Signal.ToUpperInvariant(),
-                Amount: bot.Amount,
-                DurationSeconds: bot.DurationSeconds,
-                StrategyId: "rsi"), key, ct);
-            return signal with { AutomatedTradeId = trade.Id };
+            openCount = await _tradeRepository.CountByUserAsync(userId, TradeStatus.Running, ct: ct);
+            pendingCount = await _tradeRepository.CountByUserAsync(userId, TradeStatus.Pending, ct: ct);
+            if (openCount + pendingCount > 0)
+                return signal with { AutomationError = "OPEN_TRADE_EXISTS" };
+
+            var key = $"bot:rsi:{signal.Asset.Trim().ToUpperInvariant()}:{signal.CandleTime.ToUnixTimeSeconds()}:{signal.Signal}";
+            try
+            {
+                var trade = await _trades.PlaceTradeAsync(new PlaceTradeRequest(
+                    Asset: signal.Asset,
+                    Direction: signal.Signal.ToUpperInvariant(),
+                    Amount: bot.Amount,
+                    DurationSeconds: bot.DurationSeconds,
+                    StrategyId: "rsi"), key, ct);
+                // #region agent log
+                ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                    "OT1",
+                    "RsiSignalAppService.ExecuteIfRequestedAsync",
+                    "placed_one_trade",
+                    new { tradeId = trade.Id.ToString("N")[..8], asset = signal.Asset, signal = signal.Signal });
+                // #endregion
+                return signal with { AutomatedTradeId = trade.Id };
+            }
+            catch (ApiException ex)
+            {
+                return signal with { AutomationError = ex.Code };
+            }
         }
-        catch (ApiException ex)
+        finally
         {
-            return signal with { AutomationError = ex.Code };
+            if (_autoTradeGates.TryGetValue(userId, out var sem))
+                sem.Release();
         }
     }
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, SemaphoreSlim> _autoTradeGates = new();
 
     private async Task<string?> GetReachedDailyLimitAsync(BotRuntimeConfig bot, CancellationToken ct)
     {

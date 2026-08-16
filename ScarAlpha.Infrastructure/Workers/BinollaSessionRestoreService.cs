@@ -4,6 +4,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using ScarAlpha.Application.Abstractions;
+using ScarAlpha.Application.Services;
 using ScarAlpha.Binolla.Abstractions;
 using ScarAlpha.Binolla.Models;
 using ScarAlpha.Binolla.Session;
@@ -355,13 +356,22 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                 }
                 catch (BinollaAuthenticationException ex)
                 {
-                    // Expired / invalid SSID — do not retry storm; mark and skip.
-                    _authFailed[userId] = 1;
-                    _retryAfterUtc.TryRemove(userId, out _);
+                    // Expired / invalid SSID — try silent credential re-login when stored.
                     _logger.LogWarning(
                         ex,
-                        "Session restore: authentication failed for user {UserId} link={LinkId} (SSID invalid/expired); skipping further attempts",
+                        "Session restore: authentication failed for user {UserId} link={LinkId}; trying stored credentials",
                         userId, linkId);
+
+                    var relogged = await TryCredentialReloginAsync(userId, CancellationToken.None).ConfigureAwait(false);
+                    if (relogged)
+                    {
+                        _authFailed.TryRemove(userId, out _);
+                        _retryAfterUtc.TryRemove(userId, out _);
+                        return true;
+                    }
+
+                    _authFailed[userId] = 1;
+                    _retryAfterUtc.TryRemove(userId, out _);
                     await MarkLinkDisconnectedAsync(userId, "SSID_EXPIRED", CancellationToken.None).ConfigureAwait(false);
                     return false;
                 }
@@ -408,6 +418,34 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
         {
             userGate.Release();
             // Avoid retaining plaintext beyond this method.
+        }
+    }
+
+    private async Task<bool> TryCredentialReloginAsync(Guid userId, CancellationToken ct)
+    {
+        try
+        {
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var binolla = scope.ServiceProvider.GetRequiredService<BinollaAppService>();
+            using (AmbientUserContext.Use(userId))
+            {
+                _authFailed.TryRemove(userId, out _);
+                var result = await binolla.TryReloginFromStoredCredentialsAsync(ct).ConfigureAwait(false);
+                var ok = result is { Connected: true };
+                // #region agent log
+                ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                    "BR1",
+                    "BinollaSessionRestoreService.TryCredentialReloginAsync",
+                    ok ? "relogin_ok" : "relogin_skip",
+                    new { userId = userId.ToString("N")[..8] });
+                // #endregion
+                return ok;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Stored-credential relogin failed for user {UserId}", userId);
+            return false;
         }
     }
 

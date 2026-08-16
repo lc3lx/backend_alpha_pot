@@ -214,7 +214,11 @@ public sealed class TradeRepository : ITradeRepository
 
     public async Task<IReadOnlyList<Trade>> ListOpenTradesAsync(CancellationToken ct = default) =>
         await _db.Trades
-            .Where(x => x.Status == TradeStatus.Pending || x.Status == TradeStatus.Running)
+            .Where(x =>
+                x.Status == TradeStatus.Pending ||
+                x.Status == TradeStatus.Running ||
+                x.Status == TradeStatus.Unknown ||
+                x.Status == TradeStatus.Failed)
             .ToListAsync(ct);
 
     public async Task<(IReadOnlyList<Trade> Items, int Total)> SearchAdminAsync(
