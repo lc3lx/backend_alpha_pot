@@ -1,5 +1,6 @@
 using ScarAlpha.Application.Abstractions;
 using ScarAlpha.Application.Common;
+using ScarAlpha.Application.Contracts;
 using ScarAlpha.Binolla.Abstractions;
 using ScarAlpha.Binolla.Models;
 using ScarAlpha.Binolla.Protocol;
@@ -14,6 +15,7 @@ public sealed class RsiSignalAppService
     private readonly IRsiSignalService _signalService;
     private readonly IBinollaSessionRestorer _restorer;
     private readonly IMarketingDemoService _demo;
+    private readonly TradeAppService _trades;
 
     public RsiSignalAppService(
         ICurrentUser currentUser,
@@ -21,7 +23,8 @@ public sealed class RsiSignalAppService
         IBotAccessService botAccess,
         IRsiSignalService signalService,
         IBinollaSessionRestorer restorer,
-        IMarketingDemoService demo)
+        IMarketingDemoService demo,
+        TradeAppService trades)
     {
         _currentUser = currentUser;
         _sessions = sessions;
@@ -29,20 +32,23 @@ public sealed class RsiSignalAppService
         _signalService = signalService;
         _restorer = restorer;
         _demo = demo;
+        _trades = trades;
     }
 
     public async Task<StrategySignal> GetSignalAsync(
         string asset,
         int periodSeconds,
+        RsiStrategyOptions options,
+        bool autoExecute,
         CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(asset))
             throw new ApiException(ApiErrorCodes.ValidationError, "asset is required.");
-        if (periodSeconds is < 1 or > 14400)
-            throw new ApiException(ApiErrorCodes.ValidationError, "period must be between 1 and 14400 seconds.");
+        if (periodSeconds != 60)
+            throw new ApiException(ApiErrorCodes.ValidationError, "RSI Smart Backtest only supports the 1-minute timeframe.");
 
         if (await _demo.IsMarketingDemoAsync(_currentUser.UserId, ct))
-            return _demo.BuildRsiSignal(asset, periodSeconds);
+            return await ExecuteIfRequestedAsync(_demo.BuildRsiSignal(asset, periodSeconds), autoExecute, ct);
 
         var access = await _botAccess.CheckAsync(_currentUser.UserId, ct);
         AccountAppService.EnsureConnectedForMarket(access);
@@ -80,14 +86,14 @@ public sealed class RsiSignalAppService
             if (candles.Count == 0)
                 return SoftNone(symbol, wirePeriod);
 
-            var options = RsiStrategyOptions.Default60Seconds with { TimeframeSeconds = wirePeriod };
-            return await _signalService.GetSignalAsync(
+            var signal = await _signalService.GetSignalAsync(
                 userId: _currentUser.UserId,
                 asset: symbol,
                 candles: candles,
                 options: options,
                 now: DateTimeOffset.UtcNow,
                 ct: ct);
+            return await ExecuteIfRequestedAsync(signal, autoExecute, ct);
         }
         catch (BinollaAuthenticationException)
         {
@@ -132,6 +138,31 @@ public sealed class RsiSignalAppService
             Rsi: 0m,
             CandleTime: DateTimeOffset.UtcNow,
             Timeframe: periodSeconds.ToString());
+
+    private async Task<StrategySignal> ExecuteIfRequestedAsync(
+        StrategySignal signal,
+        bool autoExecute,
+        CancellationToken ct)
+    {
+        if (!autoExecute || signal.Signal is not ("Call" or "Put"))
+            return signal;
+
+        var key = $"bot:rsi:{signal.Asset.Trim().ToUpperInvariant()}:{signal.CandleTime.ToUnixTimeSeconds()}:{signal.Signal}";
+        try
+        {
+            var trade = await _trades.PlaceTradeAsync(new PlaceTradeRequest(
+                Asset: signal.Asset,
+                Direction: signal.Signal.ToUpperInvariant(),
+                Amount: 25m,
+                DurationSeconds: 300,
+                StrategyId: "rsi"), key, ct);
+            return signal with { AutomatedTradeId = trade.Id };
+        }
+        catch (ApiException ex)
+        {
+            return signal with { AutomationError = ex.Code };
+        }
+    }
 
     private Task<IBinollaClient?> EnsureLiveClientAsync(CancellationToken ct)
     {

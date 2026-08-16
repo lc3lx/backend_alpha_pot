@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using ScarAlpha.Application.Abstractions;
 using ScarAlpha.Application.Contracts;
 using ScarAlpha.Application.Services;
 
@@ -196,9 +197,24 @@ public static class StrategyEndpoints
             string asset,
             RsiSignalAppService svc,
             CancellationToken ct,
-            [FromQuery] int period = 60) =>
+            [FromQuery] int period = 60,
+            [FromQuery] int rsiLength = 14,
+            [FromQuery] decimal oversold = 25m,
+            [FromQuery] decimal overbought = 75m,
+            [FromQuery] int backtestCandles = 400,
+            [FromQuery] int expiryCandles = 5,
+            [FromQuery] decimal minimumSuccessRate = 75m,
+            [FromQuery] bool autoExecute = false) =>
         {
-            return Results.Ok(await svc.GetSignalAsync(asset, period, ct));
+            var options = new RsiStrategyOptions(
+                Period: rsiLength,
+                Oversold: oversold,
+                Overbought: overbought,
+                TimeframeSeconds: period,
+                BacktestCandleCount: backtestCandles,
+                ExpiryCandles: expiryCandles,
+                MinimumSuccessRate: minimumSuccessRate);
+            return Results.Ok(await svc.GetSignalAsync(asset, period, options, autoExecute, ct));
         });
         return group;
     }

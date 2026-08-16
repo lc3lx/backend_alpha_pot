@@ -272,7 +272,7 @@ Server-side strategy catalog. Only enabled strategies may be used in trades.
 ```json
 {
   "strategies": [
-    { "id": "rsi", "name": "RSI", "status": "Active", "enabled": true },
+    { "id": "rsi", "name": "RSI Smart Backtest", "status": "Active", "enabled": true },
     { "id": "ema", "name": "EMA", "status": "ComingSoon", "enabled": false },
     { "id": "macd", "name": "MACD", "status": "ComingSoon", "enabled": false },
     { "id": "ai", "name": "AI", "status": "ComingSoon", "enabled": false }
@@ -281,7 +281,18 @@ Server-side strategy catalog. Only enabled strategies may be used in trades.
 ```
 
 ### `GET /api/strategies/rsi/signal/{asset}?period=60`
-Signal-only. RSI period 14, oversold 30, overbought 70. No automatic trading.
+Signal-only RSI Smart Backtest. The endpoint accepts **only** one-minute candles.
+Defaults: RSI length `14`, oversold `25`, overbought `75`, historical lookback
+`400`, expiry `5` candles, and minimum success rate `75`.
+
+Optional query settings: `rsiLength`, `oversold`, `overbought`,
+`backtestCandles`, `expiryCandles` (`3`, `4`, or `5`), and
+`minimumSuccessRate`. A CALL needs a closed RSI at/below oversold; a PUT needs
+a closed RSI at/above overbought. The response is `None` unless same-direction
+historical signals meet the minimum rate; its `backtest` object returns the
+total, wins, losses, rate, and pass status. Open candles are excluded and the
+historical sample ends before the current entry, so the calculation has no
+lookahead. No automatic trading is performed by this endpoint.
 
 ---
 

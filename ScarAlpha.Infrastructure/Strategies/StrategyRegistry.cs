@@ -6,7 +6,7 @@ public sealed class StrategyRegistry : IStrategyRegistry
 {
     private static readonly IReadOnlyList<StrategyInfo> Catalog =
     [
-        new("rsi", "RSI", StrategyCatalogStatus.Active, Enabled: true),
+        new("rsi", "RSI Smart Backtest", StrategyCatalogStatus.Active, Enabled: true),
         new("ema", "EMA", StrategyCatalogStatus.ComingSoon, Enabled: false),
         new("macd", "MACD", StrategyCatalogStatus.ComingSoon, Enabled: false),
         new("ai", "AI", StrategyCatalogStatus.ComingSoon, Enabled: false)

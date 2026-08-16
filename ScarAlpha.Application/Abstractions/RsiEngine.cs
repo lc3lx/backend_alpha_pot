@@ -13,10 +13,13 @@ public sealed record RsiStrategyOptions(
     int Period,
     decimal Oversold,
     decimal Overbought,
-    int TimeframeSeconds)
+    int TimeframeSeconds,
+    int BacktestCandleCount = 400,
+    int ExpiryCandles = 5,
+    decimal MinimumSuccessRate = 75m)
 {
     public static RsiStrategyOptions Default60Seconds =>
-        new(Period: 14, Oversold: 30m, Overbought: 70m, TimeframeSeconds: 60);
+        new(Period: 14, Oversold: 25m, Overbought: 75m, TimeframeSeconds: 60);
 }
 
 public sealed record RsiCandle(
@@ -24,16 +27,27 @@ public sealed record RsiCandle(
     decimal Close,
     DateTimeOffset? EndTimestamp);
 
-/// <summary>
-/// Server-computed strategy signal snapshot (no automatic trading in Phase 5).
-/// </summary>
+public sealed record RsiBacktestStats(
+    int TotalSignals,
+    int SuccessfulSignals,
+    int FailedSignals,
+    decimal SuccessRate,
+    int LookbackCandles,
+    int ExpiryCandles,
+    decimal MinimumSuccessRate,
+    bool Passed);
+
+/// <summary>Server-computed, closed-candle RSI strategy signal snapshot.</summary>
 public sealed record StrategySignal(
     string StrategyId,
     string Asset,
     string Signal,
     decimal Rsi,
     DateTimeOffset CandleTime,
-    string Timeframe);
+    string Timeframe,
+    RsiBacktestStats? Backtest = null,
+    string? AutomatedTradeId = null,
+    string? AutomationError = null);
 
 public interface IRsiCalculator
 {
@@ -47,10 +61,10 @@ public interface IRsiCalculator
 public interface IRsiSignalService
 {
     /// <summary>
-    /// Computes RSI crossing signal for the latest closed candle.
-    /// - Closed candles only (based on EndTimestamp when available)
-    /// - Crossing logic: oversold(<=30) to above(>30) => CALL, overbought(>=70) to below(<70) => PUT
-    /// - No repeat signal for the same candleTime
+    /// Computes an RSI signal on the latest closed 1-minute candle only.
+    /// A CALL requires RSI <= Oversold and a PUT requires RSI >= Overbought.
+    /// The current signal is emitted only after the same-direction historical
+    /// backtest meets the configured success rate; no open-candle data is used.
     /// </summary>
     Task<StrategySignal> GetSignalAsync(
         Guid userId,

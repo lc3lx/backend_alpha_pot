@@ -29,29 +29,27 @@ public sealed class RsiSignalService : IRsiSignalService
         if (candles is null)
             throw new ArgumentNullException(nameof(candles));
 
+        ValidateOptions(options);
+
         var closed = candles
             .Where(c => c.EndTimestamp is null || c.EndTimestamp <= now)
             .OrderBy(c => c.Timestamp)
             .ToList();
 
-        // Need at least (period + 2) closes: current RSI uses `period + 1`,
-        // previous RSI uses `period + 1` too, shifted by one candle.
-        if (closed.Count < options.Period + 2)
-            throw new ApiException(ApiErrorCodes.ValidationError, "Insufficient candles for RSI signal.");
+        // One current candle, a completed expiry window for at least one
+        // historical entry, and enough closes for Wilder RSI.
+        if (closed.Count < options.Period + options.ExpiryCandles + 2)
+            throw new ApiException(ApiErrorCodes.ValidationError, "Insufficient closed candles for RSI backtest.");
 
         var currentCandle = closed[^1];
-        var previousCandle = closed[^2];
-
         var closes = closed.Select(c => c.Close).ToList();
-        var prevRsi = _calculator.CalculateRsi(closes.Take(closed.Count - 1).ToList(), options);
         var currentRsi = _calculator.CalculateRsi(closes, options);
 
-        // Crossing logic (no new signals unless crossing threshold boundaries).
-        var call = previousCandle is not null && prevRsi <= options.Oversold && currentRsi > options.Oversold;
-        var put = previousCandle is not null && prevRsi >= options.Overbought && currentRsi < options.Overbought;
-
-        var signalType = call ? RsiSignalType.Call :
-            put ? RsiSignalType.Put :
+        // The candle must CLOSE inside the relevant RSI extreme. Touching the
+        // level intra-candle is never visible here because open candles were
+        // removed above.
+        var signalType = currentRsi <= options.Oversold ? RsiSignalType.Call :
+            currentRsi >= options.Overbought ? RsiSignalType.Put :
             RsiSignalType.None;
 
         var roundedRsi = Math.Round(currentRsi, 2, MidpointRounding.AwayFromZero);
@@ -68,6 +66,19 @@ public sealed class RsiSignalService : IRsiSignalService
                 Timeframe: timeframe));
         }
 
+        var backtest = EvaluateBacktest(closes, signalType, options);
+        if (!backtest.Passed)
+        {
+            return Task.FromResult(new StrategySignal(
+                StrategyId: "rsi",
+                Asset: asset.Trim(),
+                Signal: "None",
+                Rsi: roundedRsi,
+                CandleTime: currentCandle.Timestamp,
+                Timeframe: timeframe,
+                Backtest: backtest));
+        }
+
         var key = $"{userId:N}:{asset.Trim().ToUpperInvariant()}:{options.TimeframeSeconds}";
         if (_lastNonNoneSignalCandleTime.TryGetValue(key, out var lastTime) &&
             lastTime == currentCandle.Timestamp)
@@ -79,7 +90,8 @@ public sealed class RsiSignalService : IRsiSignalService
                 Signal: "None",
                 Rsi: roundedRsi,
                 CandleTime: currentCandle.Timestamp,
-                Timeframe: timeframe));
+                Timeframe: timeframe,
+                Backtest: backtest));
         }
 
         _lastNonNoneSignalCandleTime[key] = currentCandle.Timestamp;
@@ -90,7 +102,73 @@ public sealed class RsiSignalService : IRsiSignalService
             Signal: signalType == RsiSignalType.Call ? "Call" : "Put",
             Rsi: roundedRsi,
             CandleTime: currentCandle.Timestamp,
-            Timeframe: timeframe));
+            Timeframe: timeframe,
+            Backtest: backtest));
+    }
+
+    private RsiBacktestStats EvaluateBacktest(
+        IReadOnlyList<decimal> closes,
+        RsiSignalType direction,
+        RsiStrategyOptions options)
+    {
+        var currentIndex = closes.Count - 1;
+        // The lookback ends before the current entry and before any historical
+        // outcome would overlap the current candle. This prevents lookahead.
+        var firstIndex = Math.Max(options.Period, currentIndex - options.BacktestCandleCount);
+        var lastIndex = currentIndex - options.ExpiryCandles - 1;
+        var total = 0;
+        var successful = 0;
+
+        for (var entryIndex = firstIndex; entryIndex <= lastIndex; entryIndex++)
+        {
+            var historicalRsi = _calculator.CalculateRsi(
+                closes.Take(entryIndex + 1).ToList(), options);
+            var matchesDirection = direction == RsiSignalType.Call
+                ? historicalRsi <= options.Oversold
+                : historicalRsi >= options.Overbought;
+
+            if (!matchesDirection)
+                continue;
+
+            total++;
+            var entryClose = closes[entryIndex];
+            var expiryClose = closes[entryIndex + options.ExpiryCandles];
+            var won = direction == RsiSignalType.Call
+                ? expiryClose > entryClose
+                : expiryClose < entryClose;
+            if (won)
+                successful++;
+        }
+
+        var failed = total - successful;
+        var successRate = total == 0
+            ? 0m
+            : Math.Round(successful * 100m / total, 2, MidpointRounding.AwayFromZero);
+        return new RsiBacktestStats(
+            TotalSignals: total,
+            SuccessfulSignals: successful,
+            FailedSignals: failed,
+            SuccessRate: successRate,
+            LookbackCandles: options.BacktestCandleCount,
+            ExpiryCandles: options.ExpiryCandles,
+            MinimumSuccessRate: options.MinimumSuccessRate,
+            Passed: total > 0 && successRate >= options.MinimumSuccessRate);
+    }
+
+    private static void ValidateOptions(RsiStrategyOptions options)
+    {
+        if (options.TimeframeSeconds != 60)
+            throw new ApiException(ApiErrorCodes.ValidationError, "RSI Smart Backtest only supports the 1-minute timeframe.");
+        if (options.Period is < 2 or > 100)
+            throw new ApiException(ApiErrorCodes.ValidationError, "RSI length must be between 2 and 100.");
+        if (options.Oversold is <= 0 or >= 100 || options.Overbought is <= 0 or >= 100 || options.Oversold >= options.Overbought)
+            throw new ApiException(ApiErrorCodes.ValidationError, "RSI levels must be between 0 and 100, with oversold below overbought.");
+        if (options.BacktestCandleCount is < 20 or > 2000)
+            throw new ApiException(ApiErrorCodes.ValidationError, "Backtest candles must be between 20 and 2000.");
+        if (options.ExpiryCandles is < 3 or > 5)
+            throw new ApiException(ApiErrorCodes.ValidationError, "Expiry must be 3, 4, or 5 candles.");
+        if (options.MinimumSuccessRate is < 0 or > 100)
+            throw new ApiException(ApiErrorCodes.ValidationError, "Minimum success rate must be between 0 and 100.");
     }
 }
 
