@@ -25,14 +25,14 @@ public sealed class BotControlAppService
             throw new ApiException(ApiErrorCodes.ValidationError, "Select a trading pair before starting the bot.");
         var access = await _access.CheckAsync(_currentUser.UserId, ct);
         AccountAppService.EnsureAllowed(access);
-        return Map(_runtime.Start(_currentUser.UserId, request.Asset, request.Amount, request.DurationSeconds, request.DailyProfitTarget, request.DailyLossLimit));
+        return Map(_runtime.Start(_currentUser.UserId, request.Asset, request.Amount, request.DurationSeconds, request.DailyProfitTarget, request.DailyLossLimit, request.AutoStopAtProfit, request.AutoStopAtLoss, request.SignalConfirmationEnabled, request.RiskLevel, request.NotificationsEnabled));
     }
 
     public BotRuntimeDto Pause() => Map(_runtime.Pause(_currentUser.UserId));
     public BotRuntimeDto Stop() => Map(_runtime.Stop(_currentUser.UserId));
     public BotRuntimeDto Apply(BotApplyRequest request) =>
-        Map(_runtime.Apply(_currentUser.UserId, request.Asset, request.Amount, request.DurationSeconds, request.DailyProfitTarget, request.DailyLossLimit));
+        Map(_runtime.Apply(_currentUser.UserId, request.Asset, request.Amount, request.DurationSeconds, request.DailyProfitTarget, request.DailyLossLimit, request.AutoStopAtProfit, request.AutoStopAtLoss, request.SignalConfirmationEnabled, request.RiskLevel, request.NotificationsEnabled));
 
     private static BotRuntimeDto Map(BotRuntimeConfig value) =>
-        new(value.State.ToString(), value.Asset, value.Amount, value.DurationSeconds, value.DailyProfitTarget, value.DailyLossLimit, value.UpdatedAt);
+        new(value.State.ToString(), value.Asset, value.Amount, value.DurationSeconds, value.DailyProfitTarget, value.DailyLossLimit, value.UpdatedAt, value.AutoStopAtProfit, value.AutoStopAtLoss, value.SignalConfirmationEnabled, value.RiskLevel, value.NotificationsEnabled);
 }

@@ -4,6 +4,7 @@ using ScarAlpha.Application.Contracts;
 using ScarAlpha.Binolla.Abstractions;
 using ScarAlpha.Binolla.Models;
 using ScarAlpha.Binolla.Protocol;
+using ScarAlpha.Domain.Enums;
 
 namespace ScarAlpha.Application.Services;
 
@@ -17,6 +18,7 @@ public sealed class RsiSignalAppService
     private readonly IMarketingDemoService _demo;
     private readonly TradeAppService _trades;
     private readonly IBotRuntimeService _botRuntime;
+    private readonly ITradeRepository _tradeRepository;
 
     public RsiSignalAppService(
         ICurrentUser currentUser,
@@ -26,7 +28,8 @@ public sealed class RsiSignalAppService
         IBinollaSessionRestorer restorer,
         IMarketingDemoService demo,
         TradeAppService trades,
-        IBotRuntimeService botRuntime)
+        IBotRuntimeService botRuntime,
+        ITradeRepository tradeRepository)
     {
         _currentUser = currentUser;
         _sessions = sessions;
@@ -36,6 +39,7 @@ public sealed class RsiSignalAppService
         _demo = demo;
         _trades = trades;
         _botRuntime = botRuntime;
+        _tradeRepository = tradeRepository;
     }
 
     public async Task<StrategySignal> GetSignalAsync(
@@ -151,6 +155,13 @@ public sealed class RsiSignalAppService
         if (!autoExecute || bot.State != BotRunState.Running || signal.Signal is not ("Call" or "Put"))
             return signal;
 
+        var dailyLimit = await GetReachedDailyLimitAsync(bot, ct);
+        if (dailyLimit is not null)
+        {
+            _botRuntime.Stop(_currentUser.UserId);
+            return signal with { AutomationError = dailyLimit };
+        }
+
         var key = $"bot:rsi:{signal.Asset.Trim().ToUpperInvariant()}:{signal.CandleTime.ToUnixTimeSeconds()}:{signal.Signal}";
         try
         {
@@ -166,6 +177,28 @@ public sealed class RsiSignalAppService
         {
             return signal with { AutomationError = ex.Code };
         }
+    }
+
+    private async Task<string?> GetReachedDailyLimitAsync(BotRuntimeConfig bot, CancellationToken ct)
+    {
+        if ((!bot.AutoStopAtProfit || bot.DailyProfitTarget <= 0m) &&
+            (!bot.AutoStopAtLoss || bot.DailyLossLimit <= 0m))
+            return null;
+
+        var startOfUtcDay = new DateTimeOffset(DateTime.UtcNow.Date, TimeSpan.Zero);
+        var trades = await _tradeRepository.ListByUserAsync(_currentUser.UserId, take: 1000, ct: ct);
+        var pnl = trades
+            .Where(trade =>
+                trade.UpdatedAt >= startOfUtcDay &&
+                trade.Status is TradeStatus.Profit or TradeStatus.Loss)
+            .Sum(trade => trade.Pnl ?? 0m);
+
+        if (bot.AutoStopAtProfit && bot.DailyProfitTarget > 0m && pnl >= bot.DailyProfitTarget)
+            return "DAILY_PROFIT_TARGET_REACHED";
+        if (bot.AutoStopAtLoss && bot.DailyLossLimit > 0m && pnl <= -bot.DailyLossLimit)
+            return "DAILY_LOSS_LIMIT_REACHED";
+
+        return null;
     }
 
     private Task<IBinollaClient?> EnsureLiveClientAsync(CancellationToken ct)

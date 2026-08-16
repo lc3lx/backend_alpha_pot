@@ -83,15 +83,20 @@ public sealed record BotRuntimeConfig(
     int DurationSeconds,
     decimal DailyProfitTarget,
     decimal DailyLossLimit,
-    DateTimeOffset UpdatedAt);
+    DateTimeOffset UpdatedAt,
+    bool AutoStopAtProfit = true,
+    bool AutoStopAtLoss = true,
+    bool SignalConfirmationEnabled = true,
+    string RiskLevel = "risk-medium",
+    bool NotificationsEnabled = true);
 
 public interface IBotRuntimeService
 {
     BotRuntimeConfig Get(Guid userId);
-    BotRuntimeConfig Start(Guid userId, string asset, decimal amount = 25m, int durationSeconds = 300, decimal dailyProfitTarget = 50m, decimal dailyLossLimit = 30m);
+    BotRuntimeConfig Start(Guid userId, string asset, decimal amount = 25m, int durationSeconds = 300, decimal dailyProfitTarget = 50m, decimal dailyLossLimit = 30m, bool autoStopAtProfit = true, bool autoStopAtLoss = true, bool signalConfirmationEnabled = true, string riskLevel = "risk-medium", bool notificationsEnabled = true);
     BotRuntimeConfig Pause(Guid userId);
     BotRuntimeConfig Stop(Guid userId);
-    BotRuntimeConfig Apply(Guid userId, string? asset, decimal? amount, int? durationSeconds, decimal? dailyProfitTarget, decimal? dailyLossLimit);
+    BotRuntimeConfig Apply(Guid userId, string? asset, decimal? amount, int? durationSeconds, decimal? dailyProfitTarget, decimal? dailyLossLimit, bool? autoStopAtProfit = null, bool? autoStopAtLoss = null, bool? signalConfirmationEnabled = null, string? riskLevel = null, bool? notificationsEnabled = null);
     IReadOnlyList<BotRuntimeConfig> ListKnown();
 }
 
