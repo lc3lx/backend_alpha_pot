@@ -324,16 +324,32 @@ public sealed class BinollaSession : IBinollaClient
         }
     }
 
-    public async Task<TradeOutcome> WaitOutcomeAsync(string orderId, CancellationToken cancellationToken = default)
+    public Task<TradeOutcome> WaitOutcomeAsync(string orderId, CancellationToken cancellationToken = default) =>
+        WaitOutcomeAsync(orderId, _options.OutcomeTimeout, cancellationToken);
+
+    public async Task<TradeOutcome> WaitOutcomeAsync(
+        string orderId,
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
         if (string.IsNullOrWhiteSpace(orderId))
             throw new BinollaOrderException("Order id is required.");
 
+        if (timeout <= TimeSpan.Zero)
+            timeout = _options.OutcomeTimeout;
+
         State.Touch();
 
         if (State.ClosedOrderPnL.TryGetValue(orderId, out var existingPnl))
         {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                "H1",
+                "BinollaSession.WaitOutcomeAsync",
+                "outcome_from_cache",
+                new { orderIdLen = orderId.Length, pnl = existingPnl, timeoutSec = timeout.TotalSeconds });
+            // #endregion
             return new TradeOutcome
             {
                 OrderId = orderId,
@@ -346,7 +362,15 @@ public sealed class BinollaSession : IBinollaClient
         var tcs = _orders.RegisterOutcome(orderId);
 
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutCts.CancelAfter(_options.OutcomeTimeout);
+        timeoutCts.CancelAfter(timeout);
+
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+            "H1",
+            "BinollaSession.WaitOutcomeAsync",
+            "outcome_wait_start",
+            new { orderIdLen = orderId.Length, timeoutSec = timeout.TotalSeconds });
+        // #endregion
 
         await using var reg = timeoutCts.Token.Register(() =>
         {
@@ -364,11 +388,32 @@ public sealed class BinollaSession : IBinollaClient
             if (State.ClosedOrderPnL.TryGetValue(orderId, out var racePnl))
                 _orders.TryCompleteOutcome(orderId, racePnl, null);
 
-            return await tcs.Task.ConfigureAwait(false);
+            var outcome = await tcs.Task.ConfigureAwait(false);
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                "H1+H5",
+                "BinollaSession.WaitOutcomeAsync",
+                "outcome_wait_ok",
+                new
+                {
+                    orderIdLen = orderId.Length,
+                    result = outcome.Result.ToString(),
+                    pnl = outcome.ProfitLoss,
+                    timeoutSec = timeout.TotalSeconds
+                });
+            // #endregion
+            return outcome;
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             _orders.RemoveOutcomeWaiter(orderId);
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                "H1",
+                "BinollaSession.WaitOutcomeAsync",
+                "outcome_wait_timeout",
+                new { orderIdLen = orderId.Length, timeoutSec = timeout.TotalSeconds });
+            // #endregion
             throw new BinollaTimeoutException("Outcome wait timed out.");
         }
         catch (OperationCanceledException)
@@ -376,10 +421,17 @@ public sealed class BinollaSession : IBinollaClient
             _orders.RemoveOutcomeWaiter(orderId);
             throw;
         }
-        catch
+        catch (Exception ex)
         {
             if (!tcs.Task.IsCompleted)
                 _orders.RemoveOutcomeWaiter(orderId);
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                "H1",
+                "BinollaSession.WaitOutcomeAsync",
+                "outcome_wait_error",
+                new { orderIdLen = orderId.Length, err = ex.GetType().Name });
+            // #endregion
             throw;
         }
     }

@@ -34,6 +34,14 @@ public interface IBinollaClient : IAsyncDisposable
 
     Task<TradeOutcome> WaitOutcomeAsync(string orderId, CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Wait for Binolla close with an explicit timeout (use trade duration + buffer).
+    /// </summary>
+    Task<TradeOutcome> WaitOutcomeAsync(
+        string orderId,
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default);
+
     Task SubscribePairAsync(string pair, int period = 60, CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -98,7 +106,11 @@ public sealed class BinollaSessionManagerOptions
 
     public TimeSpan PlaceOrderTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
-    public TimeSpan OutcomeTimeout { get; set; } = TimeSpan.FromMinutes(5);
+    /// <summary>
+    /// Fallback when caller does not pass a per-trade timeout.
+    /// Must exceed longest common durations (5m) plus WS close lag — 5m raced 5m trades.
+    /// </summary>
+    public TimeSpan OutcomeTimeout { get; set; } = TimeSpan.FromMinutes(15);
 
     public bool EnableChartConnection { get; set; }
 

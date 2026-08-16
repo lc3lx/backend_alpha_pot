@@ -909,6 +909,20 @@ internal sealed class SessionMessageRouter
         };
 
         _orders.TryCompleteOutcome(deal.Uuid, pnl, (decimal)deal.ClosePrice);
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+            "H2+H5",
+            "SessionMessageRouter.ApplyClosedDeal",
+            "binolla_close",
+            new
+            {
+                uuidLen = deal.Uuid.Length,
+                profit = pnl,
+                amount = deal.Amount,
+                result = result.ToString(),
+                closePrice = deal.ClosePrice
+            });
+        // #endregion
         _onOrderClosed?.Invoke(outcome);
     }
 
