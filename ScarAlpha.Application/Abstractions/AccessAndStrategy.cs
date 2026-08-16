@@ -88,15 +88,48 @@ public sealed record BotRuntimeConfig(
     bool AutoStopAtLoss = true,
     bool SignalConfirmationEnabled = true,
     string RiskLevel = "risk-medium",
-    bool NotificationsEnabled = true);
+    bool NotificationsEnabled = true,
+    IReadOnlyList<string>? Assets = null)
+{
+    /// <summary>Selected pairs to analyze (falls back to single Asset).</summary>
+    public IReadOnlyList<string> ResolvedAssets =>
+        Assets is { Count: > 0 }
+            ? Assets
+            : string.IsNullOrWhiteSpace(Asset)
+                ? Array.Empty<string>()
+                : new[] { Asset };
+}
 
 public interface IBotRuntimeService
 {
     BotRuntimeConfig Get(Guid userId);
-    BotRuntimeConfig Start(Guid userId, string asset, decimal amount = 25m, int durationSeconds = 300, decimal dailyProfitTarget = 50m, decimal dailyLossLimit = 30m, bool autoStopAtProfit = true, bool autoStopAtLoss = true, bool signalConfirmationEnabled = true, string riskLevel = "risk-medium", bool notificationsEnabled = true);
+    BotRuntimeConfig Start(
+        Guid userId,
+        IReadOnlyList<string> assets,
+        decimal amount = 25m,
+        int durationSeconds = 300,
+        decimal dailyProfitTarget = 50m,
+        decimal dailyLossLimit = 30m,
+        bool autoStopAtProfit = true,
+        bool autoStopAtLoss = true,
+        bool signalConfirmationEnabled = true,
+        string riskLevel = "risk-medium",
+        bool notificationsEnabled = true);
     BotRuntimeConfig Pause(Guid userId);
     BotRuntimeConfig Stop(Guid userId);
-    BotRuntimeConfig Apply(Guid userId, string? asset, decimal? amount, int? durationSeconds, decimal? dailyProfitTarget, decimal? dailyLossLimit, bool? autoStopAtProfit = null, bool? autoStopAtLoss = null, bool? signalConfirmationEnabled = null, string? riskLevel = null, bool? notificationsEnabled = null);
+    BotRuntimeConfig Apply(
+        Guid userId,
+        string? asset,
+        decimal? amount,
+        int? durationSeconds,
+        decimal? dailyProfitTarget,
+        decimal? dailyLossLimit,
+        bool? autoStopAtProfit = null,
+        bool? autoStopAtLoss = null,
+        bool? signalConfirmationEnabled = null,
+        string? riskLevel = null,
+        bool? notificationsEnabled = null,
+        IReadOnlyList<string>? assets = null);
     IReadOnlyList<BotRuntimeConfig> ListKnown();
 }
 

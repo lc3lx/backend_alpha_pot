@@ -493,7 +493,8 @@ public sealed class AdminAppService
                 DailyProfitTarget: runtime.DailyProfitTarget,
                 DailyLossLimit: runtime.DailyLossLimit,
                 UpdatedAt: runtime.UpdatedAt,
-                IsMarketingDemo: user.IsMarketingDemo));
+                IsMarketingDemo: user.IsMarketingDemo,
+                Assets: runtime.ResolvedAssets));
         }
 
         rows = rows
@@ -526,7 +527,8 @@ public sealed class AdminAppService
             DailyProfitTarget: runtime.DailyProfitTarget,
             DailyLossLimit: runtime.DailyLossLimit,
             UpdatedAt: runtime.UpdatedAt,
-            IsMarketingDemo: user.IsMarketingDemo);
+            IsMarketingDemo: user.IsMarketingDemo,
+            Assets: runtime.ResolvedAssets);
     }
 
     public async Task<AdminBotRuntimeDto> ControlBotAsync(
@@ -549,15 +551,15 @@ public sealed class AdminAppService
         {
             case "start":
             {
-                var asset = request.Asset?.Trim();
-                if (string.IsNullOrWhiteSpace(asset))
-                    throw new ApiException(ApiErrorCodes.ValidationError, "Asset is required to start the bot.");
+                var assets = BotAssetList.Normalize(request.Asset, request.Assets);
+                if (assets.Count == 0)
+                    throw new ApiException(ApiErrorCodes.ValidationError, "Select at least one trading pair to start the bot.");
                 var access = await _botAccess.CheckAsync(userId, ct);
                 if (access.Access != BotAccessState.Allowed && !user.IsMarketingDemo)
                     throw new ApiException(ApiErrorCodes.Forbidden, $"User bot access is {access.Access}.", 403);
                 next = _botRuntime.Start(
                     userId,
-                    asset,
+                    assets,
                     request.Amount ?? 25m,
                     request.DurationSeconds ?? 300,
                     request.DailyProfitTarget ?? 50m,
@@ -577,7 +579,8 @@ public sealed class AdminAppService
                     request.Amount,
                     request.DurationSeconds,
                     request.DailyProfitTarget,
-                    request.DailyLossLimit);
+                    request.DailyLossLimit,
+                    assets: request.Assets);
                 break;
             default:
                 throw new ApiException(ApiErrorCodes.ValidationError, "action must be start, pause, stop, or apply.");

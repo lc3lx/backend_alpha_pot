@@ -92,9 +92,44 @@ public sealed record StrategyDto(
 
 public sealed record StrategiesResponse(IReadOnlyList<StrategyDto> Strategies);
 
-public sealed record BotStartRequest(string Asset, decimal Amount = 25m, int DurationSeconds = 300, decimal DailyProfitTarget = 50m, decimal DailyLossLimit = 30m, bool AutoStopAtProfit = true, bool AutoStopAtLoss = true, bool SignalConfirmationEnabled = true, string RiskLevel = "risk-medium", bool NotificationsEnabled = true);
-public sealed record BotApplyRequest(string? Asset = null, decimal? Amount = null, int? DurationSeconds = null, decimal? DailyProfitTarget = null, decimal? DailyLossLimit = null, bool? AutoStopAtProfit = null, bool? AutoStopAtLoss = null, bool? SignalConfirmationEnabled = null, string? RiskLevel = null, bool? NotificationsEnabled = null);
-public sealed record BotRuntimeDto(string State, string? Asset, decimal Amount, int DurationSeconds, decimal DailyProfitTarget, decimal DailyLossLimit, DateTimeOffset UpdatedAt, bool AutoStopAtProfit, bool AutoStopAtLoss, bool SignalConfirmationEnabled, string RiskLevel, bool NotificationsEnabled);
+public sealed record BotStartRequest(
+    string? Asset = null,
+    decimal Amount = 25m,
+    int DurationSeconds = 300,
+    decimal DailyProfitTarget = 50m,
+    decimal DailyLossLimit = 30m,
+    bool AutoStopAtProfit = true,
+    bool AutoStopAtLoss = true,
+    bool SignalConfirmationEnabled = true,
+    string RiskLevel = "risk-medium",
+    bool NotificationsEnabled = true,
+    IReadOnlyList<string>? Assets = null);
+public sealed record BotApplyRequest(
+    string? Asset = null,
+    decimal? Amount = null,
+    int? DurationSeconds = null,
+    decimal? DailyProfitTarget = null,
+    decimal? DailyLossLimit = null,
+    bool? AutoStopAtProfit = null,
+    bool? AutoStopAtLoss = null,
+    bool? SignalConfirmationEnabled = null,
+    string? RiskLevel = null,
+    bool? NotificationsEnabled = null,
+    IReadOnlyList<string>? Assets = null);
+public sealed record BotRuntimeDto(
+    string State,
+    string? Asset,
+    decimal Amount,
+    int DurationSeconds,
+    decimal DailyProfitTarget,
+    decimal DailyLossLimit,
+    DateTimeOffset UpdatedAt,
+    bool AutoStopAtProfit,
+    bool AutoStopAtLoss,
+    bool SignalConfirmationEnabled,
+    string RiskLevel,
+    bool NotificationsEnabled,
+    IReadOnlyList<string> Assets);
 
 public sealed record BinollaStatusDto(
     bool Connected,
@@ -338,7 +373,8 @@ public sealed record AdminBotRuntimeDto(
     decimal DailyProfitTarget,
     decimal DailyLossLimit,
     DateTimeOffset UpdatedAt,
-    bool IsMarketingDemo);
+    bool IsMarketingDemo,
+    IReadOnlyList<string> Assets);
 
 public sealed record AdminBotListResponse(
     IReadOnlyList<AdminBotRuntimeDto> Items,
@@ -352,7 +388,8 @@ public sealed record AdminBotControlRequest(
     decimal? Amount = null,
     int? DurationSeconds = null,
     decimal? DailyProfitTarget = null,
-    decimal? DailyLossLimit = null);
+    decimal? DailyLossLimit = null,
+    IReadOnlyList<string>? Assets = null);
 
 public sealed record AdminTradeDto(
     string Id,

@@ -155,6 +155,10 @@ public sealed class RsiSignalAppService
         if (!autoExecute || bot.State != BotRunState.Running || signal.Signal is not ("Call" or "Put"))
             return signal;
 
+        var selected = bot.ResolvedAssets;
+        if (selected.Count > 0 && !BotAssetList.Contains(selected, signal.Asset))
+            return signal;
+
         var dailyLimit = await GetReachedDailyLimitAsync(bot, ct);
         if (dailyLimit is not null)
         {
