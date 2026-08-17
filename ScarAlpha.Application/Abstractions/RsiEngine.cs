@@ -54,8 +54,9 @@ public static class RsiEntryLevels
     public const decimal CallMax = 25m;
     public const decimal PutMin = 75m;
     public const decimal MinSuccessRate = 75m;
-    /// <summary>Shift displayed/gated RSI toward Binolla's 1m reading (80 → 74).</summary>
-    public const decimal BinollaDisplayShift = -6m;
+    /// <summary>Put side: 80 → 74. Call side below 26: 20 → 26.</summary>
+    public const decimal BinollaAlignDelta = 6m;
+    public const decimal BinollaCallBoostBelow = 26m;
     /// <summary>Enter on the first tick both conditions are true. After this, look for a new touch.</summary>
     public const int SetupTtlSeconds = 5;
 
@@ -64,7 +65,9 @@ public static class RsiEntryLevels
 
     public static decimal AlignToBinolla(decimal rsi)
     {
-        var shifted = rsi + BinollaDisplayShift;
+        var shifted = rsi < BinollaCallBoostBelow
+            ? rsi + BinollaAlignDelta
+            : rsi - BinollaAlignDelta;
         if (shifted < 0m) return 0m;
         if (shifted > 100m) return 100m;
         return shifted;

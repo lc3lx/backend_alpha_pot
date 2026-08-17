@@ -16,7 +16,9 @@ public sealed class Phase5RsiTests
     public void AlignToBinolla_shifts_80_to_74()
     {
         RsiEntryLevels.AlignToBinolla(80m).Should().Be(74m);
-        RsiEntryLevels.AlignToBinolla(5m).Should().Be(0m);
+        RsiEntryLevels.AlignToBinolla(5m).Should().Be(11m);
+        RsiEntryLevels.AlignToBinolla(25m).Should().Be(31m);
+        RsiEntryLevels.AlignToBinolla(26m).Should().Be(20m);
         RsiEntryLevels.AlignToBinolla(100m).Should().Be(94m);
     }
 
@@ -51,7 +53,7 @@ public sealed class Phase5RsiTests
 
         var signal = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
 
-        signal.Rsi.Should().Be(0m);
+        signal.Rsi.Should().Be(RsiEntryLevels.AlignToBinolla(0m));
         signal.Signal.Should().Be("None");
         signal.Backtest.Should().NotBeNull();
         signal.Backtest!.Passed.Should().BeFalse();
@@ -432,6 +434,8 @@ public sealed class Phase5RsiTests
             closes.Add(35m + i * 5);
         for (var i = 1; i <= 16; i++)
             closes.Add(95m - i * 4);
+        for (var i = 1; i <= 8; i++)
+            closes.Add(closes[^1] - 6m);
         return closes;
     }
 
