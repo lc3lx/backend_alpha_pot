@@ -416,20 +416,33 @@ public sealed class RsiSignalAppService
             _currentUser.UserId, take: 20, status: TradeStatus.Running, ct: ct);
         var pending = await _tradeRepository.ListByUserAsync(
             _currentUser.UserId, take: 10, status: TradeStatus.Pending, ct: ct);
-        var blocking = running.Concat(pending).Count(t => OpenTradeGate.IsBlocking(t, now));
-        if (blocking > 0)
+        var blockers = running.Concat(pending).Where(t => OpenTradeGate.IsBlocking(t, now)).ToList();
+        if (blockers.Count > 0)
         {
+            var first = blockers.OrderBy(t => t.CreatedAt).First();
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
                 "H-STUCK1",
                 "RsiSignalAppService.HasBlockingOpenTradeAsync",
                 "signal_skip_blocking_open",
-                new { blocking, running = running.Count, pending = pending.Count },
+                new
+                {
+                    blocking = blockers.Count,
+                    running = running.Count,
+                    pending = pending.Count,
+                    asset = first.Asset,
+                    direction = first.Direction.ToString(),
+                    amount = first.Amount,
+                    durationSec = first.DurationSeconds,
+                    status = first.Status.ToString(),
+                    ageSec = Math.Round((now - first.CreatedAt).TotalSeconds, 0),
+                    tradeId = first.Id.ToString("N")[..8]
+                },
                 runId: "stuck-running");
             // #endregion
         }
 
-        return blocking > 0;
+        return blockers.Count > 0;
     }
 
     /// <summary>

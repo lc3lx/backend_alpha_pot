@@ -29,13 +29,15 @@ public sealed class RsiSignalService : IRsiSignalService
         if (candles is null)
             throw new ArgumentNullException(nameof(candles));
 
-        ValidateOptions(options);
         options = options with
         {
             Oversold = RsiEntryLevels.CallMax,
             Overbought = RsiEntryLevels.PutMin,
+            BacktestCandleCount = RsiZoneBacktest.LookbackCandles,
+            MinimumSuccessRate = RsiEntryLevels.MinSuccessRate,
             MaxEntryLagSeconds = RsiEntryLevels.SetupTtlSeconds
         };
+        ValidateOptions(options);
 
         // Closed only when EndTimestamp is known and not in the future — never treat null as closed.
         var closed = candles
@@ -51,7 +53,8 @@ public sealed class RsiSignalService : IRsiSignalService
         var currentCandle = closed[^1];
         var closes = closed.Select(c => c.Close).ToList();
         var currentRsi = _calculator.CalculateRsi(closes, options);
-        var (callBacktest, putBacktest) = EvaluateBothBacktests(closes, options);
+        // Backtest is always ready before the live RSI gate is consulted.
+        var (callBacktest, putBacktest) = RsiZoneBacktest.Evaluate(closes, options);
 
         var roundedRsi = Math.Round(currentRsi, 2, MidpointRounding.AwayFromZero);
         var liveCloses = candles.OrderBy(c => c.Timestamp).Select(c => c.Close).ToList();
@@ -138,7 +141,7 @@ public sealed class RsiSignalService : IRsiSignalService
                     liveRsi,
                     hasForming = forming is not null,
                     rsiSide = "None",
-                    lookback = options.BacktestCandleCount,
+                    lookback = RsiZoneBacktest.LookbackCandles,
                     touchedOversold,
                     touchedOverbought,
                     wouldEnter = false,
@@ -184,7 +187,7 @@ public sealed class RsiSignalService : IRsiSignalService
                 liveRsi,
                 hasForming = forming is not null,
                 rsiSide = signalType.ToString(),
-                lookback = options.BacktestCandleCount,
+                lookback = RsiZoneBacktest.LookbackCandles,
                 touchedOversold,
                 touchedOverbought,
                 ageSeconds = Math.Round(ageSeconds, 2),
@@ -246,122 +249,6 @@ public sealed class RsiSignalService : IRsiSignalService
 
     private static string EmissionKey(Guid userId, string asset, int timeframeSeconds) =>
         $"{userId:N}:{asset.Trim().ToUpperInvariant()}:{timeframeSeconds}";
-
-    private (RsiBacktestStats Call, RsiBacktestStats Put) EvaluateBothBacktests(
-        IReadOnlyList<decimal> closes,
-        RsiStrategyOptions options)
-    {
-        var currentIndex = closes.Count - 1;
-        var firstIndex = Math.Max(options.Period, currentIndex - options.BacktestCandleCount);
-        var lastIndex = currentIndex - 1;
-        var rsiSeries = BuildRsiSeries(closes, options);
-        var callTotal = 0;
-        var callWins = 0;
-        var putTotal = 0;
-        var putWins = 0;
-        var inCallZone = false;
-        var inPutZone = false;
-        var callTouchIndex = -1;
-        var putTouchIndex = -1;
-
-        for (var i = firstIndex; i <= lastIndex; i++)
-        {
-            var historicalRsi = rsiSeries[i];
-
-            if (historicalRsi <= options.Oversold)
-            {
-                if (!inCallZone)
-                {
-                    inCallZone = true;
-                    callTouchIndex = i;
-                }
-            }
-            else if (inCallZone)
-            {
-                callTotal++;
-                if (closes[i] > closes[callTouchIndex])
-                    callWins++;
-                inCallZone = false;
-                callTouchIndex = -1;
-            }
-
-            if (historicalRsi >= options.Overbought)
-            {
-                if (!inPutZone)
-                {
-                    inPutZone = true;
-                    putTouchIndex = i;
-                }
-            }
-            else if (inPutZone)
-            {
-                putTotal++;
-                if (closes[i] < closes[putTouchIndex])
-                    putWins++;
-                inPutZone = false;
-                putTouchIndex = -1;
-            }
-        }
-
-        return (ToStats(callTotal, callWins, options), ToStats(putTotal, putWins, options));
-    }
-
-    private static decimal[] BuildRsiSeries(IReadOnlyList<decimal> closes, RsiStrategyOptions options)
-    {
-        var series = new decimal[closes.Count];
-        if (closes.Count < options.Period + 1)
-            return series;
-
-        decimal gainSum = 0m;
-        decimal lossSum = 0m;
-        for (var i = 1; i <= options.Period; i++)
-        {
-            var delta = closes[i] - closes[i - 1];
-            if (delta > 0) gainSum += delta;
-            else lossSum += -delta;
-        }
-
-        var avgGain = gainSum / options.Period;
-        var avgLoss = lossSum / options.Period;
-        series[options.Period] = ToRsi(avgGain, avgLoss);
-
-        for (var i = options.Period + 1; i < closes.Count; i++)
-        {
-            var delta = closes[i] - closes[i - 1];
-            var gain = delta > 0 ? delta : 0m;
-            var loss = delta < 0 ? -delta : 0m;
-            avgGain = (avgGain * (options.Period - 1) + gain) / options.Period;
-            avgLoss = (avgLoss * (options.Period - 1) + loss) / options.Period;
-            series[i] = ToRsi(avgGain, avgLoss);
-        }
-
-        return series;
-    }
-
-    private static decimal ToRsi(decimal avgGain, decimal avgLoss)
-    {
-        if (avgLoss == 0m)
-            return avgGain == 0m ? 50m : 100m;
-        var rs = avgGain / avgLoss;
-        return 100m - (100m / (1m + rs));
-    }
-
-    private static RsiBacktestStats ToStats(int total, int wins, RsiStrategyOptions options)
-    {
-        var failed = total - wins;
-        var successRate = total == 0
-            ? 0m
-            : Math.Round(wins * 100m / total, 2, MidpointRounding.AwayFromZero);
-        return new RsiBacktestStats(
-            TotalSignals: total,
-            SuccessfulSignals: wins,
-            FailedSignals: failed,
-            SuccessRate: successRate,
-            LookbackCandles: options.BacktestCandleCount,
-            ExpiryCandles: options.ExpiryCandles,
-            MinimumSuccessRate: options.MinimumSuccessRate,
-            Passed: total > 0 && successRate >= Math.Max(options.MinimumSuccessRate, RsiEntryLevels.MinSuccessRate));
-    }
 
     private static void ValidateOptions(RsiStrategyOptions options)
     {

@@ -309,27 +309,35 @@ public sealed class BotSignalWorker : IHostedService
         var now = DateTimeOffset.UtcNow;
         var running = await trades.ListByUserAsync(userId, take: 20, status: TradeStatus.Running, ct: ct);
         var pending = await trades.ListByUserAsync(userId, take: 10, status: TradeStatus.Pending, ct: ct);
-        var blocking = running.Concat(pending).Count(trade => OpenTradeGate.IsBlocking(trade, now));
+        var blockers = running.Concat(pending).Where(trade => OpenTradeGate.IsBlocking(trade, now)).ToList();
         var staleRunning = running.Count(trade => !OpenTradeGate.IsBlocking(trade, now));
-        if (blocking > 0 || staleRunning > 0)
+        if (blockers.Count > 0 || staleRunning > 0)
         {
+            var first = blockers.OrderBy(t => t.CreatedAt).FirstOrDefault();
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
                 "H-STUCK1",
                 "BotSignalWorker.HasBlockingOpenTradeAsync",
-                blocking > 0 ? "has_blocking_open" : "stale_open_ignored",
+                blockers.Count > 0 ? "has_blocking_open" : "stale_open_ignored",
                 new
                 {
                     userId = userId.ToString("N")[..8],
-                    blocking,
+                    blocking = blockers.Count,
                     staleRunning,
-                    pending = pending.Count
+                    pending = pending.Count,
+                    asset = first?.Asset,
+                    direction = first?.Direction.ToString(),
+                    amount = first?.Amount,
+                    durationSec = first?.DurationSeconds,
+                    status = first?.Status.ToString(),
+                    ageSec = first is null ? 0 : Math.Round((now - first.CreatedAt).TotalSeconds, 0),
+                    tradeId = first is null ? null : first.Id.ToString("N")[..8]
                 },
                 runId: "stuck-running");
             // #endregion
         }
 
-        return blocking > 0;
+        return blockers.Count > 0;
     }
 
     private static bool IsLiveSetup(StrategySignal signal) =>

@@ -324,6 +324,25 @@ public sealed class Phase5RsiTests
     }
 
     [Fact]
+    public void Zone_backtest_is_always_200_one_minute_candles()
+    {
+        var options = RsiStrategyOptions.Default60Seconds with { BacktestCandleCount = 80, MinimumSuccessRate = 10m };
+        var respected = RsiZoneBacktest.Evaluate(OversoldWithRespectedBounce(), options);
+        respected.Call.LookbackCandles.Should().Be(200);
+        respected.Call.Passed.Should().BeTrue();
+        respected.Call.TotalSignals.Should().BeGreaterThan(0);
+        respected.Call.MinimumSuccessRate.Should().Be(75m);
+
+        var dump = RsiZoneBacktest.Evaluate(DumpCloses(40), options);
+        dump.Call.Passed.Should().BeFalse();
+        dump.Call.TotalSignals.Should().Be(0);
+
+        var put = RsiZoneBacktest.Evaluate(OverboughtWithRespectedDrop(), options);
+        put.Put.Passed.Should().BeTrue();
+        put.Put.TotalSignals.Should().BeGreaterThan(0);
+    }
+
+    [Fact]
     public void Trade_gate_rejects_missing_live_rsi_mid_rsi_and_expired_setup()
     {
         var okBacktest = new RsiBacktestStats(4, 4, 0, 100m, 200, 5, 75m, true);

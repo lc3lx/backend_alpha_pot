@@ -25,7 +25,12 @@ public sealed record RsiStrategyOptions(
     int MaxEntryLagSeconds = 5)
 {
     public static RsiStrategyOptions Default60Seconds =>
-        new(Period: 14, Oversold: RsiEntryLevels.CallMax, Overbought: RsiEntryLevels.PutMin, TimeframeSeconds: 60);
+        new(
+            Period: 14,
+            Oversold: RsiEntryLevels.CallMax,
+            Overbought: RsiEntryLevels.PutMin,
+            TimeframeSeconds: 60,
+            BacktestCandleCount: RsiZoneBacktest.LookbackCandles);
 
     /// <summary>Maps bot trade duration (180/240/300) to expiry candles 3–5 (default 5).</summary>
     public static RsiStrategyOptions FromBotDurationSeconds(int durationSeconds)
