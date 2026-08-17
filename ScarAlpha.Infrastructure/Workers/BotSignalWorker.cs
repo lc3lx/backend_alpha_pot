@@ -106,15 +106,18 @@ public sealed class BotSignalWorker : IHostedService
         var rsi = scope.ServiceProvider.GetRequiredService<RsiSignalAppService>();
         using (AmbientUserContext.Use(bot.UserId))
         {
-            var options = RsiStrategyOptions.Default60Seconds;
+            var options = RsiStrategyOptions.FromBotDurationSeconds(bot.DurationSeconds);
             var signals = new List<(string Asset, StrategySignal Signal)>();
             foreach (var asset in bot.ResolvedAssets)
             {
                 try
                 {
                     var signal = await rsi.GetSignalAsync(asset, 60, options, autoExecute: false, ct);
-                    if (signal.Signal is "Call" or "Put")
+                    if (signal.Signal is ("Call" or "Put") &&
+                        signal.Backtest is { Passed: true })
+                    {
                         signals.Add((asset, signal));
+                    }
                 }
                 catch
                 {
@@ -136,10 +139,12 @@ public sealed class BotSignalWorker : IHostedService
                     asset = best.Value.Asset,
                     signal = best.Value.Signal.Signal,
                     rsi = best.Value.Signal.Rsi,
+                    successRate = best.Value.Signal.Backtest?.SuccessRate,
                     candidates = signals.Count
                 });
             // #endregion
 
+            // Second call still returns Call/Put (anti-repeat only after place).
             await rsi.GetSignalAsync(best.Value.Asset, 60, options, autoExecute: true, ct);
         }
     }
@@ -149,17 +154,22 @@ public sealed class BotSignalWorker : IHostedService
     {
         if (signals.Count == 0) return null;
 
-        return signals
-            .OrderByDescending(s => s.Signal.Backtest?.SuccessRate ?? 0m)
+        var oversold = RsiStrategyOptions.Default60Seconds.Oversold;
+        var overbought = RsiStrategyOptions.Default60Seconds.Overbought;
+
+        var ordered = signals
+            .Where(s => s.Signal.Backtest is { Passed: true })
+            .OrderByDescending(s => s.Signal.Backtest!.SuccessRate)
             .ThenByDescending(s =>
             {
-                // Prefer stronger RSI edge past thresholds.
                 if (s.Signal.Signal == "Call")
-                    return 30m - s.Signal.Rsi; // deeper oversold = better
+                    return oversold - s.Signal.Rsi;
                 if (s.Signal.Signal == "Put")
-                    return s.Signal.Rsi - 70m;
+                    return s.Signal.Rsi - overbought;
                 return 0m;
             })
-            .First();
+            .ToList();
+
+        return ordered.Count == 0 ? null : ordered[0];
     }
 }

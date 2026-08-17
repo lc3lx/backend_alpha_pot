@@ -72,5 +72,7 @@ public sealed class BotControlAppService
             value.SignalConfirmationEnabled,
             value.RiskLevel,
             value.NotificationsEnabled,
-            value.ResolvedAssets);
+            value.ResolvedAssets,
+            value.PnlSessionStartedAt,
+            value.StopReason);
 }

@@ -57,7 +57,7 @@ public sealed class RsiSignalAppService
             throw new ApiException(ApiErrorCodes.ValidationError, "RSI Smart Backtest only supports the 1-minute timeframe.");
 
         if (await _demo.IsMarketingDemoAsync(_currentUser.UserId, ct))
-            return await ExecuteIfRequestedAsync(_demo.BuildRsiSignal(asset, periodSeconds), autoExecute, ct);
+            return await ExecuteIfRequestedAsync(_demo.BuildRsiSignal(asset, periodSeconds), options, autoExecute, ct);
 
         var access = await _botAccess.CheckAsync(_currentUser.UserId, ct);
         AccountAppService.EnsureConnectedForMarket(access);
@@ -82,14 +82,21 @@ public sealed class RsiSignalAppService
         {
             var history = await client.GetHistoryAsync(symbol, wirePeriod, CancellationToken.None);
 
+            var period = TimeSpan.FromSeconds(wirePeriod);
             var candles = history.Candles
                 .OrderBy(c => c.Timestamp)
-                .Select(c => new RsiCandle(
-                    Timestamp: DateTimeOffset.FromUnixTimeMilliseconds((long)(c.Timestamp * 1000)),
-                    Close: (decimal)c.Close,
-                    EndTimestamp: c.EndTimestamp is null
-                        ? null
-                        : DateTimeOffset.FromUnixTimeMilliseconds((long)(c.EndTimestamp.Value * 1000))))
+                .Select(c =>
+                {
+                    var start = DateTimeOffset.FromUnixTimeMilliseconds((long)(c.Timestamp * 1000));
+                    // Synthesize end when feed omits it so closed-candle filter can exclude the forming bar.
+                    var end = c.EndTimestamp is null
+                        ? start + period
+                        : DateTimeOffset.FromUnixTimeMilliseconds((long)(c.EndTimestamp.Value * 1000));
+                    return new RsiCandle(
+                        Timestamp: start,
+                        Close: (decimal)c.Close,
+                        EndTimestamp: end);
+                })
                 .ToList();
 
             if (candles.Count == 0)
@@ -102,7 +109,7 @@ public sealed class RsiSignalAppService
                 options: options,
                 now: DateTimeOffset.UtcNow,
                 ct: ct);
-            return await ExecuteIfRequestedAsync(signal, autoExecute, ct);
+            return await ExecuteIfRequestedAsync(signal, options, autoExecute, ct);
         }
         catch (BinollaAuthenticationException)
         {
@@ -150,6 +157,7 @@ public sealed class RsiSignalAppService
 
     private async Task<StrategySignal> ExecuteIfRequestedAsync(
         StrategySignal signal,
+        RsiStrategyOptions options,
         bool autoExecute,
         CancellationToken ct)
     {
@@ -158,6 +166,15 @@ public sealed class RsiSignalAppService
         if (!autoExecute || bot.State != BotRunState.Running || signal.Signal is not ("Call" or "Put"))
             return signal;
 
+        // Dual gate: RSI extreme alone is not enough — backtest must pass the configured floor.
+        if (signal.Backtest is null ||
+            !signal.Backtest.Passed ||
+            signal.Backtest.SuccessRate < options.MinimumSuccessRate ||
+            signal.Backtest.SuccessRate < signal.Backtest.MinimumSuccessRate)
+        {
+            return signal with { AutomationError = "BACKTEST_NOT_PASSED", Signal = "None" };
+        }
+
         var selected = bot.ResolvedAssets;
         if (selected.Count > 0 && !BotAssetList.Contains(selected, signal.Asset))
             return signal;
@@ -165,7 +182,7 @@ public sealed class RsiSignalAppService
         var dailyLimit = await GetReachedDailyLimitAsync(bot, ct);
         if (dailyLimit is not null)
         {
-            _botRuntime.Stop(userId);
+            _botRuntime.Stop(userId, dailyLimit);
             return signal with { AutomationError = dailyLimit };
         }
 
@@ -198,6 +215,12 @@ public sealed class RsiSignalAppService
             if (openCount + pendingCount > 0)
                 return signal with { AutomationError = "OPEN_TRADE_EXISTS" };
 
+            // Trade duration must match the backtest expiry window (3–5 minutes on 1m).
+            var expiryCandles = signal.Backtest.ExpiryCandles;
+            if (expiryCandles is < 3 or > 5)
+                expiryCandles = options.ExpiryCandles is >= 3 and <= 5 ? options.ExpiryCandles : 5;
+            var durationSeconds = expiryCandles * 60;
+
             var key = $"bot:rsi:{signal.Asset.Trim().ToUpperInvariant()}:{signal.CandleTime.ToUnixTimeSeconds()}:{signal.Signal}";
             try
             {
@@ -205,15 +228,29 @@ public sealed class RsiSignalAppService
                     Asset: signal.Asset,
                     Direction: signal.Signal.ToUpperInvariant(),
                     Amount: bot.Amount,
-                    DurationSeconds: bot.DurationSeconds,
+                    DurationSeconds: durationSeconds,
                     StrategyId: "rsi"), key, ct);
+
+                _signalService.MarkSignalEmitted(
+                    userId,
+                    signal.Asset,
+                    options.TimeframeSeconds,
+                    signal.CandleTime);
+
                 // #region agent log
                 var tradeIdShort = trade.Id.Length >= 8 ? trade.Id[..8] : trade.Id;
                 ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
                     "OT1",
                     "RsiSignalAppService.ExecuteIfRequestedAsync",
                     "placed_one_trade",
-                    new { tradeId = tradeIdShort, asset = signal.Asset, signal = signal.Signal });
+                    new
+                    {
+                        tradeId = tradeIdShort,
+                        asset = signal.Asset,
+                        signal = signal.Signal,
+                        durationSeconds,
+                        successRate = signal.Backtest.SuccessRate
+                    });
                 // #endregion
                 return signal with { AutomatedTradeId = trade.Id };
             }
@@ -237,11 +274,14 @@ public sealed class RsiSignalAppService
             (!bot.AutoStopAtLoss || bot.DailyLossLimit <= 0m))
             return null;
 
+        // Session baseline: after user presses Start again, prior PnL does not count.
         var startOfUtcDay = new DateTimeOffset(DateTime.UtcNow.Date, TimeSpan.Zero);
+        var from = bot.PnlSessionStartedAt ?? startOfUtcDay;
+
         var trades = await _tradeRepository.ListByUserAsync(_currentUser.UserId, take: 1000, ct: ct);
         var pnl = trades
             .Where(trade =>
-                trade.UpdatedAt >= startOfUtcDay &&
+                trade.UpdatedAt >= from &&
                 trade.Status is TradeStatus.Profit or TradeStatus.Loss)
             .Sum(trade => trade.Pnl ?? 0m);
 

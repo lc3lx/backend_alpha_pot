@@ -20,6 +20,15 @@ public sealed record RsiStrategyOptions(
 {
     public static RsiStrategyOptions Default60Seconds =>
         new(Period: 14, Oversold: 25m, Overbought: 75m, TimeframeSeconds: 60);
+
+    /// <summary>Maps bot trade duration (180/240/300) to expiry candles 3–5 (default 5).</summary>
+    public static RsiStrategyOptions FromBotDurationSeconds(int durationSeconds)
+    {
+        var candles = durationSeconds / 60;
+        if (candles is < 3 or > 5)
+            candles = 5;
+        return Default60Seconds with { ExpiryCandles = candles };
+    }
 }
 
 public sealed record RsiCandle(
@@ -65,6 +74,8 @@ public interface IRsiSignalService
     /// A CALL requires RSI <= Oversold and a PUT requires RSI >= Overbought.
     /// The current signal is emitted only after the same-direction historical
     /// backtest meets the configured success rate; no open-candle data is used.
+    /// Anti-repeat is checked but not recorded here — call
+    /// <see cref="MarkSignalEmitted"/> only after a successful trade place.
     /// </summary>
     Task<StrategySignal> GetSignalAsync(
         Guid userId,
@@ -73,5 +84,15 @@ public interface IRsiSignalService
         RsiStrategyOptions options,
         DateTimeOffset now,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Records that a Call/Put for this candle was consumed (trade placed),
+    /// so subsequent polls return None for the same closed candle.
+    /// </summary>
+    void MarkSignalEmitted(
+        Guid userId,
+        string asset,
+        int timeframeSeconds,
+        DateTimeOffset candleTime);
 }
 

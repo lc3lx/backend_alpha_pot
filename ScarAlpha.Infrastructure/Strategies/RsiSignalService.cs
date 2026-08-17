@@ -8,8 +8,8 @@ public sealed class RsiSignalService : IRsiSignalService
 {
     private readonly IRsiCalculator _calculator;
 
-    // Tracks last non-NONE signal candleTime per user+asset+timeframe, to avoid repeating signals for the same candle.
-    private readonly ConcurrentDictionary<string, DateTimeOffset> _lastNonNoneSignalCandleTime = new();
+    // Tracks last consumed (traded) signal candleTime per user+asset+timeframe.
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _lastEmittedSignalCandleTime = new();
 
     public RsiSignalService(IRsiCalculator calculator)
     {
@@ -31,8 +31,9 @@ public sealed class RsiSignalService : IRsiSignalService
 
         ValidateOptions(options);
 
+        // Closed only when EndTimestamp is known and not in the future — never treat null as closed.
         var closed = candles
-            .Where(c => c.EndTimestamp is null || c.EndTimestamp <= now)
+            .Where(c => c.EndTimestamp is DateTimeOffset end && end <= now)
             .OrderBy(c => c.Timestamp)
             .ToList();
 
@@ -79,11 +80,11 @@ public sealed class RsiSignalService : IRsiSignalService
                 Backtest: backtest));
         }
 
-        var key = $"{userId:N}:{asset.Trim().ToUpperInvariant()}:{options.TimeframeSeconds}";
-        if (_lastNonNoneSignalCandleTime.TryGetValue(key, out var lastTime) &&
+        var key = EmissionKey(userId, asset, options.TimeframeSeconds);
+        if (_lastEmittedSignalCandleTime.TryGetValue(key, out var lastTime) &&
             lastTime == currentCandle.Timestamp)
         {
-            // No repeat for the same candle.
+            // Already traded this closed candle — no re-emit.
             return Task.FromResult(new StrategySignal(
                 StrategyId: "rsi",
                 Asset: asset.Trim(),
@@ -94,8 +95,7 @@ public sealed class RsiSignalService : IRsiSignalService
                 Backtest: backtest));
         }
 
-        _lastNonNoneSignalCandleTime[key] = currentCandle.Timestamp;
-
+        // Do NOT record emission here — analyze-then-execute needs a second Call/Put.
         return Task.FromResult(new StrategySignal(
             StrategyId: "rsi",
             Asset: asset.Trim(),
@@ -105,6 +105,20 @@ public sealed class RsiSignalService : IRsiSignalService
             Timeframe: timeframe,
             Backtest: backtest));
     }
+
+    public void MarkSignalEmitted(
+        Guid userId,
+        string asset,
+        int timeframeSeconds,
+        DateTimeOffset candleTime)
+    {
+        if (string.IsNullOrWhiteSpace(asset))
+            return;
+        _lastEmittedSignalCandleTime[EmissionKey(userId, asset, timeframeSeconds)] = candleTime;
+    }
+
+    private static string EmissionKey(Guid userId, string asset, int timeframeSeconds) =>
+        $"{userId:N}:{asset.Trim().ToUpperInvariant()}:{timeframeSeconds}";
 
     private RsiBacktestStats EvaluateBacktest(
         IReadOnlyList<decimal> closes,
@@ -171,4 +185,3 @@ public sealed class RsiSignalService : IRsiSignalService
             throw new ApiException(ApiErrorCodes.ValidationError, "Minimum success rate must be between 0 and 100.");
     }
 }
-

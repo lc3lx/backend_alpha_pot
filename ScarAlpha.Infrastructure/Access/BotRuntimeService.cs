@@ -24,6 +24,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
         bool signalConfirmationEnabled = true,
         string riskLevel = "risk-medium",
         bool notificationsEnabled = true) =>
+        // User approval to run again: clear stop reason and reset PnL session to zero.
         Set(
             userId,
             BotRunState.Running,
@@ -36,7 +37,9 @@ public sealed class BotRuntimeService : IBotRuntimeService
             autoStopAtLoss,
             signalConfirmationEnabled,
             riskLevel,
-            notificationsEnabled);
+            notificationsEnabled,
+            pnlSessionStartedAt: DateTimeOffset.UtcNow,
+            stopReason: null);
 
     public BotRuntimeConfig Pause(Guid userId)
     {
@@ -53,10 +56,12 @@ public sealed class BotRuntimeService : IBotRuntimeService
             current.AutoStopAtLoss,
             current.SignalConfirmationEnabled,
             current.RiskLevel,
-            current.NotificationsEnabled);
+            current.NotificationsEnabled,
+            pnlSessionStartedAt: current.PnlSessionStartedAt,
+            stopReason: current.StopReason);
     }
 
-    public BotRuntimeConfig Stop(Guid userId)
+    public BotRuntimeConfig Stop(Guid userId, string? stopReason = null)
     {
         var current = Get(userId);
         return Set(
@@ -71,7 +76,9 @@ public sealed class BotRuntimeService : IBotRuntimeService
             current.AutoStopAtLoss,
             current.SignalConfirmationEnabled,
             current.RiskLevel,
-            current.NotificationsEnabled);
+            current.NotificationsEnabled,
+            pnlSessionStartedAt: current.PnlSessionStartedAt,
+            stopReason: stopReason);
     }
 
     public BotRuntimeConfig Apply(
@@ -104,7 +111,9 @@ public sealed class BotRuntimeService : IBotRuntimeService
             autoStopAtLoss ?? current.AutoStopAtLoss,
             signalConfirmationEnabled ?? current.SignalConfirmationEnabled,
             riskLevel ?? current.RiskLevel,
-            notificationsEnabled ?? current.NotificationsEnabled);
+            notificationsEnabled ?? current.NotificationsEnabled,
+            pnlSessionStartedAt: current.PnlSessionStartedAt,
+            stopReason: current.StopReason);
     }
 
     public IReadOnlyList<BotRuntimeConfig> ListKnown() =>
@@ -122,7 +131,9 @@ public sealed class BotRuntimeService : IBotRuntimeService
         bool autoStopAtLoss,
         bool signalConfirmationEnabled,
         string riskLevel,
-        bool notificationsEnabled)
+        bool notificationsEnabled,
+        DateTimeOffset? pnlSessionStartedAt,
+        string? stopReason)
     {
         if (amount <= 0 || amount > 100_000m)
             throw new ArgumentOutOfRangeException(nameof(amount));
@@ -145,7 +156,9 @@ public sealed class BotRuntimeService : IBotRuntimeService
             autoStopAtLoss,
             signalConfirmationEnabled,
             riskLevel,
-            notificationsEnabled);
+            notificationsEnabled,
+            pnlSessionStartedAt,
+            stopReason);
         _states[userId] = next;
         return next;
     }
@@ -162,7 +175,9 @@ public sealed class BotRuntimeService : IBotRuntimeService
         bool autoStopAtLoss = true,
         bool signalConfirmationEnabled = true,
         string riskLevel = "risk-medium",
-        bool notificationsEnabled = true)
+        bool notificationsEnabled = true,
+        DateTimeOffset? pnlSessionStartedAt = null,
+        string? stopReason = null)
     {
         var list = BotAssetList.Normalize(null, assets);
         return new BotRuntimeConfig(
@@ -179,6 +194,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
             signalConfirmationEnabled,
             riskLevel,
             notificationsEnabled,
-            list);
+            list,
+            pnlSessionStartedAt,
+            stopReason);
     }
 }

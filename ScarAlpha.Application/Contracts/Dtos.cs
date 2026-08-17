@@ -129,7 +129,9 @@ public sealed record BotRuntimeDto(
     bool SignalConfirmationEnabled,
     string RiskLevel,
     bool NotificationsEnabled,
-    IReadOnlyList<string> Assets);
+    IReadOnlyList<string> Assets,
+    DateTimeOffset? PnlSessionStartedAt = null,
+    string? StopReason = null);
 
 public sealed record BinollaStatusDto(
     bool Connected,

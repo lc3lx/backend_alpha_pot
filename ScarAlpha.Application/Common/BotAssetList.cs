@@ -1,9 +1,10 @@
 namespace ScarAlpha.Application.Common;
 
-/// <summary>Normalize bot trading-pair lists (1..Max pairs).</summary>
+/// <summary>Normalize bot trading-pair lists (all available market pairs; hard ceiling for safety).</summary>
 public static class BotAssetList
 {
-    public const int MaxAssets = 50;
+    /// <summary>Hard ceiling only — high enough to cover full Binolla asset lists.</summary>
+    public const int MaxAssets = 2000;
 
     public static IReadOnlyList<string> Normalize(string? asset, IEnumerable<string>? assets)
     {

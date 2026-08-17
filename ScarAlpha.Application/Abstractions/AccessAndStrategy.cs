@@ -89,7 +89,11 @@ public sealed record BotRuntimeConfig(
     bool SignalConfirmationEnabled = true,
     string RiskLevel = "risk-medium",
     bool NotificationsEnabled = true,
-    IReadOnlyList<string>? Assets = null)
+    IReadOnlyList<string>? Assets = null,
+    /// <summary>PnL for daily limits is counted only from this timestamp (set on each Start).</summary>
+    DateTimeOffset? PnlSessionStartedAt = null,
+    /// <summary>Why the bot last stopped — e.g. DAILY_PROFIT_TARGET_REACHED.</summary>
+    string? StopReason = null)
 {
     /// <summary>Selected pairs to analyze (falls back to single Asset).</summary>
     public IReadOnlyList<string> ResolvedAssets =>
@@ -116,7 +120,7 @@ public interface IBotRuntimeService
         string riskLevel = "risk-medium",
         bool notificationsEnabled = true);
     BotRuntimeConfig Pause(Guid userId);
-    BotRuntimeConfig Stop(Guid userId);
+    BotRuntimeConfig Stop(Guid userId, string? stopReason = null);
     BotRuntimeConfig Apply(
         Guid userId,
         string? asset,

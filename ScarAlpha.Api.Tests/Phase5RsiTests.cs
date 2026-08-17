@@ -93,14 +93,84 @@ public sealed class Phase5RsiTests
     }
 
     [Fact]
-    public async Task A_signal_is_not_repeated_for_the_same_closed_candle()
+    public async Task Null_EndTimestamp_candles_are_excluded_as_not_closed()
+    {
+        var service = new RsiSignalService(new RsiCalculator());
+        var options = RsiStrategyOptions.Default60Seconds with { MinimumSuccessRate = 0m };
+        var start = Now - TimeSpan.FromMinutes(25);
+        var candles = Enumerable.Range(0, 26)
+            .Select(i => new RsiCandle(start.AddMinutes(i), 100m - i, EndTimestamp: null))
+            .ToList();
+
+        var act = () => service.GetSignalAsync(UserId, Asset, candles, options, Now);
+        var error = await act.Should().ThrowAsync<ApiException>();
+        error.Which.Code.Should().Be(ApiErrorCodes.ValidationError);
+    }
+
+    [Fact]
+    public async Task Analyze_twice_still_emits_until_MarkSignalEmitted()
     {
         var service = new RsiSignalService(new RsiCalculator());
         var options = RsiStrategyOptions.Default60Seconds with { MinimumSuccessRate = 0m };
         var candles = CreateCandles(Enumerable.Range(0, 26).Select(i => 100m - i).ToList());
 
-        (await service.GetSignalAsync(UserId, Asset, candles, options, Now)).Signal.Should().Be("Call");
-        (await service.GetSignalAsync(UserId, Asset, candles, options, Now)).Signal.Should().Be("None");
+        var first = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
+        var second = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
+        first.Signal.Should().Be("Call");
+        second.Signal.Should().Be("Call");
+
+        service.MarkSignalEmitted(UserId, Asset, options.TimeframeSeconds, first.CandleTime);
+
+        var third = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
+        third.Signal.Should().Be("None");
+        third.Backtest!.Passed.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Passed_is_true_when_success_rate_meets_minimum_exactly()
+    {
+        // Pure downtrend historical CALL entries all lose → rate 0 → not passed at 75.
+        // With MinimumSuccessRate = 0, Passed becomes true when any historical signal exists.
+        var service = new RsiSignalService(new RsiCalculator());
+        var candles = CreateCandles(Enumerable.Range(0, 26).Select(i => 100m - i).ToList());
+
+        var atZero = await service.GetSignalAsync(
+            UserId, Asset, candles,
+            RsiStrategyOptions.Default60Seconds with { MinimumSuccessRate = 0m },
+            Now);
+        atZero.Backtest!.Passed.Should().BeTrue();
+        atZero.Signal.Should().Be("Call");
+
+        var atSeventyFive = await service.GetSignalAsync(
+            UserId, Asset, candles,
+            RsiStrategyOptions.Default60Seconds with { MinimumSuccessRate = 75m },
+            Now);
+        atSeventyFive.Backtest!.Passed.Should().BeFalse();
+        atSeventyFive.Signal.Should().Be("None");
+        atSeventyFive.Backtest.SuccessRate.Should().Be(0m);
+    }
+
+    [Fact]
+    public async Task Below_minimum_success_rate_emits_none()
+    {
+        var service = new RsiSignalService(new RsiCalculator());
+        var candles = CreateCandles(Enumerable.Range(0, 26).Select(i => 100m - i).ToList());
+        var options = RsiStrategyOptions.Default60Seconds with { MinimumSuccessRate = 75m };
+
+        var signal = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
+
+        signal.Signal.Should().Be("None");
+        signal.Backtest!.Passed.Should().BeFalse();
+        signal.Backtest.SuccessRate.Should().BeLessThan(75m);
+    }
+
+    [Fact]
+    public void FromBotDurationSeconds_maps_3_4_5_minutes()
+    {
+        RsiStrategyOptions.FromBotDurationSeconds(180).ExpiryCandles.Should().Be(3);
+        RsiStrategyOptions.FromBotDurationSeconds(240).ExpiryCandles.Should().Be(4);
+        RsiStrategyOptions.FromBotDurationSeconds(300).ExpiryCandles.Should().Be(5);
+        RsiStrategyOptions.FromBotDurationSeconds(60).ExpiryCandles.Should().Be(5);
     }
 
     [Fact]
