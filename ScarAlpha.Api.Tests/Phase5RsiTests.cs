@@ -207,19 +207,20 @@ public sealed class Phase5RsiTests
     }
 
     [Fact]
-    public async Task Stale_closed_candle_does_not_emit_call_or_put()
+    public async Task Live_rsi_at_extreme_enters_even_after_closed_candle_lag()
     {
         var service = new RsiSignalService(new RsiCalculator());
         var options = RsiStrategyOptions.Default60Seconds with { MaxEntryLagSeconds = 20 };
         var candles = CreateCandles(OversoldWithRespectedBounce());
-        // Candle closed long ago relative to Now+5min
         var lateNow = Now.AddMinutes(5);
 
         var signal = await service.GetSignalAsync(UserId, Asset, candles, options, lateNow);
 
-        signal.Signal.Should().Be("None");
-        signal.AutomationError.Should().Be("SIGNAL_STALE");
+        signal.Signal.Should().Be("Call");
+        signal.AutomationError.Should().BeNull();
         signal.Backtest!.Passed.Should().BeTrue();
+        signal.LiveRsi.Should().NotBeNull();
+        signal.LiveRsi!.Value.Should().BeLessThanOrEqualTo(options.Oversold);
     }
 
     [Fact]

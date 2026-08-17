@@ -69,7 +69,9 @@ public sealed class RsiSignalService : IRsiSignalService
         var entryBacktest = signalType == RsiSignalType.Call ? callBacktest
             : signalType == RsiSignalType.Put ? putBacktest
             : displayBacktest;
-        var entryCandleTime = forming?.Timestamp ?? currentCandle.Timestamp;
+        var liveBucket = new DateTimeOffset(
+            now.Year, now.Month, now.Day, now.Hour, now.Minute, 0, now.Offset);
+        var entryCandleTime = forming?.Timestamp ?? liveBucket;
 
         // #region agent log
         ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
@@ -112,45 +114,6 @@ public sealed class RsiSignalService : IRsiSignalService
         }
 
         var backtest = entryBacktest;
-
-        // Lag only applies when the feed has no forming bar (live RSI == last close).
-        if (forming is null)
-        {
-            var closedAt = currentCandle.EndTimestamp!.Value;
-            var lag = now - closedAt;
-            var maxLag = Math.Max(1, options.MaxEntryLagSeconds);
-            if (lag > TimeSpan.FromSeconds(maxLag))
-            {
-                // #region agent log
-                ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-                    "H-LAG1",
-                    "RsiSignalService.GetSignalAsync",
-                    "signal_stale_engine",
-                    new
-                    {
-                        asset = asset.Trim(),
-                        lagSec = Math.Round(lag.TotalSeconds, 2),
-                        maxLagSec = maxLag,
-                        candleStart = currentCandle.Timestamp.ToUnixTimeSeconds(),
-                        candleEnd = closedAt.ToUnixTimeSeconds(),
-                        nowSec = now.ToUnixTimeSeconds(),
-                        successRate = backtest.SuccessRate,
-                        direction = signalType.ToString()
-                    });
-                // #endregion
-                return Task.FromResult(new StrategySignal(
-                    StrategyId: "rsi",
-                    Asset: asset.Trim(),
-                    Signal: "None",
-                    Rsi: roundedRsi,
-                    CandleTime: currentCandle.Timestamp,
-                    Timeframe: timeframe,
-                    Backtest: backtest,
-                    AutomationError: "SIGNAL_STALE",
-                    LiveRsi: liveRsi));
-            }
-        }
-
         var key = EmissionKey(userId, asset, options.TimeframeSeconds);
         if (_lastEmittedSignalCandleTime.TryGetValue(key, out var lastTime) &&
             lastTime == entryCandleTime)

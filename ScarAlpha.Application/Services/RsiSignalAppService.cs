@@ -185,49 +185,21 @@ public sealed class RsiSignalAppService
             return signal with { AutomationError = "BACKTEST_NOT_PASSED", Signal = "None" };
         }
 
-        var liveAtExtreme = signal.LiveRsi is decimal lr &&
-            ((signal.Signal == "Call" && lr <= options.Oversold) ||
-             (signal.Signal == "Put" && lr >= options.Overbought));
-        var candleEnd = signal.CandleTime.AddSeconds(options.TimeframeSeconds);
-        var executeNow = DateTimeOffset.UtcNow;
-        var executeLag = executeNow - candleEnd;
-        var maxLag = Math.Max(1, options.MaxEntryLagSeconds);
-        if (!liveAtExtreme && executeLag > TimeSpan.FromSeconds(maxLag))
-        {
-            // #region agent log
-            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-                "H-LAG2",
-                "RsiSignalAppService.ExecuteIfRequestedAsync",
-                "signal_stale_at_execute",
-                new
-                {
-                    asset = signal.Asset,
-                    signal = signal.Signal,
-                    lagSec = Math.Round(executeLag.TotalSeconds, 2),
-                    maxLagSec = maxLag,
-                    candleEndUnix = candleEnd.ToUnixTimeSeconds(),
-                    successRate = signal.Backtest?.SuccessRate
-                });
-            // #endregion
-            return signal with { AutomationError = "SIGNAL_STALE", Signal = "None" };
-        }
-
         // #region agent log
-        if (liveAtExtreme)
-        {
-            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-                "H-LIVE",
-                "RsiSignalAppService.ExecuteIfRequestedAsync",
-                "skip_lag_live_extreme",
-                new
-                {
-                    asset = signal.Asset,
-                    signal = signal.Signal,
-                    liveRsi = signal.LiveRsi,
-                    lagSec = Math.Round(executeLag.TotalSeconds, 2)
-                },
-                runId: "missed-entry");
-        }
+        ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+            "H-LIVE",
+            "RsiSignalAppService.ExecuteIfRequestedAsync",
+            "execute_live_setup",
+            new
+            {
+                asset = signal.Asset,
+                signal = signal.Signal,
+                liveRsi = signal.LiveRsi,
+                closedRsi = signal.Rsi,
+                successRate = signal.Backtest?.SuccessRate,
+                botState = bot.State.ToString()
+            },
+            runId: "missed-entry");
         // #endregion
 
         var selected = bot.ResolvedAssets;
