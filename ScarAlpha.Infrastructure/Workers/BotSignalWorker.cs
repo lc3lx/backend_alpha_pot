@@ -137,111 +137,132 @@ public sealed class BotSignalWorker : IHostedService
         if (await HasBlockingOpenTradeAsync(trades, bot.UserId, ct).ConfigureAwait(false))
             return;
 
-        var rsi = scope.ServiceProvider.GetRequiredService<RsiSignalAppService>();
-        using (AmbientUserContext.Use(bot.UserId))
-        {
-            var options = RsiStrategyOptions.FromBotDurationSeconds(bot.DurationSeconds);
-            var batch = NextBatch(bot);
-            var bag = new ConcurrentBag<(string Asset, StrategySignal Signal)>();
-            var staleHits = 0;
-            var softNone = 0;
-            var userId = bot.UserId;
-            var scanStarted = DateTimeOffset.UtcNow;
-            var secIntoMin = SecondsIntoMinute();
-            await Parallel.ForEachAsync(
-                batch,
-                new ParallelOptions { MaxDegreeOfParallelism = ScanParallelism, CancellationToken = ct },
-                async (asset, token) =>
-                {
-                    using (AmbientUserContext.Use(userId))
-                    {
-                        try
-                        {
-                            var signal = await rsi.GetSignalAsync(asset, 60, options, autoExecute: false, token);
-                            if (signal.AutomationError == "SIGNAL_STALE")
-                                Interlocked.Increment(ref staleHits);
-                            else if (signal.Signal is not ("Call" or "Put"))
-                                Interlocked.Increment(ref softNone);
+        var options = RsiStrategyOptions.FromBotDurationSeconds(bot.DurationSeconds);
+        var batch = NextBatch(bot);
+        var bag = new ConcurrentBag<(string Asset, StrategySignal Signal)>();
+        var staleHits = 0;
+        var softNone = 0;
+        var dbRace = 0;
+        var userId = bot.UserId;
+        var scanStarted = DateTimeOffset.UtcNow;
+        var secIntoMin = SecondsIntoMinute();
 
-                            if (signal.Signal is ("Call" or "Put") &&
-                                signal.Backtest is { Passed: true } &&
-                                IsFresh(signal, options))
-                            {
-                                bag.Add((asset, signal));
-                            }
-                        }
-                        catch
+        // Each parallel asset MUST use its own DI scope — AppDbContext is not thread-safe.
+        await Parallel.ForEachAsync(
+            batch,
+            new ParallelOptions { MaxDegreeOfParallelism = ScanParallelism, CancellationToken = ct },
+            async (asset, token) =>
+            {
+                await using var assetScope = _scopeFactory.CreateAsyncScope();
+                var rsi = assetScope.ServiceProvider.GetRequiredService<RsiSignalAppService>();
+                using (AmbientUserContext.Use(userId))
+                {
+                    try
+                    {
+                        var signal = await rsi.GetSignalAsync(asset, 60, options, autoExecute: false, token);
+                        if (signal.AutomationError == "SIGNAL_STALE")
+                            Interlocked.Increment(ref staleHits);
+                        else if (signal.Signal is not ("Call" or "Put"))
+                            Interlocked.Increment(ref softNone);
+
+                        if (signal.Signal is ("Call" or "Put") &&
+                            signal.Backtest is { Passed: true } &&
+                            IsFresh(signal, options))
                         {
-                            // soft-skip pair
+                            bag.Add((asset, signal));
                         }
                     }
-                }).ConfigureAwait(false);
-
-            var scanMs = (DateTimeOffset.UtcNow - scanStarted).TotalMilliseconds;
-            var best = PickBest(bag.ToList(), options);
-
-            // #region agent log
-            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-                "H-LAG3",
-                "BotSignalWorker.ProcessBotAsync",
-                "scan_tick",
-                new
-                {
-                    userId = bot.UserId.ToString("N")[..8],
-                    assetCount = bot.ResolvedAssets.Count,
-                    batch = batch.Count,
-                    scanMs = Math.Round(scanMs, 0),
-                    secIntoMin,
-                    candidates = bag.Count,
-                    staleHits,
-                    softNone,
-                    maxLag = options.MaxEntryLagSeconds,
-                    hasBest = best is not null
-                });
-            // #endregion
-
-            if (best is null) return;
-
-            var lagAtPick = LagSeconds(best.Value.Signal, options);
-            if (!IsFresh(best.Value.Signal, options))
-            {
-                // #region agent log
-                ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-                    "H-LAG4",
-                    "BotSignalWorker.ProcessBotAsync",
-                    "best_went_stale_before_execute",
-                    new
+                    catch (InvalidOperationException ex) when (
+                        ex.Message.Contains("second operation", StringComparison.OrdinalIgnoreCase) ||
+                        ex.Message.Contains("DbContext", StringComparison.OrdinalIgnoreCase))
                     {
-                        asset = best.Value.Asset,
-                        lagSec = lagAtPick,
-                        maxLag = options.MaxEntryLagSeconds,
-                        scanMs = Math.Round(scanMs, 0)
-                    });
-                // #endregion
-                return;
-            }
+                        Interlocked.Increment(ref dbRace);
+                        // #region agent log
+                        ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                            "H-DB1",
+                            "BotSignalWorker.ProcessBotAsync",
+                            "dbcontext_race_caught",
+                            new { asset, err = ex.Message.Length > 80 ? ex.Message[..80] : ex.Message });
+                        // #endregion
+                    }
+                    catch
+                    {
+                        // soft-skip pair
+                    }
+                }
+            }).ConfigureAwait(false);
 
+        var scanMs = (DateTimeOffset.UtcNow - scanStarted).TotalMilliseconds;
+        var best = PickBest(bag.ToList(), options);
+
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+            "H-DB1",
+            "BotSignalWorker.ProcessBotAsync",
+            "scan_tick",
+            new
+            {
+                userId = bot.UserId.ToString("N")[..8],
+                assetCount = bot.ResolvedAssets.Count,
+                batch = batch.Count,
+                scanMs = Math.Round(scanMs, 0),
+                secIntoMin,
+                candidates = bag.Count,
+                staleHits,
+                softNone,
+                dbRace,
+                maxLag = options.MaxEntryLagSeconds,
+                hasBest = best is not null,
+                scopedPerAsset = true
+            });
+        // #endregion
+
+        if (best is null) return;
+
+        var lagAtPick = LagSeconds(best.Value.Signal, options);
+        if (!IsFresh(best.Value.Signal, options))
+        {
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-                "H-LAG2",
+                "H-LAG4",
                 "BotSignalWorker.ProcessBotAsync",
-                "best_signal_executing",
+                "best_went_stale_before_execute",
                 new
                 {
-                    userId = bot.UserId.ToString("N")[..8],
                     asset = best.Value.Asset,
-                    signal = best.Value.Signal.Signal,
-                    rsi = best.Value.Signal.Rsi,
-                    successRate = best.Value.Signal.Backtest?.SuccessRate,
                     lagSec = lagAtPick,
                     maxLag = options.MaxEntryLagSeconds,
-                    candidates = bag.Count,
-                    scanMs = Math.Round(scanMs, 0),
-                    secIntoMin
+                    scanMs = Math.Round(scanMs, 0)
                 });
             // #endregion
+            return;
+        }
 
-            var placed = await rsi.GetSignalAsync(best.Value.Asset, 60, options, autoExecute: true, ct);
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+            "H-LAG2",
+            "BotSignalWorker.ProcessBotAsync",
+            "best_signal_executing",
+            new
+            {
+                userId = bot.UserId.ToString("N")[..8],
+                asset = best.Value.Asset,
+                signal = best.Value.Signal.Signal,
+                rsi = best.Value.Signal.Rsi,
+                successRate = best.Value.Signal.Backtest?.SuccessRate,
+                lagSec = lagAtPick,
+                maxLag = options.MaxEntryLagSeconds,
+                candidates = bag.Count,
+                scanMs = Math.Round(scanMs, 0),
+                secIntoMin
+            });
+        // #endregion
+
+        await using var execScope = _scopeFactory.CreateAsyncScope();
+        var execRsi = execScope.ServiceProvider.GetRequiredService<RsiSignalAppService>();
+        using (AmbientUserContext.Use(bot.UserId))
+        {
+            var placed = await execRsi.GetSignalAsync(best.Value.Asset, 60, options, autoExecute: true, ct);
 
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
