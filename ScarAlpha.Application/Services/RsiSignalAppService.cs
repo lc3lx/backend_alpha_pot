@@ -304,6 +304,28 @@ public sealed class RsiSignalAppService
             var key = $"bot:rsi:{signal.Asset.Trim().ToUpperInvariant()}:{signal.CandleTime.ToUnixTimeSeconds()}:{signal.Signal}";
             try
             {
+                var putOk = signal.LiveRsi is decimal lr && lr >= RsiEntryLevels.PutMin;
+                var callOk = signal.LiveRsi is decimal lc && lc <= RsiEntryLevels.CallMax;
+                var violation = (signal.Signal == "Put" && !putOk) || (signal.Signal == "Call" && !callOk);
+                // #region agent log
+                ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                    "H-C",
+                    "RsiSignalAppService.ExecuteIfRequestedAsync",
+                    "place_rsi_snapshot",
+                    new
+                    {
+                        asset = signal.Asset,
+                        signal = signal.Signal,
+                        liveRsi = signal.LiveRsi,
+                        closedRsi = signal.Rsi,
+                        rsiEqClosed = signal.LiveRsi == signal.Rsi,
+                        putOk,
+                        callOk,
+                        violation,
+                        successRate = signal.Backtest?.SuccessRate
+                    },
+                    runId: "rsi-zone");
+                // #endregion
                 var trade = await _trades.PlaceTradeAsync(new PlaceTradeRequest(
                     Asset: signal.Asset,
                     Direction: signal.Signal.ToUpperInvariant(),

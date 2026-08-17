@@ -193,6 +193,8 @@ public sealed class RsiSignalService : IRsiSignalService
                 ageSeconds = Math.Round(ageSeconds, 2),
                 consumed = watch.Consumed,
                 wouldEnter = fresh,
+                putOk = RsiEntryLevels.IsPutRsi(liveRsi),
+                callOk = RsiEntryLevels.IsCallRsi(liveRsi),
                 skip = fresh
                     ? "ok"
                     : watch.Consumed ? "consumed" : "expired",

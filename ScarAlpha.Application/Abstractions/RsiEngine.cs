@@ -102,6 +102,14 @@ public static class RsiEntryLevels
             if (!IsCallRsi(liveRsi))
             {
                 rejectCode = "RSI_NOT_OVERSOLD";
+                // #region agent log
+                ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                    "H-A",
+                    "RsiEntryLevels.TryValidateForTrade",
+                    "gate_reject_rsi",
+                    new { signal = signal.Signal, liveRsi, closedRsi = signal.Rsi, rejectCode, callMax = CallMax, putMin = PutMin },
+                    runId: "rsi-zone");
+                // #endregion
                 return false;
             }
 
@@ -116,6 +124,14 @@ public static class RsiEntryLevels
             if (!IsPutRsi(liveRsi))
             {
                 rejectCode = "RSI_NOT_OVERBOUGHT";
+                // #region agent log
+                ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                    "H-A",
+                    "RsiEntryLevels.TryValidateForTrade",
+                    "gate_reject_rsi",
+                    new { signal = signal.Signal, liveRsi, closedRsi = signal.Rsi, rejectCode, callMax = CallMax, putMin = PutMin },
+                    runId: "rsi-zone");
+                // #endregion
                 return false;
             }
 
@@ -140,6 +156,26 @@ public static class RsiEntryLevels
             return false;
         }
 
+        var violation = (signal.Signal == "Put" && liveRsi < PutMin) ||
+                        (signal.Signal == "Call" && liveRsi > CallMax);
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+            "H-A",
+            "RsiEntryLevels.TryValidateForTrade",
+            "gate_pass",
+            new
+            {
+                signal = signal.Signal,
+                liveRsi,
+                closedRsi = signal.Rsi,
+                rsiEqClosed = liveRsi == signal.Rsi,
+                putOk = liveRsi >= PutMin,
+                callOk = liveRsi <= CallMax,
+                violation,
+                ageSec = Math.Round(ageSeconds, 2)
+            },
+            runId: "rsi-zone");
+        // #endregion
         return true;
     }
 }

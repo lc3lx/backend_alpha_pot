@@ -117,6 +117,20 @@ public sealed class TradeAppService
         }
 
         var direction = ParseDirection(request.Direction);
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+            "H-D",
+            "TradeAppService.PlaceTradeAsync",
+            "place_requested",
+            new
+            {
+                asset = request.Asset,
+                direction = request.Direction,
+                strategyId = request.StrategyId,
+                durationSec = request.DurationSeconds
+            },
+            runId: "rsi-zone");
+        // #endregion
         var now = DateTimeOffset.UtcNow;
         var trade = new Trade
         {
