@@ -180,7 +180,7 @@ public sealed class Phase5RsiTests
         signal.Signal.Should().Be("None");
         signal.Rsi.Should().Be(50m);
         signal.Backtest.Should().NotBeNull();
-        signal.Backtest!.LookbackCandles.Should().Be(60);
+        signal.Backtest!.LookbackCandles.Should().Be(200);
     }
 
     [Fact]
@@ -230,7 +230,7 @@ public sealed class Phase5RsiTests
         var signal = await service.GetSignalAsync(UserId, Asset, CreateCandles(OversoldWithRespectedBounce()), options, Now);
 
         signal.Backtest.Should().NotBeNull();
-        signal.Backtest!.LookbackCandles.Should().Be(60);
+        signal.Backtest!.LookbackCandles.Should().Be(200);
         signal.Backtest.TotalSignals.Should().BeGreaterThan(0);
         signal.Backtest.Passed.Should().BeTrue();
         signal.Backtest.SuccessRate.Should().BeGreaterThanOrEqualTo(75m);

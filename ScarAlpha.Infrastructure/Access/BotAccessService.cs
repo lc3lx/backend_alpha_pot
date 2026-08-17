@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using ScarAlpha.Application.Abstractions;
 using ScarAlpha.Binolla.Abstractions;
 using ScarAlpha.Binolla.Models;
@@ -8,6 +9,9 @@ namespace ScarAlpha.Infrastructure.Access;
 
 public sealed class BotAccessService : IBotAccessService
 {
+    private static readonly ConcurrentDictionary<Guid, CacheEntry> AccessCache = new();
+    private static readonly ConcurrentDictionary<Guid, SemaphoreSlim> UserGates = new();
+
     private readonly IBinollaLinkRepository _links;
     private readonly IBinollaSessionManager _sessions;
     private readonly IBinollaSessionRestorer _restorer;
@@ -26,6 +30,41 @@ public sealed class BotAccessService : IBotAccessService
     }
 
     public async Task<BotAccessResult> CheckAsync(Guid userId, CancellationToken ct = default)
+    {
+        if (TryGetCached(userId, out var cached))
+            return cached;
+
+        var gate = UserGates.GetOrAdd(userId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (TryGetCached(userId, out cached))
+                return cached;
+
+            var result = await CheckUncachedAsync(userId, ct).ConfigureAwait(false);
+            AccessCache[userId] = new CacheEntry(DateTimeOffset.UtcNow, result);
+            return result;
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private static bool TryGetCached(Guid userId, out BotAccessResult result)
+    {
+        if (AccessCache.TryGetValue(userId, out var hit) &&
+            DateTimeOffset.UtcNow - hit.At < TimeSpan.FromSeconds(2))
+        {
+            result = hit.Result;
+            return true;
+        }
+
+        result = default!;
+        return false;
+    }
+
+    private async Task<BotAccessResult> CheckUncachedAsync(Guid userId, CancellationToken ct)
     {
         var user = await _users.GetByIdAsync(userId, ct);
         if (user?.IsMarketingDemo == true)
@@ -169,6 +208,8 @@ public sealed class BotAccessService : IBotAccessService
             AccountType: accountType,
             ApprovalStatus: approvalStatus);
     }
+
+    private readonly record struct CacheEntry(DateTimeOffset At, BotAccessResult Result);
 
     private static bool IsLive(IBinollaClient? client) =>
         client is not null &&

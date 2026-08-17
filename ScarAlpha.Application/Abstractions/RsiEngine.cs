@@ -14,7 +14,7 @@ public sealed record RsiStrategyOptions(
     decimal Oversold,
     decimal Overbought,
     int TimeframeSeconds,
-    int BacktestCandleCount = 60,
+    int BacktestCandleCount = 200,
     int ExpiryCandles = 5,
     decimal MinimumSuccessRate = 75m,
     /// <summary>
@@ -77,10 +77,10 @@ public interface IRsiCalculator
 public interface IRsiSignalService
 {
     /// <summary>
-    /// Computes live RSI and a 60×1m zone-respect backtest on every snapshot.
+    /// Computes live RSI and a 200×1m zone-respect backtest on every snapshot.
     /// Call/Put is emitted as soon as live RSI is at an extreme AND the matching
-    /// zone (25/75) was touched and respected in the last hour — does not wait
-    /// for the forming candle to close.
+    /// zone (25/75) was touched and respected in the last 200 one-minute candles
+    /// — does not wait for the forming candle to close.
     /// Anti-repeat is checked but not recorded here — call
     /// <see cref="MarkSignalEmitted"/> only after a successful trade place.
     /// </summary>

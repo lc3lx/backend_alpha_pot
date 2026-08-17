@@ -13,7 +13,7 @@ namespace ScarAlpha.Infrastructure.Workers;
 
 /// <summary>
 /// Keeps bots analyzing/trading while the Mini App is closed.
-/// Scans every selected pair each tick (RSI + 60-candle zone backtest in parallel).
+/// Scans every selected pair each tick (RSI + 200-candle zone backtest in parallel).
 /// </summary>
 public sealed class BotSignalWorker : IHostedService
 {
