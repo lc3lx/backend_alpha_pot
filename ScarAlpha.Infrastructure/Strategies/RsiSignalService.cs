@@ -65,10 +65,17 @@ public sealed class RsiSignalService : IRsiSignalService
 
         // Live RSI is the primary gate. Backtest is computed in parallel but ignored for entry
         // until RSI is ≤25 (Call) or ≥75 (Put). Only then does matching backtest matter.
+        // Without a forming bar (fresh quote), closed-only RSI must not trigger entries.
         RsiSignalType signalType;
         RsiBacktestStats? entryBacktest;
         string? midSkip;
-        if (RsiEntryLevels.IsCallRsi(liveRsi))
+        if (forming is null)
+        {
+            signalType = RsiSignalType.None;
+            entryBacktest = null;
+            midSkip = "noLiveQuote";
+        }
+        else if (RsiEntryLevels.IsCallRsi(liveRsi))
         {
             if (RsiEntryLevels.BacktestOk(callBacktest))
             {

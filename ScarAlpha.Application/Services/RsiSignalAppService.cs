@@ -79,6 +79,15 @@ public sealed class RsiSignalAppService
             AccountAppService.EnsureConnectedForMarket(access);
         }
 
+        // While a live trade is open for this user: do not analyze / place.
+        if (await HasBlockingOpenTradeAsync(ct))
+        {
+            return SoftNone(asset.Trim(), periodSeconds) with
+            {
+                AutomationError = "OPEN_TRADE_EXISTS"
+            };
+        }
+
         var symbol = asset.Trim();
         var wirePeriod = BinollaMarketPeriods.NormalizeHistoryPeriod(periodSeconds);
         var client = await EnsureLiveClientAsync(ct);
@@ -99,6 +108,7 @@ public sealed class RsiSignalAppService
         {
             var history = await client.GetHistoryAsync(symbol, wirePeriod, CancellationToken.None);
 
+            var now = DateTimeOffset.UtcNow;
             var period = TimeSpan.FromSeconds(wirePeriod);
             var candles = history.Candles
                 .OrderBy(c => c.Timestamp)
@@ -119,12 +129,14 @@ public sealed class RsiSignalAppService
             if (candles.Count == 0)
                 return SoftNone(symbol, wirePeriod);
 
+            _ = ApplyLiveQuoteToCandles(client, symbol, candles, wirePeriod, now);
+
             var signal = await _signalService.GetSignalAsync(
                 userId: _currentUser.UserId,
                 asset: symbol,
                 candles: candles,
                 options: options,
-                now: DateTimeOffset.UtcNow,
+                now: now,
                 ct: ct);
             return await ExecuteIfRequestedAsync(signal, options, autoExecute, ct);
         }
@@ -395,5 +407,101 @@ public sealed class RsiSignalAppService
         }
 
         return Task.FromResult<IBinollaClient?>(null);
+    }
+
+    private async Task<bool> HasBlockingOpenTradeAsync(CancellationToken ct)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var running = await _tradeRepository.ListByUserAsync(
+            _currentUser.UserId, take: 20, status: TradeStatus.Running, ct: ct);
+        var pending = await _tradeRepository.ListByUserAsync(
+            _currentUser.UserId, take: 10, status: TradeStatus.Pending, ct: ct);
+        var blocking = running.Concat(pending).Count(t => OpenTradeGate.IsBlocking(t, now));
+        if (blocking > 0)
+        {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                "H-STUCK1",
+                "RsiSignalAppService.HasBlockingOpenTradeAsync",
+                "signal_skip_blocking_open",
+                new { blocking, running = running.Count, pending = pending.Count },
+                runId: "stuck-running");
+            // #endregion
+        }
+
+        return blocking > 0;
+    }
+
+    /// <summary>
+    /// Overlay the latest tick as a forming candle so live RSI tracks price, not the last closed bar.
+    /// Without a fresh quote, closed-only RSI must not drive entries.
+    /// </summary>
+    private static bool ApplyLiveQuoteToCandles(
+        IBinollaClient client,
+        string symbol,
+        List<RsiCandle> candles,
+        int wirePeriod,
+        DateTimeOffset now)
+    {
+        const int maxQuoteAgeSeconds = 15;
+        if (!client.TryGetCachedQuote(symbol, out var quote) || quote is null)
+        {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                "H-LIVE1",
+                "RsiSignalAppService.ApplyLiveQuoteToCandles",
+                "no_cached_quote",
+                new { symbol },
+                runId: "live-rsi");
+            // #endregion
+            return false;
+        }
+
+        var ageMs = (now - quote.ReceivedAt).TotalMilliseconds;
+        if (ageMs > maxQuoteAgeSeconds * 1000)
+        {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                "H-LIVE1",
+                "RsiSignalAppService.ApplyLiveQuoteToCandles",
+                "quote_too_stale",
+                new { symbol, ageMs = Math.Round(ageMs, 0), price = quote.Price },
+                runId: "live-rsi");
+            // #endregion
+            return false;
+        }
+
+        var period = TimeSpan.FromSeconds(wirePeriod);
+        var bucketStartUnix = now.ToUnixTimeSeconds() / wirePeriod * wirePeriod;
+        var bucketStart = DateTimeOffset.FromUnixTimeSeconds(bucketStartUnix);
+        var price = (decimal)quote.Price;
+
+        // Drop any bar that belongs to the current (still open) minute — replace with live quote.
+        candles.RemoveAll(c =>
+            c.Timestamp >= bucketStart ||
+            c.EndTimestamp is null ||
+            c.EndTimestamp > now);
+
+        candles.Add(new RsiCandle(
+            Timestamp: bucketStart,
+            Close: price,
+            EndTimestamp: null));
+
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+            "H-LIVE1",
+            "RsiSignalAppService.ApplyLiveQuoteToCandles",
+            "forming_from_quote",
+            new
+            {
+                symbol,
+                price,
+                ageMs = Math.Round(ageMs, 0),
+                bucketStart = bucketStartUnix,
+                closedCount = candles.Count - 1
+            },
+            runId: "live-rsi");
+        // #endregion
+        return true;
     }
 }

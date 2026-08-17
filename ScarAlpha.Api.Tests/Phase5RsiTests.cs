@@ -399,9 +399,12 @@ public sealed class Phase5RsiTests
     private static List<RsiCandle> CreateCandles(List<decimal> closes, int? openLastIndex = null)
     {
         var start = Now - TimeSpan.FromMinutes(closes.Count - 1);
+        // Default: last bar is still forming (matches live quote overlay in production).
+        // Null EndTimestamp stays open for any evaluation `now` (setup TTL tests advance time).
+        var formingIndex = openLastIndex ?? closes.Count - 1;
         return closes.Select((close, index) => new RsiCandle(
             start.AddMinutes(index),
             close,
-            openLastIndex == index ? Now.AddSeconds(10) : Now.AddSeconds(-1))).ToList();
+            index == formingIndex ? null : Now.AddSeconds(-1))).ToList();
     }
 }

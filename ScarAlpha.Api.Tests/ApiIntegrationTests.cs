@@ -111,6 +111,19 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
                     Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0,
                     ReceivedAt = DateTimeOffset.UtcNow
                 });
+            QuoteData? cachedQuote = null;
+            Client.Setup(c => c.TryGetCachedQuote(It.IsAny<string>(), out cachedQuote))
+                .Returns((string asset, out QuoteData? quote) =>
+                {
+                    quote = new QuoteData
+                    {
+                        Pair = asset,
+                        Price = 1.23456,
+                        Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0,
+                        ReceivedAt = DateTimeOffset.UtcNow
+                    };
+                    return true;
+                });
             Client.Setup(c => c.GetHistoryAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync((string asset, int period, CancellationToken _) => new HistoryData
                 {

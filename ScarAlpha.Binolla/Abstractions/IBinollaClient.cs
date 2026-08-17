@@ -56,6 +56,9 @@ public interface IBinollaClient : IAsyncDisposable
     /// </summary>
     Task<QuoteData> GetLatestQuoteAsync(string asset, CancellationToken cancellationToken = default);
 
+    /// <summary>Non-blocking peek at the in-memory quote cache (may be null).</summary>
+    bool TryGetCachedQuote(string asset, out QuoteData? quote);
+
     /// <summary>
     /// Subscribe to the pair/period and return the latest pushed history/candles.
     /// </summary>

@@ -723,6 +723,15 @@ public sealed class BinollaSession : IBinollaClient
         throw new BinollaTimeoutException("Quote not available for asset.");
     }
 
+    public bool TryGetCachedQuote(string asset, out QuoteData? quote)
+    {
+        quote = null;
+        if (string.IsNullOrWhiteSpace(asset))
+            return false;
+        quote = FindQuoteFor(asset.Trim());
+        return quote is not null;
+    }
+
     public async Task<HistoryData> GetHistoryAsync(string asset, int period, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
@@ -737,7 +746,7 @@ public sealed class BinollaSession : IBinollaClient
         var requestedPeriod = period;
         var wirePeriod = BinollaMarketPeriods.NormalizeHistoryPeriod(period);
 
-        if (FindHistoryFor(key, wirePeriod) is { } cached)
+        if (FindHistoryFor(key, wirePeriod) is { } cached && !IsHistoryTooStale(cached, wirePeriod))
         {
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H115", "BinollaSession.GetHistoryAsync", "history_hit_cache", new
@@ -752,6 +761,19 @@ public sealed class BinollaSession : IBinollaClient
             LogHistoryVsQuote(key, cached, "cache");
             // #endregion
             return cached;
+        }
+
+        if (FindHistoryFor(key, wirePeriod) is { } stale)
+        {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H115", "BinollaSession.GetHistoryAsync", "history_cache_stale", new
+            {
+                symbol = key,
+                wirePeriod,
+                candleCount = stale.Candles.Count
+            });
+            // #endregion
+            EvictHistory(key, wirePeriod);
         }
 
         await SubscribePairAsync(key, wirePeriod, CancellationToken.None).ConfigureAwait(false);
@@ -857,7 +879,9 @@ public sealed class BinollaSession : IBinollaClient
     private void LogHistoryVsQuote(string key, HistoryData history, string source)
     {
         // #region agent log
-        var last = history.Candles.Count > 0 ? history.Candles[^1] : null;
+        var last = history.Candles.Count > 0
+            ? history.Candles.OrderBy(c => c.Timestamp).Last()
+            : null;
         var quote = FindQuoteFor(key);
         ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
             "H-LIVE1",
@@ -881,6 +905,27 @@ public sealed class BinollaSession : IBinollaClient
             },
             runId: "live-rsi");
         // #endregion
+    }
+
+    private static bool IsHistoryTooStale(HistoryData history, int periodSeconds)
+    {
+        if (history.Candles.Count == 0)
+            return true;
+        var last = history.Candles.OrderBy(c => c.Timestamp).Last();
+        var lastStart = DateTimeOffset.FromUnixTimeMilliseconds((long)(last.Timestamp * 1000));
+        var maxAge = TimeSpan.FromSeconds(Math.Max(periodSeconds * 3, 180));
+        return DateTimeOffset.UtcNow - lastStart > maxAge;
+    }
+
+    private void EvictHistory(string key, int wirePeriod)
+    {
+        var preferredKey = $"{key}:{wirePeriod}";
+        State.HistoricalData.TryRemove(preferredKey, out _);
+        foreach (var pair in State.HistoricalData.Keys.ToList())
+        {
+            if (pair.StartsWith(key + ":", StringComparison.OrdinalIgnoreCase))
+                State.HistoricalData.TryRemove(pair, out _);
+        }
     }
 
     /// <summary>
