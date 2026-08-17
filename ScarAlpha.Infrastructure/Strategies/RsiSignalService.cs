@@ -63,26 +63,88 @@ public sealed class RsiSignalService : IRsiSignalService
             .OrderBy(c => c.Timestamp)
             .LastOrDefault();
 
-        // Call = live RSI ≤ 25 AND call backtest passed. Put = live RSI ≥ 75 AND put backtest passed.
-        // No entry between 25 and 75, and no entry on backtest alone.
+        // Live RSI is the primary gate. Backtest is computed in parallel but ignored for entry
+        // until RSI is ≤25 (Call) or ≥75 (Put). Only then does matching backtest matter.
+        RsiSignalType signalType;
+        RsiBacktestStats? entryBacktest;
+        string? midSkip;
+        if (RsiEntryLevels.IsCallRsi(liveRsi))
+        {
+            if (RsiEntryLevels.BacktestOk(callBacktest))
+            {
+                signalType = RsiSignalType.Call;
+                entryBacktest = callBacktest;
+                midSkip = null;
+            }
+            else
+            {
+                signalType = RsiSignalType.None;
+                entryBacktest = null;
+                midSkip = "backtest";
+            }
+        }
+        else if (RsiEntryLevels.IsPutRsi(liveRsi))
+        {
+            if (RsiEntryLevels.BacktestOk(putBacktest))
+            {
+                signalType = RsiSignalType.Put;
+                entryBacktest = putBacktest;
+                midSkip = null;
+            }
+            else
+            {
+                signalType = RsiSignalType.None;
+                entryBacktest = null;
+                midSkip = "backtest";
+            }
+        }
+        else
+        {
+            // Mid-range live RSI — backtest has no entry value.
+            signalType = RsiSignalType.None;
+            entryBacktest = null;
+            midSkip = "midRsi";
+        }
+
         var touchedOversold = RsiEntryLevels.IsCallRsi(liveRsi);
         var touchedOverbought = RsiEntryLevels.IsPutRsi(liveRsi);
-        var signalType = RsiEntryLevels.CanEnterCall(liveRsi, callBacktest) ? RsiSignalType.Call
-            : RsiEntryLevels.CanEnterPut(liveRsi, putBacktest) ? RsiSignalType.Put
-            : RsiSignalType.None;
-        var entryBacktest = signalType == RsiSignalType.Call ? callBacktest
-            : signalType == RsiSignalType.Put ? putBacktest
-            : null;
 
         var timeframe = options.TimeframeSeconds.ToString();
-        var displayBacktest = signalType == RsiSignalType.Call ? callBacktest
-            : signalType == RsiSignalType.Put ? putBacktest
+        // Display: when at extreme show that side's backtest; otherwise show either for info only.
+        var displayBacktest = touchedOversold ? callBacktest
+            : touchedOverbought ? putBacktest
             : liveRsi >= 50m ? putBacktest : callBacktest;
         var key = EmissionKey(userId, asset, options.TimeframeSeconds);
 
         if (signalType == RsiSignalType.None || entryBacktest is null)
         {
             _setups.TryRemove(key, out _);
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                "H-LIVE",
+                "RsiSignalService.GetSignalAsync",
+                "live_entry_eval",
+                new
+                {
+                    asset = asset.Trim(),
+                    rsi = roundedRsi,
+                    liveRsi,
+                    hasForming = forming is not null,
+                    rsiSide = "None",
+                    lookback = options.BacktestCandleCount,
+                    touchedOversold,
+                    touchedOverbought,
+                    wouldEnter = false,
+                    skip = midSkip,
+                    callRate = callBacktest.SuccessRate,
+                    callN = callBacktest.TotalSignals,
+                    callPass = callBacktest.Passed,
+                    putRate = putBacktest.SuccessRate,
+                    putN = putBacktest.TotalSignals,
+                    putPass = putBacktest.Passed
+                },
+                runId: "missed-entry");
+            // #endregion
             return Task.FromResult(new StrategySignal(
                 StrategyId: "rsi",
                 Asset: asset.Trim(),

@@ -38,10 +38,11 @@ public sealed record RsiStrategyOptions(
 }
 
 /// <summary>
-/// Hard entry rules for live bot trades. ALL must pass before PlaceTrade:
-/// 1) Call: live RSI ≤ 25 — Put: live RSI ≥ 75
-/// 2) Matching zone-respect backtest Passed with ≥ 75% and at least one visit
-/// 3) Setup still within <see cref="SetupTtlSeconds"/> of first sight
+/// Entry order (strict):
+/// 1) Live RSI of the pair is primary — Put only if ≥ 75, Call only if ≤ 25.
+/// 2) Backtest runs in parallel and is ready, but has ZERO entry value until step 1 is true.
+/// 3) Only after RSI is at the extreme, require matching backtest Passed (≥ 75%, visits &gt; 0).
+/// 4) Setup must still be within <see cref="SetupTtlSeconds"/> of first sight.
 /// </summary>
 public static class RsiEntryLevels
 {
@@ -59,14 +60,16 @@ public static class RsiEntryLevels
         backtest.SuccessRate >= MinSuccessRate &&
         backtest.SuccessRate >= backtest.MinimumSuccessRate;
 
+    /// <summary>RSI first; backtest only consulted when live RSI is already at the extreme.</summary>
     public static bool CanEnterCall(decimal rsi, RsiBacktestStats? backtest) =>
         IsCallRsi(rsi) && BacktestOk(backtest);
 
+    /// <summary>RSI first; backtest only consulted when live RSI is already at the extreme.</summary>
     public static bool CanEnterPut(decimal rsi, RsiBacktestStats? backtest) =>
         IsPutRsi(rsi) && BacktestOk(backtest);
 
     /// <summary>
-    /// Final gate before placing a bot trade. Rejects display-only / expired / incomplete setups.
+    /// Final gate before placing a bot trade. Live RSI is checked before backtest.
     /// </summary>
     public static bool TryValidateForTrade(
         StrategySignal signal,
@@ -82,27 +85,44 @@ public static class RsiEntryLevels
             return false;
         }
 
-        if (signal.Signal is not ("Call" or "Put"))
-        {
-            rejectCode = "NO_SIGNAL";
-            return false;
-        }
-
         if (signal.LiveRsi is not decimal liveRsi)
         {
             rejectCode = "LIVE_RSI_REQUIRED";
             return false;
         }
 
-        if (signal.Signal == "Call" && !CanEnterCall(liveRsi, signal.Backtest))
+        // Primary gate: live RSI. Until this passes, backtest is irrelevant.
+        if (signal.Signal == "Call")
         {
-            rejectCode = IsCallRsi(liveRsi) ? "BACKTEST_NOT_PASSED" : "RSI_NOT_OVERSOLD";
-            return false;
-        }
+            if (!IsCallRsi(liveRsi))
+            {
+                rejectCode = "RSI_NOT_OVERSOLD";
+                return false;
+            }
 
-        if (signal.Signal == "Put" && !CanEnterPut(liveRsi, signal.Backtest))
+            if (!BacktestOk(signal.Backtest))
+            {
+                rejectCode = "BACKTEST_NOT_PASSED";
+                return false;
+            }
+        }
+        else if (signal.Signal == "Put")
         {
-            rejectCode = IsPutRsi(liveRsi) ? "BACKTEST_NOT_PASSED" : "RSI_NOT_OVERBOUGHT";
+            if (!IsPutRsi(liveRsi))
+            {
+                rejectCode = "RSI_NOT_OVERBOUGHT";
+                return false;
+            }
+
+            if (!BacktestOk(signal.Backtest))
+            {
+                rejectCode = "BACKTEST_NOT_PASSED";
+                return false;
+            }
+        }
+        else
+        {
+            rejectCode = "NO_SIGNAL";
             return false;
         }
 
@@ -160,8 +180,9 @@ public interface IRsiSignalService
 {
     /// <summary>
     /// Computes live RSI and a 200×1m zone-respect backtest on every snapshot.
-    /// Call = live RSI ≤ 25 AND the 200×1m call backtest passed (touch 25, leave, price up).
-    /// Put  = live RSI ≥ 75 AND the 200×1m put backtest passed (touch 75, leave, price down).
+    /// Call = live RSI ≤ 25 first, then call backtest must pass.
+    /// Put  = live RSI ≥ 75 first, then put backtest must pass.
+    /// Backtest runs in parallel but has no entry value until live RSI is at the extreme.
     /// Emits on the first moment both conditions are true and expires after 5 seconds
     /// — does not wait for the forming candle to close or for the next minute.
     /// Anti-repeat is checked but not recorded here — call
