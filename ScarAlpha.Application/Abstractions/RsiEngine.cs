@@ -14,7 +14,7 @@ public sealed record RsiStrategyOptions(
     decimal Oversold,
     decimal Overbought,
     int TimeframeSeconds,
-    int BacktestCandleCount = 400,
+    int BacktestCandleCount = 40,
     int ExpiryCandles = 5,
     decimal MinimumSuccessRate = 75m,
     /// <summary>

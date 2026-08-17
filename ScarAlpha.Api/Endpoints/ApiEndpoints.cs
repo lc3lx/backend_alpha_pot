@@ -218,7 +218,7 @@ public static class StrategyEndpoints
             [FromQuery] int rsiLength = 14,
             [FromQuery] decimal oversold = 25m,
             [FromQuery] decimal overbought = 75m,
-            [FromQuery] int backtestCandles = 400,
+            [FromQuery] int backtestCandles = 40,
             [FromQuery] int expiryCandles = 5,
             [FromQuery] decimal minimumSuccessRate = 75m,
             [FromQuery] bool autoExecute = false) =>
