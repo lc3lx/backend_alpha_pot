@@ -83,8 +83,26 @@ public sealed class RsiSignalService : IRsiSignalService
         // Instant entry only: if this closed candle is already old, the setup is gone.
         var closedAt = currentCandle.EndTimestamp!.Value;
         var lag = now - closedAt;
-        if (lag > TimeSpan.FromSeconds(Math.Max(1, options.MaxEntryLagSeconds)))
+        var maxLag = Math.Max(1, options.MaxEntryLagSeconds);
+        if (lag > TimeSpan.FromSeconds(maxLag))
         {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                "H-LAG1",
+                "RsiSignalService.GetSignalAsync",
+                "signal_stale_engine",
+                new
+                {
+                    asset = asset.Trim(),
+                    lagSec = Math.Round(lag.TotalSeconds, 2),
+                    maxLagSec = maxLag,
+                    candleStart = currentCandle.Timestamp.ToUnixTimeSeconds(),
+                    candleEnd = closedAt.ToUnixTimeSeconds(),
+                    nowSec = now.ToUnixTimeSeconds(),
+                    successRate = backtest.SuccessRate,
+                    direction = signalType.ToString()
+                });
+            // #endregion
             return Task.FromResult(new StrategySignal(
                 StrategyId: "rsi",
                 Asset: asset.Trim(),

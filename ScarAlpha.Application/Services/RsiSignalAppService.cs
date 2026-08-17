@@ -177,8 +177,28 @@ public sealed class RsiSignalAppService
 
         // Refuse late fills — candle close must still be within MaxEntryLagSeconds.
         var candleEnd = signal.CandleTime.AddSeconds(options.TimeframeSeconds);
-        if (DateTimeOffset.UtcNow - candleEnd > TimeSpan.FromSeconds(Math.Max(1, options.MaxEntryLagSeconds)))
+        var executeNow = DateTimeOffset.UtcNow;
+        var executeLag = executeNow - candleEnd;
+        var maxLag = Math.Max(1, options.MaxEntryLagSeconds);
+        if (executeLag > TimeSpan.FromSeconds(maxLag))
+        {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                "H-LAG2",
+                "RsiSignalAppService.ExecuteIfRequestedAsync",
+                "signal_stale_at_execute",
+                new
+                {
+                    asset = signal.Asset,
+                    signal = signal.Signal,
+                    lagSec = Math.Round(executeLag.TotalSeconds, 2),
+                    maxLagSec = maxLag,
+                    candleEndUnix = candleEnd.ToUnixTimeSeconds(),
+                    successRate = signal.Backtest?.SuccessRate
+                });
+            // #endregion
             return signal with { AutomationError = "SIGNAL_STALE", Signal = "None" };
+        }
 
         var selected = bot.ResolvedAssets;
         if (selected.Count > 0 && !BotAssetList.Contains(selected, signal.Asset))

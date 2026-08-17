@@ -1,3 +1,5 @@
+using System.Net.Http;
+using System.Text;
 using System.Text.Json;
 
 namespace ScarAlpha.Binolla.Diagnostics;
@@ -6,22 +8,30 @@ namespace ScarAlpha.Binolla.Diagnostics;
 public static class AgentDebug1892
 {
     private const string SessionId = "1892a4";
+    private const string IngestUrl = "http://127.0.0.1:7892/ingest/aea6d51e-f3e9-4c7e-b6b4-db55c4306e97";
+    private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromMilliseconds(400) };
 
-    public static void Write(string hypothesisId, string location, string message, object? data = null)
+    public static void Write(
+        string hypothesisId,
+        string location,
+        string message,
+        object? data = null,
+        string runId = "entry-lag")
     {
         // #region agent log
         try
         {
-            var line = JsonSerializer.Serialize(new Dictionary<string, object?>
+            var payload = new Dictionary<string, object?>
             {
                 ["sessionId"] = SessionId,
-                ["runId"] = "trade-settle",
+                ["runId"] = runId,
                 ["hypothesisId"] = hypothesisId,
                 ["location"] = location,
                 ["message"] = message,
                 ["data"] = data,
                 ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
-            });
+            };
+            var line = JsonSerializer.Serialize(payload);
 
             foreach (var path in CandidatePaths())
             {
@@ -37,6 +47,21 @@ public static class AgentDebug1892
                     // try next
                 }
             }
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    using var content = new StringContent(line, Encoding.UTF8, "application/json");
+                    using var req = new HttpRequestMessage(HttpMethod.Post, IngestUrl) { Content = content };
+                    req.Headers.TryAddWithoutValidation("X-Debug-Session-Id", SessionId);
+                    await Http.SendAsync(req).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // local ingest may be unreachable on VPS
+                }
+            });
 
             try
             {
@@ -64,5 +89,6 @@ public static class AgentDebug1892
         yield return Path.GetFullPath(Path.Combine(cwd, "logs", "debug-1892a4.log"));
         yield return "/home/web/backend/logs/debug-1892a4.log";
         yield return @"d:\work\flul_bot\debug-1892a4.log";
+        yield return @"d:\work\flul_bot\.cursor\debug-1892a4.log";
     }
 }
