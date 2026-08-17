@@ -26,6 +26,8 @@ module.exports = {
       exec_mode: 'fork',
       autorestart: true,
       watch: false,
+      // History/quote caches plus Playwright can exceed 512MB during a scan; keep 1GB so PM2
+      // does not SIGKILL a healthy process. Pair this with the rotating scan + LRU history cap.
       max_memory_restart: '1024M',
       // Playwright/Chromium children can ignore SIGINT — force SIGKILL sooner
       kill_timeout: 8000,

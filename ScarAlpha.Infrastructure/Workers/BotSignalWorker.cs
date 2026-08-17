@@ -13,14 +13,17 @@ namespace ScarAlpha.Infrastructure.Workers;
 
 /// <summary>
 /// Keeps bots analyzing/trading while the Mini App is closed.
-/// Scans every selected pair each tick (RSI + 200-candle zone backtest in parallel).
+/// Each tick scans a rotating batch of pairs (RSI + 200-candle zone backtest in parallel)
+/// so we do not subscribe the whole universe on the WebSocket at once.
 /// </summary>
 public sealed class BotSignalWorker : IHostedService
 {
     private const int ScanParallelism = 8;
+    private const int ScanBatchSize = 8;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IBotRuntimeService _botRuntime;
     private readonly ILogger<BotSignalWorker> _logger;
+    private readonly ConcurrentDictionary<Guid, int> _scanOffsets = new();
     private CancellationTokenSource? _cts;
     private Task? _loop;
 
@@ -178,7 +181,11 @@ public sealed class BotSignalWorker : IHostedService
         }
 
         var options = RsiStrategyOptions.FromBotDurationSeconds(bot.DurationSeconds);
-        var batch = bot.ResolvedAssets;
+        var allAssets = bot.ResolvedAssets;
+        var offset = _scanOffsets.GetOrAdd(bot.UserId, 0);
+        var batch = TakeRotatingBatch(allAssets, offset, ScanBatchSize);
+        if (allAssets.Count > 0)
+            _scanOffsets[bot.UserId] = (offset + ScanBatchSize) % allAssets.Count;
         var bag = new ConcurrentBag<(string Asset, StrategySignal Signal)>();
         var staleHits = 0;
         var softNone = 0;
@@ -290,6 +297,7 @@ public sealed class BotSignalWorker : IHostedService
                 userId = bot.UserId.ToString("N")[..8],
                 assetCount = bot.ResolvedAssets.Count,
                 batch = batch.Count,
+                scanOffset = offset,
                 scanMs = Math.Round(scanMs, 0),
                 secIntoMin,
                 candidates = bag.Count,
@@ -306,6 +314,19 @@ public sealed class BotSignalWorker : IHostedService
             },
             runId: "missed-entry");
         // #endregion
+    }
+
+    private static List<string> TakeRotatingBatch(IReadOnlyList<string> assets, int offset, int size)
+    {
+        if (assets.Count == 0 || assets.Count <= size)
+            return assets.ToList();
+
+        var batch = new List<string>(size);
+        var n = assets.Count;
+        var start = ((offset % n) + n) % n;
+        for (var i = 0; i < size; i++)
+            batch.Add(assets[(start + i) % n]);
+        return batch;
     }
 
     private static async Task<bool> HasBlockingOpenTradeAsync(

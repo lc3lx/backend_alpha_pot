@@ -1161,7 +1161,9 @@ internal sealed class SessionMessageRouter
                 }
             }
 
-            _state.HistoricalData[$"{asset}:{period}"] = history;
+            var ticksBefore = history.TickHistory.Count;
+            CompactTickHistory(history);
+            _state.SetHistory($"{asset}:{period}", history);
             Interlocked.Increment(ref _historyStoredCount);
             // #region agent log
             LoginTrace.Write("H113", "SessionMessageRouter.ProcessHistoryLast", "history_stored", new
@@ -1170,7 +1172,8 @@ internal sealed class SessionMessageRouter
                 period,
                 candleCount = history.Candles.Count,
                 tickCount = history.TickHistory.Count,
-                synthesized = history.Candles.Count > 0 && history.TickHistory.Count > 0,
+                ticksBefore,
+                synthesized = history.Candles.Count > 0 && ticksBefore > 0,
                 cacheSize = _state.HistoricalData.Count,
                 storedTotal = Volatile.Read(ref _historyStoredCount)
             });
@@ -1184,5 +1187,18 @@ internal sealed class SessionMessageRouter
                 len = content?.Length ?? 0
             });
         }
+    }
+
+    /// <summary>
+    /// Ticks are only needed to synthesize candles and a synthetic last quote.
+    /// Keep the newest tick; drop the rest (~1000 points per asset).
+    /// </summary>
+    private static void CompactTickHistory(HistoryData history)
+    {
+        if (history.TickHistory.Count <= 1)
+            return;
+        var last = history.TickHistory[^1];
+        history.TickHistory.Clear();
+        history.TickHistory.Add(last);
     }
 }

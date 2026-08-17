@@ -46,8 +46,12 @@ public interface IBinollaClient : IAsyncDisposable
 
     /// <summary>
     /// Fire-and-forget subscribe so the next HTTP poll can hit cache without blocking.
+    /// No-ops when candles and a fresh quote are already in cache.
     /// </summary>
     void EnsureMarketDataWarm(string asset, int period = 60);
+
+    /// <summary>True when in-memory candles for this pair/period are still usable.</summary>
+    bool HasFreshHistory(string asset, int period);
 
     Task<IReadOnlyList<TradingAsset>> GetTradingAssetsAsync(CancellationToken cancellationToken = default);
 

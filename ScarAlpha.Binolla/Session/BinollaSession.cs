@@ -529,6 +529,15 @@ public sealed class BinollaSession : IBinollaClient
         }
     }
 
+    public bool HasFreshHistory(string asset, int period)
+    {
+        if (string.IsNullOrWhiteSpace(asset))
+            return false;
+        var key = asset.Trim();
+        var wirePeriod = BinollaMarketPeriods.NormalizeHistoryPeriod(period);
+        return FindHistoryFor(key, wirePeriod) is { } cached && !IsHistoryTooStale(cached, wirePeriod);
+    }
+
     public void EnsureMarketDataWarm(string asset, int period = 60)
     {
         if (string.IsNullOrWhiteSpace(asset))
@@ -540,6 +549,9 @@ public sealed class BinollaSession : IBinollaClient
 
         var key = asset.Trim();
         var wirePeriod = BinollaMarketPeriods.NormalizeHistoryPeriod(period);
+        if (HasFreshHistory(key, wirePeriod) && IsQuoteFresh(key))
+            return;
+
         var warmKey = $"{key}:{wirePeriod}";
         if (!_warmInFlight.TryAdd(warmKey, 1))
             return;
@@ -748,6 +760,7 @@ public sealed class BinollaSession : IBinollaClient
 
         if (FindHistoryFor(key, wirePeriod) is { } cached && !IsHistoryTooStale(cached, wirePeriod))
         {
+            cached.AccessedAt = DateTimeOffset.UtcNow;
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H115", "BinollaSession.GetHistoryAsync", "history_hit_cache", new
             {
@@ -936,7 +949,10 @@ public sealed class BinollaSession : IBinollaClient
         var preferredKey = $"{key}:{preferredPeriod}";
         if (State.HistoricalData.TryGetValue(preferredKey, out var exact) &&
             (exact.Candles.Count > 0 || exact.TickHistory.Count > 0))
+        {
+            exact.AccessedAt = DateTimeOffset.UtcNow;
             return exact;
+        }
 
         // Prefer period 60 when available (OTC baseline), then any non-empty for the asset.
         HistoryData? any = null;
@@ -952,7 +968,10 @@ public sealed class BinollaSession : IBinollaClient
                 sixty = pair.Value;
         }
 
-        return sixty ?? any;
+        var hit = sixty ?? any;
+        if (hit is not null)
+            hit.AccessedAt = DateTimeOffset.UtcNow;
+        return hit;
     }
 
     private QuoteData? FindQuoteFor(string key)
@@ -966,6 +985,13 @@ public sealed class BinollaSession : IBinollaClient
         }
 
         return null;
+    }
+
+    private bool IsQuoteFresh(string key, int maxAgeSeconds = 15)
+    {
+        var quote = FindQuoteFor(key);
+        return quote is not null
+            && (DateTimeOffset.UtcNow - quote.ReceivedAt).TotalSeconds <= maxAgeSeconds;
     }
 
     private bool TryQuoteFromHistory(string key, out QuoteData? quote)

@@ -39,6 +39,8 @@ public sealed class BinollaSessionState
     public decimal DemoBalance { get; private set; }
     public DateTimeOffset? BalanceUpdatedAt { get; private set; }
 
+    public const int MaxHistoricalEntries = 24;
+
     public ConcurrentDictionary<string, QuoteData> LatestQuotes { get; } = new(StringComparer.OrdinalIgnoreCase);
     public ConcurrentDictionary<string, HistoryData> HistoricalData { get; } = new(StringComparer.OrdinalIgnoreCase);
     public ConcurrentDictionary<string, decimal> ClosedOrderPnL { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -151,5 +153,33 @@ public sealed class BinollaSessionState
         {
             _assets = new List<AssetDataWire>();
         }
+    }
+
+    /// <summary>
+    /// Store history and drop the least-recently-used entries so RAM stays bounded
+    /// while the worker rotates a small scan batch.
+    /// </summary>
+    public void SetHistory(string key, HistoryData history)
+    {
+        history.AccessedAt = DateTimeOffset.UtcNow;
+        HistoricalData[key] = history;
+        TrimHistoryLru(key);
+    }
+
+    private void TrimHistoryLru(string keepKey)
+    {
+        var extra = HistoricalData.Count - MaxHistoricalEntries;
+        if (extra <= 0)
+            return;
+
+        var victims = HistoricalData
+            .Where(p => !p.Key.Equals(keepKey, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(p => p.Value.AccessedAt)
+            .ThenBy(p => p.Value.ReceivedAt)
+            .Take(extra)
+            .Select(p => p.Key)
+            .ToList();
+        foreach (var victim in victims)
+            HistoricalData.TryRemove(victim, out _);
     }
 }

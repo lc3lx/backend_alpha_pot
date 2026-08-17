@@ -108,7 +108,14 @@ public sealed class RsiSignalAppService
             return SoftNone(symbol, wirePeriod) with { AutomationError = "OPEN_TRADE_EXISTS" };
         }
 
-        client.EnsureMarketDataWarm(symbol, wirePeriod);
+        // Skip asset/change when candles are already cached — GetHistoryAsync hits RAM
+        // and a stale quote still warms so the current rotating batch stays live.
+        const int maxQuoteAgeSeconds = 15;
+        var quoteFresh = client.TryGetCachedQuote(symbol, out var cachedQuote)
+            && cachedQuote is not null
+            && (DateTimeOffset.UtcNow - cachedQuote.ReceivedAt).TotalSeconds <= maxQuoteAgeSeconds;
+        if (!client.HasFreshHistory(symbol, wirePeriod) || !quoteFresh)
+            client.EnsureMarketDataWarm(symbol, wirePeriod);
         try
         {
             if (await IsAnalysisPausedAsync(ct))

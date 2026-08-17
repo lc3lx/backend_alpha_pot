@@ -86,4 +86,5 @@ public sealed class HistoryData
     public List<CandlestickData> Candles { get; init; } = new();
     public CandlestickData? LatestCandle => Candles.Count > 0 ? Candles[^1] : null;
     public DateTimeOffset ReceivedAt { get; init; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset AccessedAt { get; set; } = DateTimeOffset.UtcNow;
 }
