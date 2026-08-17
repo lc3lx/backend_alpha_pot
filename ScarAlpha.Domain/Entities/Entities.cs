@@ -22,6 +22,10 @@ public class User
     /// JSON blob of admin-configured fake display values (balance, P/L targets, sample trades, etc.).
     /// </summary>
     public string? MarketingDemoConfigJson { get; set; }
+    /// <summary>
+    /// Persisted bot runtime (Running/Paused/Stopped + settings) so the bot survives API restarts.
+    /// </summary>
+    public string? BotRuntimeJson { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
 

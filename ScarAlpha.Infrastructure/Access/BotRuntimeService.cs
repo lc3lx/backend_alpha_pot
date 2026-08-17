@@ -1,4 +1,7 @@
 using System.Collections.Concurrent;
+using System.Text.Json;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using ScarAlpha.Application.Abstractions;
 using ScarAlpha.Application.Common;
 
@@ -6,7 +9,17 @@ namespace ScarAlpha.Infrastructure.Access;
 
 public sealed class BotRuntimeService : IBotRuntimeService
 {
+    private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+
     private readonly ConcurrentDictionary<Guid, BotRuntimeConfig> _states = new();
+    private readonly IServiceScopeFactory _scopes;
+    private readonly ILogger<BotRuntimeService> _logger;
+
+    public BotRuntimeService(IServiceScopeFactory scopes, ILogger<BotRuntimeService> logger)
+    {
+        _scopes = scopes;
+        _logger = logger;
+    }
 
     public BotRuntimeConfig Get(Guid userId) => _states.TryGetValue(userId, out var state)
         ? state
@@ -24,7 +37,6 @@ public sealed class BotRuntimeService : IBotRuntimeService
         bool signalConfirmationEnabled = true,
         string riskLevel = "risk-medium",
         bool notificationsEnabled = true) =>
-        // User approval to run again: clear stop reason and reset PnL session to zero.
         Set(
             userId,
             BotRunState.Running,
@@ -39,7 +51,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
             riskLevel,
             notificationsEnabled,
             pnlSessionStartedAt: DateTimeOffset.UtcNow,
-            stopReason: null);
+            stopReason: null,
+            persist: true);
 
     public BotRuntimeConfig Pause(Guid userId)
     {
@@ -58,7 +71,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
             current.RiskLevel,
             current.NotificationsEnabled,
             pnlSessionStartedAt: current.PnlSessionStartedAt,
-            stopReason: current.StopReason);
+            stopReason: current.StopReason,
+            persist: true);
     }
 
     public BotRuntimeConfig Stop(Guid userId, string? stopReason = null)
@@ -78,7 +92,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
             current.RiskLevel,
             current.NotificationsEnabled,
             pnlSessionStartedAt: current.PnlSessionStartedAt,
-            stopReason: stopReason);
+            stopReason: stopReason,
+            persist: true);
     }
 
     public BotRuntimeConfig Apply(
@@ -113,11 +128,17 @@ public sealed class BotRuntimeService : IBotRuntimeService
             riskLevel ?? current.RiskLevel,
             notificationsEnabled ?? current.NotificationsEnabled,
             pnlSessionStartedAt: current.PnlSessionStartedAt,
-            stopReason: current.StopReason);
+            stopReason: current.StopReason,
+            persist: true);
     }
 
     public IReadOnlyList<BotRuntimeConfig> ListKnown() =>
         _states.Values.OrderByDescending(x => x.UpdatedAt).ToList();
+
+    public void RestoreFromPersistence(BotRuntimeConfig config)
+    {
+        _states[config.UserId] = config;
+    }
 
     private BotRuntimeConfig Set(
         Guid userId,
@@ -133,7 +154,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
         string riskLevel,
         bool notificationsEnabled,
         DateTimeOffset? pnlSessionStartedAt,
-        string? stopReason)
+        string? stopReason,
+        bool persist)
     {
         if (amount <= 0 || amount > 100_000m)
             throw new ArgumentOutOfRangeException(nameof(amount));
@@ -160,7 +182,30 @@ public sealed class BotRuntimeService : IBotRuntimeService
             pnlSessionStartedAt,
             stopReason);
         _states[userId] = next;
+        if (persist)
+            QueuePersist(next);
         return next;
+    }
+
+    private void QueuePersist(BotRuntimeConfig cfg)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await using var scope = _scopes.CreateAsyncScope();
+                var users = scope.ServiceProvider.GetRequiredService<IUserRepository>();
+                var user = await users.GetByIdAsync(cfg.UserId).ConfigureAwait(false);
+                if (user is null) return;
+                user.BotRuntimeJson = JsonSerializer.Serialize(StoredBotRuntime.From(cfg), JsonOpts);
+                user.UpdatedAt = DateTimeOffset.UtcNow;
+                await users.UpdateAsync(user).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to persist bot runtime for {UserId}", cfg.UserId);
+            }
+        });
     }
 
     private static BotRuntimeConfig New(
@@ -197,5 +242,73 @@ public sealed class BotRuntimeService : IBotRuntimeService
             list,
             pnlSessionStartedAt,
             stopReason);
+    }
+
+    public sealed record StoredBotRuntime(
+        string State,
+        IReadOnlyList<string> Assets,
+        decimal Amount,
+        int DurationSeconds,
+        decimal DailyProfitTarget,
+        decimal DailyLossLimit,
+        bool AutoStopAtProfit,
+        bool AutoStopAtLoss,
+        bool SignalConfirmationEnabled,
+        string RiskLevel,
+        bool NotificationsEnabled,
+        DateTimeOffset? PnlSessionStartedAt,
+        string? StopReason)
+    {
+        public static StoredBotRuntime From(BotRuntimeConfig c) => new(
+            c.State.ToString(),
+            c.ResolvedAssets.ToList(),
+            c.Amount,
+            c.DurationSeconds,
+            c.DailyProfitTarget,
+            c.DailyLossLimit,
+            c.AutoStopAtProfit,
+            c.AutoStopAtLoss,
+            c.SignalConfirmationEnabled,
+            c.RiskLevel,
+            c.NotificationsEnabled,
+            c.PnlSessionStartedAt,
+            c.StopReason);
+
+        public BotRuntimeConfig ToConfig(Guid userId)
+        {
+            var state = Enum.TryParse<BotRunState>(State, true, out var s) ? s : BotRunState.Stopped;
+            var assets = BotAssetList.Normalize(null, Assets);
+            return new BotRuntimeConfig(
+                userId,
+                state,
+                assets.Count > 0 ? assets[0] : null,
+                Amount <= 0 ? 25m : Amount,
+                DurationSeconds is < 5 or > 3600 ? 300 : DurationSeconds,
+                DailyProfitTarget < 0 ? 50m : DailyProfitTarget,
+                DailyLossLimit < 0 ? 30m : DailyLossLimit,
+                DateTimeOffset.UtcNow,
+                AutoStopAtProfit,
+                AutoStopAtLoss,
+                SignalConfirmationEnabled,
+                RiskLevel: RiskLevel is "risk-low" or "risk-medium" or "risk-high" ? RiskLevel : "risk-medium",
+                NotificationsEnabled,
+                assets,
+                PnlSessionStartedAt,
+                StopReason);
+        }
+
+        public static BotRuntimeConfig? TryParse(Guid userId, string? json)
+        {
+            if (string.IsNullOrWhiteSpace(json)) return null;
+            try
+            {
+                var stored = JsonSerializer.Deserialize<StoredBotRuntime>(json, JsonOpts);
+                return stored?.ToConfig(userId);
+            }
+            catch
+            {
+                return null;
+            }
+        }
     }
 }

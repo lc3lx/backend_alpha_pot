@@ -302,6 +302,9 @@ namespace ScarAlpha.Infrastructure.Persistence.Migrations
                     b.Property<string>("MarketingDemoConfigJson")
                         .HasColumnType("text");
 
+                    b.Property<string>("BotRuntimeJson")
+                        .HasColumnType("text");
+
                     b.Property<string>("PasswordHash")
                         .HasMaxLength(512)
                         .HasColumnType("character varying(512)");

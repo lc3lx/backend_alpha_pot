@@ -16,7 +16,12 @@ public sealed record RsiStrategyOptions(
     int TimeframeSeconds,
     int BacktestCandleCount = 400,
     int ExpiryCandles = 5,
-    decimal MinimumSuccessRate = 75m)
+    decimal MinimumSuccessRate = 75m,
+    /// <summary>
+    /// Max seconds after the signal candle closes to still allow Call/Put.
+    /// Late entries are rejected — the setup is considered gone.
+    /// </summary>
+    int MaxEntryLagSeconds = 20)
 {
     public static RsiStrategyOptions Default60Seconds =>
         new(Period: 14, Oversold: 25m, Overbought: 75m, TimeframeSeconds: 60);

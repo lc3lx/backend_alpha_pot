@@ -174,6 +174,26 @@ public sealed class Phase5RsiTests
     }
 
     [Fact]
+    public async Task Stale_closed_candle_does_not_emit_call_or_put()
+    {
+        var service = new RsiSignalService(new RsiCalculator());
+        var options = RsiStrategyOptions.Default60Seconds with
+        {
+            MinimumSuccessRate = 0m,
+            MaxEntryLagSeconds = 20,
+        };
+        var candles = CreateCandles(Enumerable.Range(0, 26).Select(i => 100m - i).ToList());
+        // Candle closed long ago relative to Now+5min
+        var lateNow = Now.AddMinutes(5);
+
+        var signal = await service.GetSignalAsync(UserId, Asset, candles, options, lateNow);
+
+        signal.Signal.Should().Be("None");
+        signal.AutomationError.Should().Be("SIGNAL_STALE");
+        signal.Backtest!.Passed.Should().BeTrue();
+    }
+
+    [Fact]
     public async Task One_minute_is_the_only_supported_timeframe()
     {
         var service = new RsiSignalService(new RsiCalculator());

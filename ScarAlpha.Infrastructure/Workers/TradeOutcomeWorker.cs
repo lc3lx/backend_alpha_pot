@@ -42,7 +42,71 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _loop = Task.Run(() => LoopAsync(_cts.Token));
         _ = Task.Run(() => RecoverAfterSessionRestoreAsync(_cts.Token));
+        _ = Task.Run(() => SweepStuckTradesAsync(_cts.Token));
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Periodically re-enqueue Running trades that still need settlement (lost waiters / API restart).
+    /// Past duration+grace with no outcome → Unknown so the UI does not hang forever.
+    /// </summary>
+    private async Task SweepStuckTradesAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(45), ct).ConfigureAwait(false);
+                await using var scope = _scopeFactory.CreateAsyncScope();
+                var trades = scope.ServiceProvider.GetRequiredService<ITradeRepository>();
+                var open = await trades.ListOpenTradesAsync(ct).ConfigureAwait(false);
+                var now = DateTimeOffset.UtcNow;
+
+                foreach (var trade in open)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    if (trade.Status is not (TradeStatus.Running or TradeStatus.Pending))
+                        continue;
+                    if (string.IsNullOrWhiteSpace(trade.BinollaOrderId))
+                        continue;
+
+                    var duration = trade.DurationSeconds > 0 ? trade.DurationSeconds : 60;
+                    var expectedEnd = trade.CreatedAt.AddSeconds(duration);
+                    var hardDeadline = expectedEnd.AddMinutes(20);
+
+                    if (now >= hardDeadline)
+                    {
+                        if (!TradeStateMachine.IsHardTerminal(trade.Status))
+                        {
+                            await ApplyStatusAsync(
+                                trades, trade, TradeStatus.Unknown, null, "OUTCOME_SWEEP_TIMEOUT", ct);
+                            _logger.LogWarning(
+                                "Sweep: trade {TradeId} marked Unknown after hard deadline", trade.Id);
+                        }
+                        continue;
+                    }
+
+                    // After expected expiry, keep trying to attach outcome waiter.
+                    if (now >= expectedEnd)
+                    {
+                        var client = _sessions.Get(trade.UserId.ToString());
+                        if (client is not null &&
+                            client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
+                        {
+                            Enqueue(trade.Id, trade.UserId, trade.BinollaOrderId!);
+                        }
+                    }
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Stuck-trade sweep failed");
+            }
+        }
     }
 
     /// <summary>

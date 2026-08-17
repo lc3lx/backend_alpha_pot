@@ -87,6 +87,11 @@ public sealed class UserRepository : IUserRepository
         _db.Users.Update(user);
         await _db.SaveChangesAsync(ct);
     }
+
+    public async Task<IReadOnlyList<User>> ListWithBotRuntimeAsync(CancellationToken ct = default) =>
+        await _db.Users
+            .Where(x => x.BotRuntimeJson != null && x.BotRuntimeJson != "")
+            .ToListAsync(ct);
 }
 
 public sealed class BinollaLinkRepository : IBinollaLinkRepository

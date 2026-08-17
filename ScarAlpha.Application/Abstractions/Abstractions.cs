@@ -18,6 +18,7 @@ public interface IUserRepository
         CancellationToken ct = default);
     Task<User> AddAsync(User user, CancellationToken ct = default);
     Task UpdateAsync(User user, CancellationToken ct = default);
+    Task<IReadOnlyList<User>> ListWithBotRuntimeAsync(CancellationToken ct = default);
 }
 
 public interface IBinollaLinkRepository

@@ -135,6 +135,8 @@ public interface IBotRuntimeService
         bool? notificationsEnabled = null,
         IReadOnlyList<string>? assets = null);
     IReadOnlyList<BotRuntimeConfig> ListKnown();
+    /// <summary>Load persisted runtime into memory (API startup). Does not rewrite DB.</summary>
+    void RestoreFromPersistence(BotRuntimeConfig config);
 }
 
 public interface IStrategyRegistry

@@ -59,6 +59,7 @@ public static class DependencyInjection
         services.AddSingleton<IStrategyRegistry, StrategyRegistry>();
         services.AddScoped<IBotAccessService, BotAccessService>();
         services.AddSingleton<IBotRuntimeService, BotRuntimeService>();
+        services.AddHostedService<BotRuntimeRestoreHostedService>();
         services.AddScoped<IAuditService, AuditService>();
         services.AddScoped<IMarketingDemoService, MarketingDemoService>();
 

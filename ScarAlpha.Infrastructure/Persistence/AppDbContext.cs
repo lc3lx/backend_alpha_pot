@@ -35,6 +35,7 @@ public sealed class AppDbContext : DbContext
             e.Property(x => x.IsMarketingDemo).HasDefaultValue(false);
             e.HasIndex(x => x.IsMarketingDemo);
             e.Property(x => x.MarketingDemoConfigJson).HasColumnType("text");
+            e.Property(x => x.BotRuntimeJson).HasColumnType("text");
             e.HasOne(x => x.BinollaLink).WithOne(x => x.User).HasForeignKey<BinollaLink>(x => x.UserId);
         });
 

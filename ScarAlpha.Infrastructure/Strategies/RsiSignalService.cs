@@ -80,6 +80,22 @@ public sealed class RsiSignalService : IRsiSignalService
                 Backtest: backtest));
         }
 
+        // Instant entry only: if this closed candle is already old, the setup is gone.
+        var closedAt = currentCandle.EndTimestamp!.Value;
+        var lag = now - closedAt;
+        if (lag > TimeSpan.FromSeconds(Math.Max(1, options.MaxEntryLagSeconds)))
+        {
+            return Task.FromResult(new StrategySignal(
+                StrategyId: "rsi",
+                Asset: asset.Trim(),
+                Signal: "None",
+                Rsi: roundedRsi,
+                CandleTime: currentCandle.Timestamp,
+                Timeframe: timeframe,
+                Backtest: backtest,
+                AutomationError: "SIGNAL_STALE"));
+        }
+
         var key = EmissionKey(userId, asset, options.TimeframeSeconds);
         if (_lastEmittedSignalCandleTime.TryGetValue(key, out var lastTime) &&
             lastTime == currentCandle.Timestamp)
@@ -183,5 +199,7 @@ public sealed class RsiSignalService : IRsiSignalService
             throw new ApiException(ApiErrorCodes.ValidationError, "Expiry must be 3, 4, or 5 candles.");
         if (options.MinimumSuccessRate is < 0 or > 100)
             throw new ApiException(ApiErrorCodes.ValidationError, "Minimum success rate must be between 0 and 100.");
+        if (options.MaxEntryLagSeconds is < 1 or > 120)
+            throw new ApiException(ApiErrorCodes.ValidationError, "Max entry lag must be between 1 and 120 seconds.");
     }
 }

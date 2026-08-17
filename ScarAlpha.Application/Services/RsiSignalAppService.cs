@@ -175,6 +175,11 @@ public sealed class RsiSignalAppService
             return signal with { AutomationError = "BACKTEST_NOT_PASSED", Signal = "None" };
         }
 
+        // Refuse late fills — candle close must still be within MaxEntryLagSeconds.
+        var candleEnd = signal.CandleTime.AddSeconds(options.TimeframeSeconds);
+        if (DateTimeOffset.UtcNow - candleEnd > TimeSpan.FromSeconds(Math.Max(1, options.MaxEntryLagSeconds)))
+            return signal with { AutomationError = "SIGNAL_STALE", Signal = "None" };
+
         var selected = bot.ResolvedAssets;
         if (selected.Count > 0 && !BotAssetList.Contains(selected, signal.Asset))
             return signal;
