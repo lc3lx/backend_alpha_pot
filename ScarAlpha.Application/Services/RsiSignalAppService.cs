@@ -181,7 +181,13 @@ public sealed class RsiSignalAppService
         if (bot.State != BotRunState.Running || signal.Signal is not ("Call" or "Put"))
             return signal;
 
-        // Dual gate: RSI extreme alone is not enough — backtest must pass the configured floor.
+        var liveRsi = signal.LiveRsi ?? signal.Rsi;
+        if (signal.Signal == "Call" && liveRsi > options.Oversold)
+            return signal with { AutomationError = "RSI_NOT_OVERSOLD", Signal = "None" };
+        if (signal.Signal == "Put" && liveRsi < options.Overbought)
+            return signal with { AutomationError = "RSI_NOT_OVERBOUGHT", Signal = "None" };
+
+        // Dual gate: touching 25/75 is not enough — matching backtest must pass ≥ 75%.
         if (signal.Backtest is null ||
             !signal.Backtest.Passed ||
             signal.Backtest.SuccessRate < options.MinimumSuccessRate ||

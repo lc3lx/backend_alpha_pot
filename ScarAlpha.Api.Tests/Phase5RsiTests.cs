@@ -238,6 +238,20 @@ public sealed class Phase5RsiTests
     }
 
     [Fact]
+    public async Task Live_overbought_with_put_backtest_enters_put()
+    {
+        var service = new RsiSignalService(new RsiCalculator());
+        var options = RsiStrategyOptions.Default60Seconds;
+        var signal = await service.GetSignalAsync(
+            UserId, Asset, CreateCandles(OverboughtWithRespectedDrop()), options, Now);
+
+        signal.Signal.Should().Be("Put");
+        signal.Backtest!.Passed.Should().BeTrue();
+        signal.LiveRsi.Should().NotBeNull();
+        signal.LiveRsi!.Value.Should().BeGreaterThanOrEqualTo(options.Overbought);
+    }
+
+    [Fact]
     public async Task One_minute_is_the_only_supported_timeframe()
     {
         var service = new RsiSignalService(new RsiCalculator());
@@ -265,6 +279,19 @@ public sealed class Phase5RsiTests
             closes.Add(35m + i * 5);
         for (var i = 1; i <= 16; i++)
             closes.Add(95m - i * 4);
+        return closes;
+    }
+
+    /// <summary>Touch RSI 75, drop out of the zone, then return to overbought.</summary>
+    private static List<decimal> OverboughtWithRespectedDrop()
+    {
+        var closes = new List<decimal>();
+        for (var i = 0; i < 16; i++)
+            closes.Add(20m + i * 3);
+        for (var i = 1; i <= 12; i++)
+            closes.Add(65m - i * 5);
+        for (var i = 1; i <= 16; i++)
+            closes.Add(5m + i * 4);
         return closes;
     }
 

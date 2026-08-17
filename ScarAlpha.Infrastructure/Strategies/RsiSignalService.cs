@@ -57,18 +57,22 @@ public sealed class RsiSignalService : IRsiSignalService
             .OrderBy(c => c.Timestamp)
             .LastOrDefault();
 
-        // Enter on LIVE RSI (forming bar included). Do not wait for candle close.
-        var signalType = liveRsi <= options.Oversold ? RsiSignalType.Call :
-            liveRsi >= options.Overbought ? RsiSignalType.Put :
-            RsiSignalType.None;
+        // Call = live RSI touches 25 (oversold) AND the call backtest passed.
+        // Put  = live RSI touches 75 (overbought) AND the put backtest passed.
+        // Do not wait for the forming candle to close.
+        var touchedOversold = liveRsi <= options.Oversold;
+        var touchedOverbought = liveRsi >= options.Overbought;
+        var signalType = touchedOversold && callBacktest.Passed ? RsiSignalType.Call
+            : touchedOverbought && putBacktest.Passed ? RsiSignalType.Put
+            : RsiSignalType.None;
+        var entryBacktest = signalType == RsiSignalType.Call ? callBacktest
+            : signalType == RsiSignalType.Put ? putBacktest
+            : null;
 
         var timeframe = options.TimeframeSeconds.ToString();
         var displayBacktest = signalType == RsiSignalType.Call ? callBacktest
             : signalType == RsiSignalType.Put ? putBacktest
             : liveRsi >= 50m ? putBacktest : callBacktest;
-        var entryBacktest = signalType == RsiSignalType.Call ? callBacktest
-            : signalType == RsiSignalType.Put ? putBacktest
-            : displayBacktest;
         var liveBucket = new DateTimeOffset(
             now.Year, now.Month, now.Day, now.Hour, now.Minute, 0, now.Offset);
         var entryCandleTime = forming?.Timestamp ?? liveBucket;
@@ -86,10 +90,14 @@ public sealed class RsiSignalService : IRsiSignalService
                 hasForming = forming is not null,
                 rsiSide = signalType.ToString(),
                 lookback = options.BacktestCandleCount,
-                wouldEnter = signalType != RsiSignalType.None && entryBacktest.Passed,
-                skip = signalType == RsiSignalType.None
-                    ? "midRsi"
-                    : entryBacktest.Passed ? "ok" : "backtest",
+                touchedOversold,
+                touchedOverbought,
+                wouldEnter = signalType != RsiSignalType.None,
+                skip = signalType != RsiSignalType.None
+                    ? "ok"
+                    : !touchedOversold && !touchedOverbought
+                        ? "midRsi"
+                        : "backtest",
                 callRate = callBacktest.SuccessRate,
                 callN = callBacktest.TotalSignals,
                 callPass = callBacktest.Passed,
@@ -100,7 +108,7 @@ public sealed class RsiSignalService : IRsiSignalService
             runId: "missed-entry");
         // #endregion
 
-        if (signalType == RsiSignalType.None || !entryBacktest.Passed)
+        if (signalType == RsiSignalType.None || entryBacktest is null)
         {
             return Task.FromResult(new StrategySignal(
                 StrategyId: "rsi",
