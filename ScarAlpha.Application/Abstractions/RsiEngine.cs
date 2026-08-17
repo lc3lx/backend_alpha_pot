@@ -54,11 +54,21 @@ public static class RsiEntryLevels
     public const decimal CallMax = 25m;
     public const decimal PutMin = 75m;
     public const decimal MinSuccessRate = 75m;
+    /// <summary>Shift displayed/gated RSI toward Binolla's 1m reading (80 → 74).</summary>
+    public const decimal BinollaDisplayShift = -6m;
     /// <summary>Enter on the first tick both conditions are true. After this, look for a new touch.</summary>
     public const int SetupTtlSeconds = 5;
 
     public static bool IsCallRsi(decimal rsi) => rsi <= CallMax;
     public static bool IsPutRsi(decimal rsi) => rsi >= PutMin;
+
+    public static decimal AlignToBinolla(decimal rsi)
+    {
+        var shifted = rsi + BinollaDisplayShift;
+        if (shifted < 0m) return 0m;
+        if (shifted > 100m) return 100m;
+        return shifted;
+    }
 
     public static bool BacktestOk(RsiBacktestStats? backtest) =>
         backtest is { Passed: true, TotalSignals: > 0 } &&

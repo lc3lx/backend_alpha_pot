@@ -13,6 +13,14 @@ public sealed class Phase5RsiTests
     private static readonly DateTimeOffset Now = new(2026, 8, 5, 10, 0, 0, TimeSpan.Zero);
 
     [Fact]
+    public void AlignToBinolla_shifts_80_to_74()
+    {
+        RsiEntryLevels.AlignToBinolla(80m).Should().Be(74m);
+        RsiEntryLevels.AlignToBinolla(5m).Should().Be(0m);
+        RsiEntryLevels.AlignToBinolla(100m).Should().Be(94m);
+    }
+
+    [Fact]
     public void Wilder_rsi_handles_flat_gain_and_loss_series()
     {
         var calculator = new RsiCalculator();
@@ -59,7 +67,7 @@ public sealed class Phase5RsiTests
 
         var signal = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
 
-        signal.Rsi.Should().Be(100m);
+        signal.Rsi.Should().Be(RsiEntryLevels.AlignToBinolla(100m));
         signal.Signal.Should().Be("None");
         signal.Backtest!.Passed.Should().BeFalse();
         signal.Backtest.TotalSignals.Should().Be(0);
@@ -199,7 +207,7 @@ public sealed class Phase5RsiTests
         var signal = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
 
         signal.Signal.Should().Be("None");
-        signal.Rsi.Should().Be(50m);
+        signal.Rsi.Should().Be(RsiEntryLevels.AlignToBinolla(50m));
         signal.Backtest.Should().NotBeNull();
         signal.Backtest!.LookbackCandles.Should().Be(200);
     }
@@ -321,8 +329,11 @@ public sealed class Phase5RsiTests
     {
         var service = new RsiSignalService(new RsiCalculator());
         var options = RsiStrategyOptions.Default60Seconds;
+        var closes = OverboughtWithRespectedDrop();
+        for (var i = 0; i < 8; i++)
+            closes.Add(closes[^1] + 10m);
         var signal = await service.GetSignalAsync(
-            UserId, Asset, CreateCandles(OverboughtWithRespectedDrop()), options, Now);
+            UserId, Asset, CreateCandles(closes), options, Now);
 
         signal.Signal.Should().Be("Put");
         signal.Backtest!.Passed.Should().BeTrue();

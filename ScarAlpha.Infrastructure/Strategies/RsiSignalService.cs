@@ -64,13 +64,15 @@ public sealed class RsiSignalService : IRsiSignalService
         // Backtest is always ready before the live RSI gate is consulted.
         var (callBacktest, putBacktest) = RsiZoneBacktest.Evaluate(closes, options);
 
-        var roundedRsi = Math.Round(currentRsi, 2, MidpointRounding.AwayFromZero);
+        var roundedRsi = RsiEntryLevels.AlignToBinolla(
+            Math.Round(currentRsi, 2, MidpointRounding.AwayFromZero));
         var forming = ordered.LastOrDefault(c => c.Timestamp + barLength > now);
         var liveCloses = forming is null
             ? closes
             : closes.Concat(new[] { forming.Close }).ToList();
         var liveRsi = liveCloses.Count >= options.Period + 1
-            ? Math.Round(_calculator.CalculateRsi(liveCloses, options), 2, MidpointRounding.AwayFromZero)
+            ? RsiEntryLevels.AlignToBinolla(
+                Math.Round(_calculator.CalculateRsi(liveCloses, options), 2, MidpointRounding.AwayFromZero))
             : roundedRsi;
 
         // Live RSI is the primary gate. Backtest is computed in parallel but ignored for entry
