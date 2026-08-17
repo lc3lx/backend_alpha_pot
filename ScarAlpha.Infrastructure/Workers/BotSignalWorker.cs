@@ -69,9 +69,9 @@ public sealed class BotSignalWorker : IHostedService
 
             try
             {
-                var delay = SecondsIntoMinute() <= 25
-                    ? TimeSpan.FromSeconds(2)
-                    : TimeSpan.FromSeconds(4);
+                var delay = SecondsIntoMinute() <= 22
+                    ? TimeSpan.FromSeconds(1)
+                    : TimeSpan.FromSeconds(3);
                 await Task.Delay(delay, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -152,6 +152,7 @@ public sealed class BotSignalWorker : IHostedService
         var staleHits = 0;
         var softNone = 0;
         var dbRace = 0;
+        var placedCount = 0;
         var userId = bot.UserId;
         var scanStarted = DateTimeOffset.UtcNow;
         var secIntoMin = SecondsIntoMinute();
@@ -168,7 +169,7 @@ public sealed class BotSignalWorker : IHostedService
                 {
                     try
                     {
-                        var signal = await rsi.GetSignalAsync(asset, 60, options, autoExecute: false, token);
+                        var signal = await rsi.GetSignalAsync(asset, 60, options, autoExecute: true, token);
                         if (signal.AutomationError == "SIGNAL_STALE")
                             Interlocked.Increment(ref staleHits);
                         else if (signal.Signal is not ("Call" or "Put"))
@@ -180,6 +181,9 @@ public sealed class BotSignalWorker : IHostedService
                         {
                             bag.Add((asset, signal));
                         }
+
+                        if (!string.IsNullOrEmpty(signal.AutomatedTradeId))
+                            Interlocked.Increment(ref placedCount);
                     }
                     catch (InvalidOperationException ex) when (
                         ex.Message.Contains("second operation", StringComparison.OrdinalIgnoreCase) ||
@@ -206,7 +210,7 @@ public sealed class BotSignalWorker : IHostedService
 
         // #region agent log
         ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-            "H-DB1",
+            "H-MISS",
             "BotSignalWorker.ProcessBotAsync",
             "scan_tick",
             new
@@ -220,81 +224,14 @@ public sealed class BotSignalWorker : IHostedService
                 staleHits,
                 softNone,
                 dbRace,
+                placedCount,
                 maxLag = options.MaxEntryLagSeconds,
                 lookback = options.BacktestCandleCount,
                 hasBest = best is not null,
                 scopedPerAsset = true
-            });
+            },
+            runId: "missed-entry");
         // #endregion
-
-        if (best is null) return;
-
-        var lagAtPick = LagSeconds(best.Value.Signal, options);
-        if (!IsFresh(best.Value.Signal, options))
-        {
-            // #region agent log
-            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-                "H-LAG4",
-                "BotSignalWorker.ProcessBotAsync",
-                "best_went_stale_before_execute",
-                new
-                {
-                    asset = best.Value.Asset,
-                    lagSec = lagAtPick,
-                    maxLag = options.MaxEntryLagSeconds,
-                    scanMs = Math.Round(scanMs, 0)
-                });
-            // #endregion
-            return;
-        }
-
-        // #region agent log
-        ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-            "H-LAG2",
-            "BotSignalWorker.ProcessBotAsync",
-            "best_signal_executing",
-            new
-            {
-                userId = bot.UserId.ToString("N")[..8],
-                asset = best.Value.Asset,
-                signal = best.Value.Signal.Signal,
-                rsi = best.Value.Signal.Rsi,
-                successRate = best.Value.Signal.Backtest?.SuccessRate,
-                lagSec = lagAtPick,
-                maxLag = options.MaxEntryLagSeconds,
-                candidates = bag.Count,
-                scanMs = Math.Round(scanMs, 0),
-                secIntoMin
-            });
-        // #endregion
-
-        await using var execScope = _scopeFactory.CreateAsyncScope();
-        var execRsi = execScope.ServiceProvider.GetRequiredService<RsiSignalAppService>();
-        using (AmbientUserContext.Use(bot.UserId))
-        {
-            var placed = await execRsi.GetSignalAsync(best.Value.Asset, 60, options, autoExecute: true, ct);
-
-            // #region agent log
-            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-                "H-LAG2",
-                "BotSignalWorker.ProcessBotAsync",
-                "execute_result",
-                new
-                {
-                    asset = best.Value.Asset,
-                    resultSignal = placed.Signal,
-                    automationError = placed.AutomationError,
-                    tradeId = placed.AutomatedTradeId is { Length: >= 8 } tid ? tid[..8] : placed.AutomatedTradeId,
-                    lagAfterSec = LagSeconds(placed, options)
-                });
-            // #endregion
-        }
-    }
-
-    private static double LagSeconds(StrategySignal signal, RsiStrategyOptions options)
-    {
-        var closedAt = signal.CandleTime.AddSeconds(options.TimeframeSeconds);
-        return Math.Round((DateTimeOffset.UtcNow - closedAt).TotalSeconds, 2);
     }
 
     private static async Task<bool> HasBlockingOpenTradeAsync(

@@ -81,6 +81,10 @@ public sealed class RsiSignalService : IRsiSignalService
                 rsiEqual = liveRsi == roundedRsi,
                 rsiSide = signalType.ToString(),
                 lookback = options.BacktestCandleCount,
+                wouldEnter = signalType != RsiSignalType.None && entryBacktest.Passed,
+                skip = signalType == RsiSignalType.None
+                    ? "midRsi"
+                    : entryBacktest.Passed ? "ok" : "backtest",
                 callRate = callBacktest.SuccessRate,
                 callN = callBacktest.TotalSignals,
                 callPass = callBacktest.Passed,
