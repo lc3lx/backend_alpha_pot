@@ -170,11 +170,21 @@ pm2_start_or_restart() {
   ensure_pm2
   mkdir -p "$LOG_DIR"
 
-  if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
-    info "Restarting PM2 app: $APP_NAME"
-    # Re-read ecosystem with current exported env
-    pm2 delete "$APP_NAME" >/dev/null 2>&1 || true
+  info "Stopping previous $APP_NAME and freeing port ${BACKEND_PORT}"
+  pm2 delete "$APP_NAME" >/dev/null 2>&1 || true
+  # Failed restarts leave extra forks (logs showed id 105 still serving while 124 could not bind).
+  if command -v fuser >/dev/null 2>&1; then
+    fuser -k "${BACKEND_PORT}/tcp" >/dev/null 2>&1 || true
   fi
+  if command -v lsof >/dev/null 2>&1; then
+    local pids
+    pids="$(lsof -ti ":${BACKEND_PORT}" 2>/dev/null || true)"
+    if [[ -n "${pids}" ]]; then
+      # shellcheck disable=SC2086
+      kill -9 ${pids} >/dev/null 2>&1 || true
+    fi
+  fi
+  sleep 2
 
   info "Starting PM2 app: $APP_NAME"
   pm2 start "$ROOT/ecosystem.config.cjs" --update-env
@@ -221,13 +231,7 @@ main() {
       echo "Logs:    pm2 logs $APP_NAME"
       ;;
     restart)
-      ensure_pm2
-      if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
-        pm2 restart "$APP_NAME" --update-env
-      else
-        publish_api
-        pm2_start_or_restart
-      fi
+      pm2_start_or_restart
       ;;
     stop)
       ensure_pm2
@@ -236,6 +240,9 @@ main() {
     delete|rm)
       ensure_pm2
       pm2 delete "$APP_NAME" || true
+      if command -v fuser >/dev/null 2>&1; then
+        fuser -k "${BACKEND_PORT}/tcp" >/dev/null 2>&1 || true
+      fi
       pm2 save || true
       ;;
     logs)

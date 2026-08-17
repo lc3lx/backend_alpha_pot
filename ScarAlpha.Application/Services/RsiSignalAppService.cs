@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Threading;
+using Microsoft.Extensions.Logging;
 using ScarAlpha.Application.Abstractions;
 using ScarAlpha.Application.Common;
 using ScarAlpha.Application.Contracts;
@@ -21,6 +22,7 @@ public sealed class RsiSignalAppService
     private readonly TradeAppService _trades;
     private readonly IBotRuntimeService _botRuntime;
     private readonly ITradeRepository _tradeRepository;
+    private readonly ILogger<RsiSignalAppService> _logger;
 
     public RsiSignalAppService(
         ICurrentUser currentUser,
@@ -31,7 +33,8 @@ public sealed class RsiSignalAppService
         IMarketingDemoService demo,
         TradeAppService trades,
         IBotRuntimeService botRuntime,
-        ITradeRepository tradeRepository)
+        ITradeRepository tradeRepository,
+        ILogger<RsiSignalAppService> logger)
     {
         _currentUser = currentUser;
         _sessions = sessions;
@@ -42,6 +45,7 @@ public sealed class RsiSignalAppService
         _trades = trades;
         _botRuntime = botRuntime;
         _tradeRepository = tradeRepository;
+        _logger = logger;
     }
 
     public Task<StrategySignal> TryAutoExecuteAsync(
@@ -173,7 +177,8 @@ public sealed class RsiSignalAppService
     {
         var userId = _currentUser.UserId;
         var bot = _botRuntime.Get(userId);
-        if (!autoExecute || bot.State != BotRunState.Running || signal.Signal is not ("Call" or "Put"))
+        // Home polls rsi/signal without autoExecute. If the bot is Running, place anyway.
+        if (bot.State != BotRunState.Running || signal.Signal is not ("Call" or "Put"))
             return signal;
 
         // Dual gate: RSI extreme alone is not enough — backtest must pass the configured floor.
@@ -197,7 +202,8 @@ public sealed class RsiSignalAppService
                 liveRsi = signal.LiveRsi,
                 closedRsi = signal.Rsi,
                 successRate = signal.Backtest?.SuccessRate,
-                botState = bot.State.ToString()
+                botState = bot.State.ToString(),
+                autoExecute
             },
             runId: "missed-entry");
         // #endregion
@@ -310,10 +316,22 @@ public sealed class RsiSignalAppService
                         successRate = signal.Backtest.SuccessRate
                     });
                 // #endregion
+                _logger.LogInformation(
+                    "Placed RSI {Direction} {Asset} trade={TradeId} duration={Duration}s rate={Rate:F0}%",
+                    signal.Signal,
+                    signal.Asset,
+                    trade.Id,
+                    durationSeconds,
+                    signal.Backtest.SuccessRate);
                 return signal with { AutomatedTradeId = trade.Id };
             }
             catch (ApiException ex)
             {
+                _logger.LogWarning(
+                    "RSI place skipped {Asset} {Direction} code={Code}",
+                    signal.Asset,
+                    signal.Signal,
+                    ex.Code);
                 return signal with { AutomationError = ex.Code };
             }
         }
