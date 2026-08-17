@@ -211,21 +211,50 @@ public sealed class RsiSignalAppService
             return signal with { AutomationError = dailyLimit };
         }
 
-        // One open trade at a time — never stack 2+ concurrent bot trades.
-        var openCount = await _tradeRepository.CountByUserAsync(
-            userId, TradeStatus.Running, ct: ct);
-        var pendingCount = await _tradeRepository.CountByUserAsync(
-            userId, TradeStatus.Pending, ct: ct);
-        if (openCount + pendingCount > 0)
+        // One live trade at a time — expired/stuck Running rows must not freeze the bot.
+        var now = DateTimeOffset.UtcNow;
+        var runningRows = await _tradeRepository.ListByUserAsync(
+            userId, take: 20, status: TradeStatus.Running, ct: ct);
+        var pendingRows = await _tradeRepository.ListByUserAsync(
+            userId, take: 10, status: TradeStatus.Pending, ct: ct);
+        var blocking = runningRows.Concat(pendingRows).Where(t => OpenTradeGate.IsBlocking(t, now)).ToList();
+        if (blocking.Count > 0)
         {
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-                "OT1",
+                "H-STUCK1",
                 "RsiSignalAppService.ExecuteIfRequestedAsync",
                 "skip_open_trade_exists",
-                new { openCount, pendingCount, asset = signal.Asset });
+                new
+                {
+                    blocking = blocking.Count,
+                    staleRunning = runningRows.Count - runningRows.Count(t => OpenTradeGate.IsBlocking(t, now)),
+                    pending = pendingRows.Count,
+                    asset = signal.Asset,
+                    oldestAgeSec = blocking.Count == 0
+                        ? 0
+                        : Math.Round((now - blocking.Min(t => t.CreatedAt)).TotalSeconds, 0)
+                },
+                runId: "stuck-running");
             // #endregion
             return signal with { AutomationError = "OPEN_TRADE_EXISTS" };
+        }
+
+        if (runningRows.Count + pendingRows.Count > 0)
+        {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                "H-STUCK1",
+                "RsiSignalAppService.ExecuteIfRequestedAsync",
+                "proceed_despite_stale_open",
+                new
+                {
+                    staleRunning = runningRows.Count,
+                    pending = pendingRows.Count,
+                    asset = signal.Asset
+                },
+                runId: "stuck-running");
+            // #endregion
         }
 
         var gate = await _autoTradeGates.GetOrAdd(userId, _ => new SemaphoreSlim(1, 1))
@@ -235,9 +264,11 @@ public sealed class RsiSignalAppService
 
         try
         {
-            openCount = await _tradeRepository.CountByUserAsync(userId, TradeStatus.Running, ct: ct);
-            pendingCount = await _tradeRepository.CountByUserAsync(userId, TradeStatus.Pending, ct: ct);
-            if (openCount + pendingCount > 0)
+            runningRows = await _tradeRepository.ListByUserAsync(
+                userId, take: 20, status: TradeStatus.Running, ct: ct);
+            pendingRows = await _tradeRepository.ListByUserAsync(
+                userId, take: 10, status: TradeStatus.Pending, ct: ct);
+            if (runningRows.Concat(pendingRows).Any(t => OpenTradeGate.IsBlocking(t, DateTimeOffset.UtcNow)))
                 return signal with { AutomationError = "OPEN_TRADE_EXISTS" };
 
             // Trade duration must match the backtest expiry window (3–5 minutes on 1m).

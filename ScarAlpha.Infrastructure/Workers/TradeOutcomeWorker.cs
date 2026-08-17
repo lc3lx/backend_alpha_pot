@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -16,6 +17,7 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
     private readonly IBinollaSessionRestorer _sessionRestorer;
     private readonly ILogger<TradeOutcomeWorker> _logger;
     private readonly ChannelWorkQueue _queue = new();
+    private readonly ConcurrentDictionary<Guid, byte> _inFlight = new();
     private CancellationTokenSource? _cts;
     private Task? _loop;
 
@@ -72,16 +74,38 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
 
                     var duration = trade.DurationSeconds > 0 ? trade.DurationSeconds : 60;
                     var expectedEnd = trade.CreatedAt.AddSeconds(duration);
-                    var hardDeadline = expectedEnd.AddMinutes(20);
+                    var hardDeadline = expectedEnd.AddSeconds(OpenTradeGate.RunningGraceSeconds);
 
                     if (now >= hardDeadline)
                     {
                         if (!TradeStateMachine.IsHardTerminal(trade.Status))
                         {
-                            await ApplyStatusAsync(
-                                trades, trade, TradeStatus.Unknown, null, "OUTCOME_SWEEP_TIMEOUT", ct);
+                            var next = trade.Status == TradeStatus.Pending
+                                ? TradeStatus.Failed
+                                : TradeStatus.Unknown;
+                            var code = trade.Status == TradeStatus.Pending
+                                ? "PENDING_SWEEP_TIMEOUT"
+                                : "OUTCOME_SWEEP_TIMEOUT";
+                            var prior = trade.Status.ToString();
+                            await ApplyStatusAsync(trades, trade, next, null, code, ct);
+                            // #region agent log
+                            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                                "H-STUCK3",
+                                "TradeOutcomeWorker.SweepStuckTradesAsync",
+                                "marked_after_grace",
+                                new
+                                {
+                                    tradeId = trade.Id.ToString("N")[..8],
+                                    prior,
+                                    next = next.ToString(),
+                                    ageSec = Math.Round((now - trade.CreatedAt).TotalSeconds, 0),
+                                    duration
+                                },
+                                runId: "stuck-running");
+                            // #endregion
                             _logger.LogWarning(
-                                "Sweep: trade {TradeId} marked Unknown after hard deadline", trade.Id);
+                                "Sweep: trade {TradeId} {Prior} → {Next} after expiry+grace",
+                                trade.Id, prior, next);
                         }
                         continue;
                     }
@@ -187,10 +211,15 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
                     // Leave Unknown/Failed as-is; only demote live open trades.
                     if (trade.Status is TradeStatus.Pending or TradeStatus.Running)
                     {
-                        await ApplyStatusAsync(trades, trade, TradeStatus.Unknown, null, "RECOVERY_NO_SESSION", ct);
+                        var prior = trade.Status;
+                        var next = prior == TradeStatus.Pending
+                            ? TradeStatus.Failed
+                            : TradeStatus.Unknown;
+                        await ApplyStatusAsync(
+                            trades, trade, next, null, "RECOVERY_NO_SESSION", ct);
                         _logger.LogWarning(
-                            "Recovery: trade {TradeId} user={UserId} order={BinollaOrderId} marked Unknown — no live session and no Binolla order query API",
-                            trade.Id, trade.UserId, trade.BinollaOrderId);
+                            "Recovery: trade {TradeId} user={UserId} order={BinollaOrderId} {Prior} → {Next} — no live session and no Binolla order query API",
+                            trade.Id, trade.UserId, trade.BinollaOrderId, prior, next);
                     }
                 }
             }
@@ -206,14 +235,24 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
     {
         await foreach (var item in _queue.Reader.ReadAllAsync(ct))
         {
-            try
+            if (!_inFlight.TryAdd(item.TradeId, 0))
+                continue;
+
+            _ = Task.Run(async () =>
             {
-                await ProcessAsync(item, ct);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Outcome worker failed for trade {TradeId}", item.TradeId);
-            }
+                try
+                {
+                    await ProcessAsync(item, ct).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Outcome worker failed for trade {TradeId}", item.TradeId);
+                }
+                finally
+                {
+                    _inFlight.TryRemove(item.TradeId, out _);
+                }
+            }, ct);
         }
     }
 

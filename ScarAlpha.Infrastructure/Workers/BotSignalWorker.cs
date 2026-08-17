@@ -3,6 +3,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using ScarAlpha.Application.Abstractions;
+using ScarAlpha.Application.Common;
 using ScarAlpha.Application.Services;
 using ScarAlpha.Binolla.Abstractions;
 using ScarAlpha.Binolla.Models;
@@ -135,7 +136,17 @@ public sealed class BotSignalWorker : IHostedService
 
         // Only block on truly live open trades — expired/stuck ones must not freeze the bot.
         if (await HasBlockingOpenTradeAsync(trades, bot.UserId, ct).ConfigureAwait(false))
+        {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                "H-STUCK1",
+                "BotSignalWorker.ProcessBotAsync",
+                "worker_skip_blocking_open",
+                new { userId = bot.UserId.ToString("N")[..8] },
+                runId: "stuck-running");
+            // #endregion
             return;
+        }
 
         var options = RsiStrategyOptions.FromBotDurationSeconds(bot.DurationSeconds);
         var batch = NextBatch(bot);
@@ -308,22 +319,28 @@ public sealed class BotSignalWorker : IHostedService
     {
         var now = DateTimeOffset.UtcNow;
         var running = await trades.ListByUserAsync(userId, take: 20, status: TradeStatus.Running, ct: ct);
-        foreach (var trade in running)
-        {
-            var duration = trade.DurationSeconds > 0 ? trade.DurationSeconds : 60;
-            // Grace after expiry — if still Running past this, do not block new entries.
-            if (trade.CreatedAt.AddSeconds(duration + 90) > now)
-                return true;
-        }
-
         var pending = await trades.ListByUserAsync(userId, take: 10, status: TradeStatus.Pending, ct: ct);
-        foreach (var trade in pending)
+        var blocking = running.Concat(pending).Count(trade => OpenTradeGate.IsBlocking(trade, now));
+        var staleRunning = running.Count(trade => !OpenTradeGate.IsBlocking(trade, now));
+        if (blocking > 0 || staleRunning > 0)
         {
-            if (trade.CreatedAt.AddMinutes(2) > now)
-                return true;
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                "H-STUCK1",
+                "BotSignalWorker.HasBlockingOpenTradeAsync",
+                blocking > 0 ? "has_blocking_open" : "stale_open_ignored",
+                new
+                {
+                    userId = userId.ToString("N")[..8],
+                    blocking,
+                    staleRunning,
+                    pending = pending.Count
+                },
+                runId: "stuck-running");
+            // #endregion
         }
 
-        return false;
+        return blocking > 0;
     }
 
     private static bool IsFresh(StrategySignal signal, RsiStrategyOptions options)
