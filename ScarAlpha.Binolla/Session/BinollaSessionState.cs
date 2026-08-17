@@ -47,6 +47,7 @@ public sealed class BinollaSessionState
 
     private List<AssetDataWire> _assets = new();
     private HashSet<string> _subscribedPairs = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<string> _subscribedOrder = new();
 
     public IReadOnlyList<AssetDataWire> Assets
     {
@@ -131,7 +132,15 @@ public sealed class BinollaSessionState
     {
         lock (_assetsGate)
         {
-            _subscribedPairs.Add(pair);
+            if (_subscribedPairs.Add(pair))
+                _subscribedOrder.Add(pair);
+            while (_subscribedPairs.Count > MaxHistoricalEntries && _subscribedOrder.Count > 0)
+            {
+                var oldest = _subscribedOrder[0];
+                _subscribedOrder.RemoveAt(0);
+                if (!oldest.Equals(pair, StringComparison.OrdinalIgnoreCase))
+                    _subscribedPairs.Remove(oldest);
+            }
         }
 
         Touch();
@@ -142,6 +151,7 @@ public sealed class BinollaSessionState
         lock (_assetsGate)
         {
             _subscribedPairs.Clear();
+            _subscribedOrder.Clear();
         }
     }
 

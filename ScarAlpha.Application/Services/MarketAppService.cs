@@ -60,15 +60,8 @@ public sealed class MarketAppService
                 "Market assets for user {UserId}: count={Count} elapsedMs={ElapsedMs}",
                 _currentUser.UserId, assets.Count, sw.ElapsedMilliseconds);
 
-            // Prefetch EURUSD_otc (or first FX OTC) so candles/price hit cache on next poll.
-            var prefer = assets.FirstOrDefault(a =>
-                             a.Symbol.Equals("EURUSD_otc", StringComparison.OrdinalIgnoreCase))
-                         ?? assets.FirstOrDefault(a =>
-                             a.Symbol.EndsWith("_otc", StringComparison.OrdinalIgnoreCase) &&
-                             a.Symbol.Contains("EUR", StringComparison.OrdinalIgnoreCase))
-                         ?? assets.FirstOrDefault(a => a.IsOpen);
-            if (prefer is not null)
-                client.EnsureMarketDataWarm(prefer.Symbol, 60);
+            // Do not prefetch EURUSD here — every Home assets poll was stealing the
+            // quote stream from the worker's rotating batch via asset/change.
 
             // #region agent log
             var fxLike = assets.Where(a =>
@@ -87,8 +80,7 @@ public sealed class MarketAppService
                     fxCount = fxLike.Count,
                     sample = assets.Take(8).Select(a => a.Symbol).ToArray(),
                     fxSample = fxLike.Take(12).Select(a => a.Symbol).ToArray(),
-                    hasEurUsd = assets.Any(a => a.Symbol.Contains("EURUSD", StringComparison.OrdinalIgnoreCase)),
-                    warmAsset = prefer?.Symbol
+                    hasEurUsd = assets.Any(a => a.Symbol.Contains("EURUSD", StringComparison.OrdinalIgnoreCase))
                 });
             // #endregion
 

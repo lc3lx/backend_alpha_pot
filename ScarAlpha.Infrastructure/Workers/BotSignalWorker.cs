@@ -20,10 +20,12 @@ public sealed class BotSignalWorker : IHostedService
 {
     private const int ScanParallelism = 8;
     private const int ScanBatchSize = 8;
+    /// <summary>Hold the same 8 pairs for this many ticks so Binolla quotes can arrive.</summary>
+    private const int ScanHoldTicks = 2;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IBotRuntimeService _botRuntime;
     private readonly ILogger<BotSignalWorker> _logger;
-    private readonly ConcurrentDictionary<Guid, int> _scanOffsets = new();
+    private readonly ConcurrentDictionary<Guid, (int Offset, int Hold)> _scanOffsets = new();
     private CancellationTokenSource? _cts;
     private Task? _loop;
 
@@ -182,10 +184,16 @@ public sealed class BotSignalWorker : IHostedService
 
         var options = RsiStrategyOptions.FromBotDurationSeconds(bot.DurationSeconds);
         var allAssets = bot.ResolvedAssets;
-        var offset = _scanOffsets.GetOrAdd(bot.UserId, 0);
+        var slot = _scanOffsets.GetOrAdd(bot.UserId, _ => (0, 0));
+        var offset = slot.Offset;
         var batch = TakeRotatingBatch(allAssets, offset, ScanBatchSize);
-        if (allAssets.Count > 0)
-            _scanOffsets[bot.UserId] = (offset + ScanBatchSize) % allAssets.Count;
+        var hold = slot.Hold + 1;
+        if (hold >= ScanHoldTicks && allAssets.Count > 0)
+        {
+            offset = (offset + ScanBatchSize) % allAssets.Count;
+            hold = 0;
+        }
+        _scanOffsets[bot.UserId] = (offset, hold);
         var bag = new ConcurrentBag<(string Asset, StrategySignal Signal)>();
         var staleHits = 0;
         var softNone = 0;
@@ -297,7 +305,8 @@ public sealed class BotSignalWorker : IHostedService
                 userId = bot.UserId.ToString("N")[..8],
                 assetCount = bot.ResolvedAssets.Count,
                 batch = batch.Count,
-                scanOffset = offset,
+                scanOffset = slot.Offset,
+                scanHold = slot.Hold,
                 scanMs = Math.Round(scanMs, 0),
                 secIntoMin,
                 candidates = bag.Count,

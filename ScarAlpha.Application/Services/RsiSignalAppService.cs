@@ -108,13 +108,13 @@ public sealed class RsiSignalAppService
             return SoftNone(symbol, wirePeriod) with { AutomationError = "OPEN_TRADE_EXISTS" };
         }
 
-        // Skip asset/change when candles are already cached — GetHistoryAsync hits RAM
-        // and a stale quote still warms so the current rotating batch stays live.
+        // GetHistoryAsync already SubscribePair on a cache miss. Only warm when
+        // candles are in RAM but the live quote went stale (refresh quotes, no 2nd history dump).
         const int maxQuoteAgeSeconds = 15;
         var quoteFresh = client.TryGetCachedQuote(symbol, out var cachedQuote)
             && cachedQuote is not null
             && (DateTimeOffset.UtcNow - cachedQuote.ReceivedAt).TotalSeconds <= maxQuoteAgeSeconds;
-        if (!client.HasFreshHistory(symbol, wirePeriod) || !quoteFresh)
+        if (client.HasFreshHistory(symbol, wirePeriod) && !quoteFresh)
             client.EnsureMarketDataWarm(symbol, wirePeriod);
         try
         {
@@ -124,6 +124,9 @@ public sealed class RsiSignalAppService
             }
 
             var history = await client.GetHistoryAsync(symbol, wirePeriod, CancellationToken.None);
+
+            if (!quoteFresh)
+                quoteFresh = await WaitForFreshQuoteAsync(client, symbol, maxQuoteAgeSeconds, ct);
 
             var now = DateTimeOffset.UtcNow;
             var period = TimeSpan.FromSeconds(wirePeriod);
@@ -515,6 +518,37 @@ public sealed class RsiSignalAppService
         }
 
         return blockers.Count > 0;
+    }
+
+    /// <summary>
+    /// Binolla quotes arrive after s_history/last. A short wait avoids noLiveQuote on the
+    /// same tick we just subscribed.
+    /// </summary>
+    private static async Task<bool> WaitForFreshQuoteAsync(
+        IBinollaClient client,
+        string symbol,
+        int maxQuoteAgeSeconds,
+        CancellationToken ct)
+    {
+        for (var i = 0; i < 8; i++)
+        {
+            if (client.TryGetCachedQuote(symbol, out var quote) &&
+                quote is not null &&
+                (DateTimeOffset.UtcNow - quote.ReceivedAt).TotalSeconds <= maxQuoteAgeSeconds)
+                return true;
+            try
+            {
+                await Task.Delay(50, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return false;
+            }
+        }
+
+        return client.TryGetCachedQuote(symbol, out var last) &&
+               last is not null &&
+               (DateTimeOffset.UtcNow - last.ReceivedAt).TotalSeconds <= maxQuoteAgeSeconds;
     }
 
     /// <summary>
