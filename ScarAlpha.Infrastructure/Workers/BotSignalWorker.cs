@@ -97,6 +97,17 @@ public sealed class BotSignalWorker : IHostedService
             {
                 await ProcessBotAsync(bot, ct).ConfigureAwait(false);
             }
+            catch (ObjectDisposedException ex)
+            {
+                // #region agent log
+                ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                    "H-DISPOSE",
+                    "BotSignalWorker.TickAsync",
+                    "tick_provider_disposed",
+                    new { userId = bot.UserId.ToString("N")[..8], err = ex.ObjectName ?? "unknown" },
+                    runId: "missed-entry");
+                // #endregion
+            }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "BotSignalWorker failed for user {UserId}", bot.UserId);
@@ -106,42 +117,64 @@ public sealed class BotSignalWorker : IHostedService
 
     private async Task ProcessBotAsync(BotRuntimeConfig bot, CancellationToken ct)
     {
-        await using var scope = _scopeFactory.CreateAsyncScope();
-        var trades = scope.ServiceProvider.GetRequiredService<ITradeRepository>();
-        var sessions = scope.ServiceProvider.GetRequiredService<IBinollaSessionManager>();
-        var restorer = scope.ServiceProvider.GetRequiredService<IBinollaSessionRestorer>();
-
-        // Auto-heal Binolla session so Running bots keep trading without manual Start.
-        var client = sessions.Get(bot.UserId.ToString());
-        if (client is null ||
-            !client.IsTransportConnected ||
-            client.Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected))
+        var skipMarketAccess = true;
+        try
         {
-            restorer.EnsureBackgroundRestore(bot.UserId);
-            try
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var trades = scope.ServiceProvider.GetRequiredService<ITradeRepository>();
+            var sessions = scope.ServiceProvider.GetRequiredService<IBinollaSessionManager>();
+            var restorer = scope.ServiceProvider.GetRequiredService<IBinollaSessionRestorer>();
+
+            // Auto-heal Binolla session so Running bots keep trading without manual Start.
+            var client = sessions.Get(bot.UserId.ToString());
+            if (client is null ||
+                !client.IsTransportConnected ||
+                client.Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected))
             {
-                using (AmbientUserContext.Use(bot.UserId))
+                restorer.EnsureBackgroundRestore(bot.UserId);
+                try
                 {
-                    var binolla = scope.ServiceProvider.GetRequiredService<BinollaAppService>();
-                    await binolla.TryReloginFromStoredCredentialsAsync(ct).ConfigureAwait(false);
+                    using (AmbientUserContext.Use(bot.UserId))
+                    {
+                        var binolla = scope.ServiceProvider.GetRequiredService<BinollaAppService>();
+                        await binolla.TryReloginFromStoredCredentialsAsync(ct).ConfigureAwait(false);
+                    }
+                }
+                catch
+                {
+                    // soft — next tick retries
                 }
             }
-            catch
+
+            // Only block on truly live open trades — expired/stuck ones must not freeze the bot.
+            if (await HasBlockingOpenTradeAsync(trades, bot.UserId, ct).ConfigureAwait(false))
             {
-                // soft — next tick retries
+                // #region agent log
+                ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                    "H-STUCK1",
+                    "BotSignalWorker.ProcessBotAsync",
+                    "worker_skip_blocking_open",
+                    new { userId = bot.UserId.ToString("N")[..8] },
+                    runId: "stuck-running");
+                // #endregion
+                return;
+            }
+
+            using (AmbientUserContext.Use(bot.UserId))
+            {
+                var demo = scope.ServiceProvider.GetRequiredService<IMarketingDemoService>();
+                skipMarketAccess = !await demo.IsMarketingDemoAsync(bot.UserId, ct).ConfigureAwait(false);
             }
         }
-
-        // Only block on truly live open trades — expired/stuck ones must not freeze the bot.
-        if (await HasBlockingOpenTradeAsync(trades, bot.UserId, ct).ConfigureAwait(false))
+        catch (ObjectDisposedException ex)
         {
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-                "H-STUCK1",
+                "H-DISPOSE",
                 "BotSignalWorker.ProcessBotAsync",
-                "worker_skip_blocking_open",
-                new { userId = bot.UserId.ToString("N")[..8] },
-                runId: "stuck-running");
+                "root_provider_disposed",
+                new { userId = bot.UserId.ToString("N")[..8], err = ex.ObjectName ?? "unknown" },
+                runId: "missed-entry");
             // #endregion
             return;
         }
@@ -153,55 +186,90 @@ public sealed class BotSignalWorker : IHostedService
         var softNone = 0;
         var dbRace = 0;
         var placedCount = 0;
+        var claimed = 0;
         var userId = bot.UserId;
         var scanStarted = DateTimeOffset.UtcNow;
         var secIntoMin = SecondsIntoMinute();
 
-        // Each parallel asset MUST use its own DI scope — AppDbContext is not thread-safe.
+        // Analyze in parallel (no place). First live Call/Put executes immediately
+        // on that pair's own scope so we do not wait for the rest of the universe.
         await Parallel.ForEachAsync(
             batch,
             new ParallelOptions { MaxDegreeOfParallelism = ScanParallelism, CancellationToken = ct },
             async (asset, token) =>
             {
-                await using var assetScope = _scopeFactory.CreateAsyncScope();
-                var rsi = assetScope.ServiceProvider.GetRequiredService<RsiSignalAppService>();
-                using (AmbientUserContext.Use(userId))
+                if (Volatile.Read(ref claimed) != 0)
+                    return;
+
+                try
                 {
-                    try
+                    await using var assetScope = _scopeFactory.CreateAsyncScope();
+                    var rsi = assetScope.ServiceProvider.GetRequiredService<RsiSignalAppService>();
+                    using (AmbientUserContext.Use(userId))
                     {
-                        var signal = await rsi.GetSignalAsync(asset, 60, options, autoExecute: true, token);
+                        var signal = await rsi.GetSignalAsync(
+                            asset, 60, options, autoExecute: false, token, skipMarketAccess);
                         if (signal.AutomationError == "SIGNAL_STALE")
                             Interlocked.Increment(ref staleHits);
                         else if (signal.Signal is not ("Call" or "Put"))
                             Interlocked.Increment(ref softNone);
 
-                        if (signal.Signal is ("Call" or "Put") &&
-                            signal.Backtest is { Passed: true } &&
-                            IsFresh(signal, options))
-                        {
-                            bag.Add((asset, signal));
-                        }
+                        if (!IsLiveSetup(signal, options))
+                            return;
 
-                        if (!string.IsNullOrEmpty(signal.AutomatedTradeId))
-                            Interlocked.Increment(ref placedCount);
-                    }
-                    catch (InvalidOperationException ex) when (
-                        ex.Message.Contains("second operation", StringComparison.OrdinalIgnoreCase) ||
-                        ex.Message.Contains("DbContext", StringComparison.OrdinalIgnoreCase))
-                    {
-                        Interlocked.Increment(ref dbRace);
+                        bag.Add((asset, signal));
+                        if (Interlocked.CompareExchange(ref claimed, 1, 0) != 0)
+                            return;
+
                         // #region agent log
                         ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-                            "H-DB1",
+                            "H-LIVE",
                             "BotSignalWorker.ProcessBotAsync",
-                            "dbcontext_race_caught",
-                            new { asset, err = ex.Message.Length > 80 ? ex.Message[..80] : ex.Message });
+                            "immediate_execute",
+                            new
+                            {
+                                asset,
+                                signal = signal.Signal,
+                                liveRsi = signal.LiveRsi,
+                                closedRsi = signal.Rsi,
+                                successRate = signal.Backtest?.SuccessRate,
+                                secIntoMin
+                            },
+                            runId: "missed-entry");
                         // #endregion
+
+                        var executed = await rsi.TryAutoExecuteAsync(signal, options, token);
+                        if (!string.IsNullOrEmpty(executed.AutomatedTradeId))
+                            Interlocked.Increment(ref placedCount);
                     }
-                    catch
-                    {
-                        // soft-skip pair
-                    }
+                }
+                catch (ObjectDisposedException ex)
+                {
+                    // #region agent log
+                    ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                        "H-DISPOSE",
+                        "BotSignalWorker.ProcessBotAsync",
+                        "asset_scope_disposed",
+                        new { asset, err = ex.ObjectName ?? "unknown" },
+                        runId: "missed-entry");
+                    // #endregion
+                }
+                catch (InvalidOperationException ex) when (
+                    ex.Message.Contains("second operation", StringComparison.OrdinalIgnoreCase) ||
+                    ex.Message.Contains("DbContext", StringComparison.OrdinalIgnoreCase))
+                {
+                    Interlocked.Increment(ref dbRace);
+                    // #region agent log
+                    ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                        "H-DB1",
+                        "BotSignalWorker.ProcessBotAsync",
+                        "dbcontext_race_caught",
+                        new { asset, err = ex.Message.Length > 80 ? ex.Message[..80] : ex.Message });
+                    // #endregion
+                }
+                catch
+                {
+                    // soft-skip pair
                 }
             }).ConfigureAwait(false);
 
@@ -225,9 +293,11 @@ public sealed class BotSignalWorker : IHostedService
                 softNone,
                 dbRace,
                 placedCount,
+                claimed,
                 maxLag = options.MaxEntryLagSeconds,
                 lookback = options.BacktestCandleCount,
                 hasBest = best is not null,
+                skipMarketAccess,
                 scopedPerAsset = true
             },
             runId: "missed-entry");
@@ -263,6 +333,19 @@ public sealed class BotSignalWorker : IHostedService
         }
 
         return blocking > 0;
+    }
+
+    private static bool IsLiveSetup(StrategySignal signal, RsiStrategyOptions options)
+    {
+        if (signal.Signal is not ("Call" or "Put") || signal.Backtest is not { Passed: true })
+            return false;
+        if (signal.LiveRsi is decimal lr)
+        {
+            if (signal.Signal == "Call" && lr <= options.Oversold) return true;
+            if (signal.Signal == "Put" && lr >= options.Overbought) return true;
+        }
+
+        return IsFresh(signal, options);
     }
 
     private static bool IsFresh(StrategySignal signal, RsiStrategyOptions options)

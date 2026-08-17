@@ -80,7 +80,7 @@ public sealed class Phase5RsiTests
     }
 
     [Fact]
-    public async Task Open_candle_is_never_used_for_signal_or_backtest()
+    public async Task Forming_bar_leaving_zone_does_not_enter_on_closed_rsi()
     {
         var service = new RsiSignalService(new RsiCalculator());
         var options = RsiStrategyOptions.Default60Seconds;
@@ -90,8 +90,28 @@ public sealed class Phase5RsiTests
 
         var signal = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
 
+        signal.Signal.Should().Be("None");
+        signal.LiveRsi.Should().NotBeNull();
+        signal.LiveRsi!.Value.Should().BeGreaterThan(options.Oversold);
+    }
+
+    [Fact]
+    public async Task Live_forming_bar_at_extreme_enters_without_waiting_for_close()
+    {
+        var service = new RsiSignalService(new RsiCalculator());
+        var options = RsiStrategyOptions.Default60Seconds;
+        var closes = OversoldWithRespectedBounce();
+        closes.Add(closes[^1] - 2m);
+        var candles = CreateCandles(closes, openLastIndex: closes.Count - 1);
+
+        var signal = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
+
         signal.Signal.Should().Be("Call");
-        signal.CandleTime.Should().Be(candles[closes.Count - 2].Timestamp);
+        signal.CandleTime.Should().Be(candles[^1].Timestamp);
+        signal.AutomationError.Should().BeNull();
+        signal.Backtest!.Passed.Should().BeTrue();
+        signal.LiveRsi.Should().NotBeNull();
+        signal.LiveRsi!.Value.Should().BeLessThanOrEqualTo(options.Oversold);
     }
 
     [Fact]

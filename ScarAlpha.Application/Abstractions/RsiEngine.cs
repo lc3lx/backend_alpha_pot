@@ -18,8 +18,9 @@ public sealed record RsiStrategyOptions(
     int ExpiryCandles = 5,
     decimal MinimumSuccessRate = 75m,
     /// <summary>
-    /// Max seconds after the signal candle closes to still allow Call/Put.
-    /// Late entries are rejected — the setup is considered gone.
+    /// Max seconds after the last CLOSED bar to still allow Call/Put when the
+    /// feed has no forming candle. Live RSI at 25/75 enters immediately and
+    /// ignores this lag.
     /// </summary>
     int MaxEntryLagSeconds = 20)
 {
@@ -77,8 +78,9 @@ public interface IRsiSignalService
 {
     /// <summary>
     /// Computes live RSI and a 60×1m zone-respect backtest on every snapshot.
-    /// Call/Put is emitted only when RSI is at an extreme AND the matching
-    /// zone (25/75) was touched and respected in the last hour.
+    /// Call/Put is emitted as soon as live RSI is at an extreme AND the matching
+    /// zone (25/75) was touched and respected in the last hour — does not wait
+    /// for the forming candle to close.
     /// Anti-repeat is checked but not recorded here — call
     /// <see cref="MarkSignalEmitted"/> only after a successful trade place.
     /// </summary>

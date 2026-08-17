@@ -47,38 +47,41 @@ public sealed class RsiSignalService : IRsiSignalService
         var currentRsi = _calculator.CalculateRsi(closes, options);
         var (callBacktest, putBacktest) = EvaluateBothBacktests(closes, options);
 
-        // The candle must CLOSE inside the relevant RSI extreme. Touching the
-        // level intra-candle is never visible here because open candles were
-        // removed above.
-        var signalType = currentRsi <= options.Oversold ? RsiSignalType.Call :
-            currentRsi >= options.Overbought ? RsiSignalType.Put :
-            RsiSignalType.None;
-
         var roundedRsi = Math.Round(currentRsi, 2, MidpointRounding.AwayFromZero);
         var liveCloses = candles.OrderBy(c => c.Timestamp).Select(c => c.Close).ToList();
         var liveRsi = liveCloses.Count >= options.Period + 1
             ? Math.Round(_calculator.CalculateRsi(liveCloses, options), 2, MidpointRounding.AwayFromZero)
             : roundedRsi;
+        var forming = candles
+            .Where(c => c.EndTimestamp is null || c.EndTimestamp > now)
+            .OrderBy(c => c.Timestamp)
+            .LastOrDefault();
+
+        // Enter on LIVE RSI (forming bar included). Do not wait for candle close.
+        var signalType = liveRsi <= options.Oversold ? RsiSignalType.Call :
+            liveRsi >= options.Overbought ? RsiSignalType.Put :
+            RsiSignalType.None;
+
         var timeframe = options.TimeframeSeconds.ToString();
-        // Always expose a live backtest: the side RSI is leaning toward.
         var displayBacktest = signalType == RsiSignalType.Call ? callBacktest
             : signalType == RsiSignalType.Put ? putBacktest
-            : currentRsi >= 50m ? putBacktest : callBacktest;
+            : liveRsi >= 50m ? putBacktest : callBacktest;
         var entryBacktest = signalType == RsiSignalType.Call ? callBacktest
             : signalType == RsiSignalType.Put ? putBacktest
             : displayBacktest;
+        var entryCandleTime = forming?.Timestamp ?? currentCandle.Timestamp;
 
         // #region agent log
         ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-            "H-BT1",
+            "H-LIVE",
             "RsiSignalService.GetSignalAsync",
-            "backtest_always",
+            "live_entry_eval",
             new
             {
                 asset = asset.Trim(),
                 rsi = roundedRsi,
                 liveRsi,
-                rsiEqual = liveRsi == roundedRsi,
+                hasForming = forming is not null,
                 rsiSide = signalType.ToString(),
                 lookback = options.BacktestCandleCount,
                 wouldEnter = signalType != RsiSignalType.None && entryBacktest.Passed,
@@ -92,7 +95,7 @@ public sealed class RsiSignalService : IRsiSignalService
                 putN = putBacktest.TotalSignals,
                 putPass = putBacktest.Passed
             },
-            runId: "backtest-always");
+            runId: "missed-entry");
         // #endregion
 
         if (signalType == RsiSignalType.None || !entryBacktest.Passed)
@@ -110,64 +113,65 @@ public sealed class RsiSignalService : IRsiSignalService
 
         var backtest = entryBacktest;
 
-        // Instant entry only: if this closed candle is already old, the setup is gone.
-        var closedAt = currentCandle.EndTimestamp!.Value;
-        var lag = now - closedAt;
-        var maxLag = Math.Max(1, options.MaxEntryLagSeconds);
-        if (lag > TimeSpan.FromSeconds(maxLag))
+        // Lag only applies when the feed has no forming bar (live RSI == last close).
+        if (forming is null)
         {
-            // #region agent log
-            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-                "H-LAG1",
-                "RsiSignalService.GetSignalAsync",
-                "signal_stale_engine",
-                new
-                {
-                    asset = asset.Trim(),
-                    lagSec = Math.Round(lag.TotalSeconds, 2),
-                    maxLagSec = maxLag,
-                    candleStart = currentCandle.Timestamp.ToUnixTimeSeconds(),
-                    candleEnd = closedAt.ToUnixTimeSeconds(),
-                    nowSec = now.ToUnixTimeSeconds(),
-                    successRate = backtest.SuccessRate,
-                    direction = signalType.ToString()
-                });
-            // #endregion
-            return Task.FromResult(new StrategySignal(
-                StrategyId: "rsi",
-                Asset: asset.Trim(),
-                Signal: "None",
-                Rsi: roundedRsi,
-                CandleTime: currentCandle.Timestamp,
-                Timeframe: timeframe,
-                Backtest: backtest,
-                AutomationError: "SIGNAL_STALE",
-                LiveRsi: liveRsi));
+            var closedAt = currentCandle.EndTimestamp!.Value;
+            var lag = now - closedAt;
+            var maxLag = Math.Max(1, options.MaxEntryLagSeconds);
+            if (lag > TimeSpan.FromSeconds(maxLag))
+            {
+                // #region agent log
+                ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                    "H-LAG1",
+                    "RsiSignalService.GetSignalAsync",
+                    "signal_stale_engine",
+                    new
+                    {
+                        asset = asset.Trim(),
+                        lagSec = Math.Round(lag.TotalSeconds, 2),
+                        maxLagSec = maxLag,
+                        candleStart = currentCandle.Timestamp.ToUnixTimeSeconds(),
+                        candleEnd = closedAt.ToUnixTimeSeconds(),
+                        nowSec = now.ToUnixTimeSeconds(),
+                        successRate = backtest.SuccessRate,
+                        direction = signalType.ToString()
+                    });
+                // #endregion
+                return Task.FromResult(new StrategySignal(
+                    StrategyId: "rsi",
+                    Asset: asset.Trim(),
+                    Signal: "None",
+                    Rsi: roundedRsi,
+                    CandleTime: currentCandle.Timestamp,
+                    Timeframe: timeframe,
+                    Backtest: backtest,
+                    AutomationError: "SIGNAL_STALE",
+                    LiveRsi: liveRsi));
+            }
         }
 
         var key = EmissionKey(userId, asset, options.TimeframeSeconds);
         if (_lastEmittedSignalCandleTime.TryGetValue(key, out var lastTime) &&
-            lastTime == currentCandle.Timestamp)
+            lastTime == entryCandleTime)
         {
-            // Already traded this closed candle — no re-emit.
             return Task.FromResult(new StrategySignal(
                 StrategyId: "rsi",
                 Asset: asset.Trim(),
                 Signal: "None",
                 Rsi: roundedRsi,
-                CandleTime: currentCandle.Timestamp,
+                CandleTime: entryCandleTime,
                 Timeframe: timeframe,
                 Backtest: backtest,
                 LiveRsi: liveRsi));
         }
 
-        // Do NOT record emission here — analyze-then-execute needs a second Call/Put.
         return Task.FromResult(new StrategySignal(
             StrategyId: "rsi",
             Asset: asset.Trim(),
             Signal: signalType == RsiSignalType.Call ? "Call" : "Put",
             Rsi: roundedRsi,
-            CandleTime: currentCandle.Timestamp,
+            CandleTime: entryCandleTime,
             Timeframe: timeframe,
             Backtest: backtest,
             LiveRsi: liveRsi));

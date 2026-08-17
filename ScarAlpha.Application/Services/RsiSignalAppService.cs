@@ -44,23 +44,33 @@ public sealed class RsiSignalAppService
         _tradeRepository = tradeRepository;
     }
 
+    public Task<StrategySignal> TryAutoExecuteAsync(
+        StrategySignal signal,
+        RsiStrategyOptions options,
+        CancellationToken ct) =>
+        ExecuteIfRequestedAsync(signal, options, autoExecute: true, ct);
+
     public async Task<StrategySignal> GetSignalAsync(
         string asset,
         int periodSeconds,
         RsiStrategyOptions options,
         bool autoExecute,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool skipMarketAccess = false)
     {
         if (string.IsNullOrWhiteSpace(asset))
             throw new ApiException(ApiErrorCodes.ValidationError, "asset is required.");
         if (periodSeconds != 60)
             throw new ApiException(ApiErrorCodes.ValidationError, "RSI Smart Backtest only supports the 1-minute timeframe.");
 
-        if (await _demo.IsMarketingDemoAsync(_currentUser.UserId, ct))
+        if (!skipMarketAccess && await _demo.IsMarketingDemoAsync(_currentUser.UserId, ct))
             return await ExecuteIfRequestedAsync(_demo.BuildRsiSignal(asset, periodSeconds), options, autoExecute, ct);
 
-        var access = await _botAccess.CheckAsync(_currentUser.UserId, ct);
-        AccountAppService.EnsureConnectedForMarket(access);
+        if (!skipMarketAccess)
+        {
+            var access = await _botAccess.CheckAsync(_currentUser.UserId, ct);
+            AccountAppService.EnsureConnectedForMarket(access);
+        }
 
         var symbol = asset.Trim();
         var wirePeriod = BinollaMarketPeriods.NormalizeHistoryPeriod(periodSeconds);
@@ -175,12 +185,14 @@ public sealed class RsiSignalAppService
             return signal with { AutomationError = "BACKTEST_NOT_PASSED", Signal = "None" };
         }
 
-        // Refuse late fills — candle close must still be within MaxEntryLagSeconds.
+        var liveAtExtreme = signal.LiveRsi is decimal lr &&
+            ((signal.Signal == "Call" && lr <= options.Oversold) ||
+             (signal.Signal == "Put" && lr >= options.Overbought));
         var candleEnd = signal.CandleTime.AddSeconds(options.TimeframeSeconds);
         var executeNow = DateTimeOffset.UtcNow;
         var executeLag = executeNow - candleEnd;
         var maxLag = Math.Max(1, options.MaxEntryLagSeconds);
-        if (executeLag > TimeSpan.FromSeconds(maxLag))
+        if (!liveAtExtreme && executeLag > TimeSpan.FromSeconds(maxLag))
         {
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
@@ -199,6 +211,24 @@ public sealed class RsiSignalAppService
             // #endregion
             return signal with { AutomationError = "SIGNAL_STALE", Signal = "None" };
         }
+
+        // #region agent log
+        if (liveAtExtreme)
+        {
+            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                "H-LIVE",
+                "RsiSignalAppService.ExecuteIfRequestedAsync",
+                "skip_lag_live_extreme",
+                new
+                {
+                    asset = signal.Asset,
+                    signal = signal.Signal,
+                    liveRsi = signal.LiveRsi,
+                    lagSec = Math.Round(executeLag.TotalSeconds, 2)
+                },
+                runId: "missed-entry");
+        }
+        // #endregion
 
         var selected = bot.ResolvedAssets;
         if (selected.Count > 0 && !BotAssetList.Contains(selected, signal.Asset))
