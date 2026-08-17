@@ -130,19 +130,20 @@ public sealed class RsiSignalAppService
 
             var now = DateTimeOffset.UtcNow;
             var period = TimeSpan.FromSeconds(wirePeriod);
-            var candles = history.Candles
-                .OrderBy(c => c.Timestamp)
+            List<CandlestickData> raw;
+            lock (history.Candles)
+                raw = history.Candles.ToList();
+            var normalized = MinuteBars.Normalize(raw, wirePeriod);
+            var candles = normalized
                 .Select(c =>
                 {
-                    var start = DateTimeOffset.FromUnixTimeMilliseconds((long)(c.Timestamp * 1000));
-                    // Synthesize end when feed omits it so closed-candle filter can exclude the forming bar.
-                    var end = c.EndTimestamp is null
-                        ? start + period
-                        : DateTimeOffset.FromUnixTimeMilliseconds((long)(c.EndTimestamp.Value * 1000));
+                    var startUnix = MinuteBars.BucketStartUnix(c.Timestamp, wirePeriod);
+                    var start = DateTimeOffset.FromUnixTimeSeconds(startUnix);
+                    // Period end, never Binolla's last-tick EndTimestamp.
                     return new RsiCandle(
                         Timestamp: start,
                         Close: (decimal)c.Close,
-                        EndTimestamp: end);
+                        EndTimestamp: start + period);
                 })
                 .ToList();
 
@@ -155,6 +156,27 @@ public sealed class RsiSignalAppService
             }
 
             _ = ApplyLiveQuoteToCandles(client, symbol, candles, wirePeriod, now);
+
+            var lastClosed = candles.LastOrDefault(c => c.Timestamp + period <= now);
+            if (lastClosed is { } closedBar &&
+                (now - (closedBar.Timestamp + period)).TotalSeconds > wirePeriod)
+            {
+                // #region agent log
+                ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                    "H-LIVE1",
+                    "RsiSignalAppService.GetSignalAsync",
+                    "rsi_closed_bar_stale",
+                    new
+                    {
+                        symbol,
+                        lastClosedStart = closedBar.Timestamp.ToUnixTimeSeconds(),
+                        ageSec = Math.Round((now - (closedBar.Timestamp + period)).TotalSeconds, 1),
+                        candleCount = candles.Count
+                    },
+                    runId: "live-rsi");
+                // #endregion
+                return SoftNone(symbol, wirePeriod);
+            }
 
             var signal = await _signalService.GetSignalAsync(
                 userId: _currentUser.UserId,
@@ -590,8 +612,8 @@ public sealed class RsiSignalAppService
             return false;
         }
 
-        var period = TimeSpan.FromSeconds(wirePeriod);
-        var bucketStartUnix = now.ToUnixTimeSeconds() / wirePeriod * wirePeriod;
+        var quoteTs = quote.Timestamp > 0 ? quote.Timestamp : now.ToUnixTimeSeconds();
+        var bucketStartUnix = MinuteBars.BucketStartUnix(quoteTs, wirePeriod);
         var bucketStart = DateTimeOffset.FromUnixTimeSeconds(bucketStartUnix);
         var price = (decimal)quote.Price;
 

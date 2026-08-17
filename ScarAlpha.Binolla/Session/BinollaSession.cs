@@ -922,12 +922,10 @@ public sealed class BinollaSession : IBinollaClient
 
     private static bool IsHistoryTooStale(HistoryData history, int periodSeconds)
     {
-        if (history.Candles.Count == 0)
-            return true;
-        var last = history.Candles.OrderBy(c => c.Timestamp).Last();
-        var lastStart = DateTimeOffset.FromUnixTimeMilliseconds((long)(last.Timestamp * 1000));
-        var maxAge = TimeSpan.FromSeconds(Math.Max(periodSeconds * 3, 180));
-        return DateTimeOffset.UtcNow - lastStart > maxAge;
+        List<CandlestickData> snapshot;
+        lock (history.Candles)
+            snapshot = history.Candles.ToList();
+        return MinuteBars.IsSeriesStale(snapshot, periodSeconds, DateTimeOffset.UtcNow);
     }
 
     private void EvictHistory(string key, int wirePeriod)
@@ -942,7 +940,7 @@ public sealed class BinollaSession : IBinollaClient
     }
 
     /// <summary>
-    /// Prefer exact period, else period 60, else any non-empty history for the asset.
+    /// Exact timeframe only. Falling back to 5m/1h candles would compute RSI on the wrong frame.
     /// </summary>
     private HistoryData? FindHistoryFor(string key, int preferredPeriod)
     {
@@ -954,24 +952,20 @@ public sealed class BinollaSession : IBinollaClient
             return exact;
         }
 
-        // Prefer period 60 when available (OTC baseline), then any non-empty for the asset.
-        HistoryData? any = null;
-        HistoryData? sixty = null;
         foreach (var pair in State.HistoricalData)
         {
             if (!pair.Key.StartsWith(key + ":", StringComparison.OrdinalIgnoreCase))
                 continue;
+            if (pair.Value.Period != preferredPeriod &&
+                !pair.Key.EndsWith($":{preferredPeriod}", StringComparison.Ordinal))
+                continue;
             if (pair.Value.Candles.Count == 0 && pair.Value.TickHistory.Count == 0)
                 continue;
-            any ??= pair.Value;
-            if (pair.Value.Period == 60 || pair.Key.EndsWith(":60", StringComparison.Ordinal))
-                sixty = pair.Value;
+            pair.Value.AccessedAt = DateTimeOffset.UtcNow;
+            return pair.Value;
         }
 
-        var hit = sixty ?? any;
-        if (hit is not null)
-            hit.AccessedAt = DateTimeOffset.UtcNow;
-        return hit;
+        return null;
     }
 
     private QuoteData? FindQuoteFor(string key)

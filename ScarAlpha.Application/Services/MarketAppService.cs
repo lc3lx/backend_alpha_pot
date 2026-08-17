@@ -216,7 +216,9 @@ public sealed class MarketAppService
         try
         {
             var history = await client.GetHistoryAsync(symbol, wirePeriod, CancellationToken.None);
-            var raw = history.Candles;
+            List<CandlestickData> raw;
+            lock (history.Candles)
+                raw = history.Candles.ToList();
             var rawFirstTs = raw.Count > 0 ? raw[0].Timestamp : (double?)null;
             var rawLastTs = raw.Count > 0 ? raw[^1].Timestamp : (double?)null;
             var wasNewestFirst = rawFirstTs is not null && rawLastTs is not null && rawFirstTs > rawLastTs;

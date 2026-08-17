@@ -1014,6 +1014,7 @@ internal sealed class SessionMessageRouter
                     AdditionalData = additional,
                     ReceivedAt = DateTimeOffset.UtcNow
                 };
+                ApplyQuoteToMinuteBars(pair, ts, price);
                 stored++;
             }
             catch
@@ -1062,7 +1063,7 @@ internal sealed class SessionMessageRouter
                 return;
             }
 
-            var period = historyMessage["period"]?.ToObject<int>() ?? 60;
+            var period = MinuteBars.EffectivePeriod(historyMessage["period"]?.ToObject<int>() ?? 60);
             var history = new HistoryData
             {
                 Asset = asset,
@@ -1086,12 +1087,14 @@ internal sealed class SessionMessageRouter
             }
 
             var candlesArray = historyMessage["candles"] as JArray;
+            var official = new List<CandlestickData>();
             if (candlesArray is not null)
             {
                 foreach (var item in candlesArray)
                 {
                     if (item is not JArray arr || arr.Count < 5) continue;
                     // Format: [timestamp, open, low, high, close, volume?, end?]  (upstream)
+                    // end is last tick time, not the 1m close — MinuteBars replaces it with start+period.
                     var open = arr[1]!.Value<double>();
                     var low = arr[2]!.Value<double>();
                     var high = arr[3]!.Value<double>();
@@ -1100,7 +1103,7 @@ internal sealed class SessionMessageRouter
                     if (low > high) (low, high) = (high, low);
                     high = Math.Max(high, Math.Max(open, close));
                     low = Math.Min(low, Math.Min(open, close));
-                    history.Candles.Add(new CandlestickData
+                    official.Add(new CandlestickData
                     {
                         Timestamp = arr[0]!.Value<double>(),
                         Open = open,
@@ -1113,58 +1116,14 @@ internal sealed class SessionMessageRouter
                 }
             }
 
-            // Some OTC pushes only tick history — synthesize OHLC so the chart can render.
-            if (history.Candles.Count == 0 && history.TickHistory.Count > 0)
-            {
-                var bucket = Math.Max(1, period);
-                long? curBucket = null;
-                double open = 0, high = 0, low = 0, close = 0;
-                foreach (var tick in history.TickHistory.OrderBy(t => t.Timestamp))
-                {
-                    var ts = (long)tick.Timestamp;
-                    var b = ts - (ts % bucket);
-                    if (curBucket is null || curBucket != b)
-                    {
-                        if (curBucket is not null)
-                        {
-                            history.Candles.Add(new CandlestickData
-                            {
-                                Timestamp = curBucket.Value,
-                                Open = open,
-                                High = high,
-                                Low = low,
-                                Close = close
-                            });
-                        }
-
-                        open = high = low = close = tick.Price;
-                        curBucket = b;
-                    }
-                    else
-                    {
-                        high = Math.Max(high, tick.Price);
-                        low = Math.Min(low, tick.Price);
-                        close = tick.Price;
-                    }
-                }
-
-                if (curBucket is not null)
-                {
-                    history.Candles.Add(new CandlestickData
-                    {
-                        Timestamp = curBucket.Value,
-                        Open = open,
-                        High = high,
-                        Low = low,
-                        Close = close
-                    });
-                }
-            }
+            var merged = MinuteBars.MergeOfficialAndTicks(official, history.TickHistory, period);
+            history.Candles.AddRange(merged);
 
             var ticksBefore = history.TickHistory.Count;
             CompactTickHistory(history);
             _state.SetHistory($"{asset}:{period}", history);
             Interlocked.Increment(ref _historyStoredCount);
+            var last = history.Candles.Count > 0 ? history.Candles[^1] : null;
             // #region agent log
             LoginTrace.Write("H113", "SessionMessageRouter.ProcessHistoryLast", "history_stored", new
             {
@@ -1173,7 +1132,10 @@ internal sealed class SessionMessageRouter
                 candleCount = history.Candles.Count,
                 tickCount = history.TickHistory.Count,
                 ticksBefore,
-                synthesized = history.Candles.Count > 0 && ticksBefore > 0,
+                officialCount = official.Count,
+                synthesized = official.Count == 0 && ticksBefore > 0,
+                lastStart = last?.Timestamp,
+                lastEnd = last?.EndTimestamp,
                 cacheSize = _state.HistoricalData.Count,
                 storedTotal = Volatile.Read(ref _historyStoredCount)
             });
@@ -1186,6 +1148,37 @@ internal sealed class SessionMessageRouter
                 type = ex.GetType().Name,
                 len = content?.Length ?? 0
             });
+        }
+    }
+
+    private void ApplyQuoteToMinuteBars(string pair, double timestamp, double price)
+    {
+        var key = $"{pair}:{MinuteBars.DefaultPeriodSeconds}";
+        if (!_state.HistoricalData.TryGetValue(key, out var history))
+        {
+            foreach (var entry in _state.HistoricalData)
+            {
+                if (entry.Value.Period == MinuteBars.DefaultPeriodSeconds &&
+                    string.Equals(entry.Value.Asset, pair, StringComparison.OrdinalIgnoreCase))
+                {
+                    history = entry.Value;
+                    break;
+                }
+            }
+        }
+
+        if (history is null || history.Candles.Count == 0)
+            return;
+
+        var period = MinuteBars.EffectivePeriod(history.Period);
+        if (period != MinuteBars.DefaultPeriodSeconds)
+            return;
+
+        lock (history.Candles)
+        {
+            var updated = MinuteBars.ApplyQuote(history.Candles, period, timestamp, price);
+            history.Candles.Clear();
+            history.Candles.AddRange(updated);
         }
     }
 

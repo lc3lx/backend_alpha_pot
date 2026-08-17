@@ -39,10 +39,18 @@ public sealed class RsiSignalService : IRsiSignalService
         };
         ValidateOptions(options);
 
-        // Closed only when EndTimestamp is known and not in the future — never treat null as closed.
-        var closed = candles
-            .Where(c => c.EndTimestamp is DateTimeOffset end && end <= now)
+        // Closed 1m bars only: a bar is closed when its minute has elapsed.
+        // Binolla wire EndTimestamp is the last tick, not the period close — never use it
+        // to treat the forming minute as a completed 1m candle.
+        var periodSeconds = options.TimeframeSeconds;
+        var barLength = TimeSpan.FromSeconds(periodSeconds);
+        var ordered = candles
             .OrderBy(c => c.Timestamp)
+            .GroupBy(c => c.Timestamp.ToUnixTimeSeconds() / periodSeconds)
+            .Select(g => g.Last())
+            .ToList();
+        var closed = ordered
+            .Where(c => c.Timestamp + barLength <= now)
             .ToList();
 
         // One current candle, a completed expiry window for at least one
@@ -57,14 +65,13 @@ public sealed class RsiSignalService : IRsiSignalService
         var (callBacktest, putBacktest) = RsiZoneBacktest.Evaluate(closes, options);
 
         var roundedRsi = Math.Round(currentRsi, 2, MidpointRounding.AwayFromZero);
-        var liveCloses = candles.OrderBy(c => c.Timestamp).Select(c => c.Close).ToList();
+        var forming = ordered.LastOrDefault(c => c.Timestamp + barLength > now);
+        var liveCloses = forming is null
+            ? closes
+            : closes.Concat(new[] { forming.Close }).ToList();
         var liveRsi = liveCloses.Count >= options.Period + 1
             ? Math.Round(_calculator.CalculateRsi(liveCloses, options), 2, MidpointRounding.AwayFromZero)
             : roundedRsi;
-        var forming = candles
-            .Where(c => c.EndTimestamp is null || c.EndTimestamp > now)
-            .OrderBy(c => c.Timestamp)
-            .LastOrDefault();
 
         // Live RSI is the primary gate. Backtest is computed in parallel but ignored for entry
         // until RSI is ≤25 (Call) or ≥75 (Put). Only then does matching backtest matter.
@@ -140,7 +147,10 @@ public sealed class RsiSignalService : IRsiSignalService
                     rsi = roundedRsi,
                     liveRsi,
                     lastClosedClose = currentCandle.Close,
+                    lastClosedStart = currentCandle.Timestamp.ToUnixTimeSeconds(),
+                    lastClosedAgeSec = Math.Round((now - (currentCandle.Timestamp + TimeSpan.FromSeconds(options.TimeframeSeconds))).TotalSeconds, 1),
                     formingClose = forming?.Close,
+                    formingStart = forming?.Timestamp.ToUnixTimeSeconds(),
                     hasForming = forming is not null,
                     rsiSide = "None",
                     lookback = RsiZoneBacktest.LookbackCandles,
@@ -188,7 +198,10 @@ public sealed class RsiSignalService : IRsiSignalService
                     rsi = roundedRsi,
                     liveRsi,
                     lastClosedClose = currentCandle.Close,
+                    lastClosedStart = currentCandle.Timestamp.ToUnixTimeSeconds(),
+                    lastClosedAgeSec = Math.Round((now - (currentCandle.Timestamp + TimeSpan.FromSeconds(options.TimeframeSeconds))).TotalSeconds, 1),
                     formingClose = forming?.Close,
+                    formingStart = forming?.Timestamp.ToUnixTimeSeconds(),
                     hasForming = forming is not null,
                     rsiSide = signalType.ToString(),
                 lookback = RsiZoneBacktest.LookbackCandles,

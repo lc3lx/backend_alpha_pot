@@ -115,18 +115,39 @@ public sealed class Phase5RsiTests
     }
 
     [Fact]
-    public async Task Null_EndTimestamp_candles_are_excluded_as_not_closed()
+    public async Task Too_few_elapsed_1m_bars_are_insufficient()
     {
         var service = new RsiSignalService(new RsiCalculator());
         var options = RsiStrategyOptions.Default60Seconds with { MinimumSuccessRate = 0m };
-        var start = Now - TimeSpan.FromMinutes(25);
-        var candles = Enumerable.Range(0, 26)
-            .Select(i => new RsiCandle(start.AddMinutes(i), 100m - i, EndTimestamp: null))
+        var candles = Enumerable.Range(0, 10)
+            .Select(i => new RsiCandle(Now.AddMinutes(i - 9), 100m - i, EndTimestamp: null))
             .ToList();
 
         var act = () => service.GetSignalAsync(UserId, Asset, candles, options, Now);
         var error = await act.Should().ThrowAsync<ApiException>();
         error.Which.Code.Should().Be(ApiErrorCodes.ValidationError);
+    }
+
+    [Fact]
+    public async Task Current_minute_last_tick_is_not_a_closed_1m_bar()
+    {
+        var now = new DateTimeOffset(2026, 8, 5, 10, 0, 30, TimeSpan.Zero);
+        var service = new RsiSignalService(new RsiCalculator());
+        var options = RsiStrategyOptions.Default60Seconds;
+        var closes = OversoldWithRespectedBounce();
+        closes.Add(110m);
+        var currentStart = now.AddSeconds(-30);
+        var candles = closes.Select((close, index) =>
+        {
+            var ts = currentStart.AddMinutes(index - (closes.Count - 1));
+            return new RsiCandle(ts, close, EndTimestamp: ts.AddSeconds(8));
+        }).ToList();
+
+        var signal = await service.GetSignalAsync(UserId, Asset, candles, options, now);
+
+        signal.Signal.Should().Be("None");
+        signal.LiveRsi.Should().NotBeNull();
+        signal.LiveRsi!.Value.Should().BeGreaterThan(options.Oversold);
     }
 
     [Fact]
@@ -227,13 +248,14 @@ public sealed class Phase5RsiTests
     {
         var service = new RsiSignalService(new RsiCalculator());
         var candles = CreateCandles(OversoldWithRespectedBounce());
-        var lateNow = Now.AddMinutes(5);
+        // Still inside the live 1-minute bar (not 5 minutes later when that bar is already closed).
+        var liveNow = Now.AddSeconds(30);
 
-        var signal = await service.GetSignalAsync(UserId, Asset, candles, RsiStrategyOptions.Default60Seconds, lateNow);
+        var signal = await service.GetSignalAsync(UserId, Asset, candles, RsiStrategyOptions.Default60Seconds, liveNow);
 
         signal.Signal.Should().Be("Call");
         signal.AutomationError.Should().BeNull();
-        signal.CandleTime.Should().Be(lateNow);
+        signal.CandleTime.Should().Be(liveNow);
         signal.Backtest!.Passed.Should().BeTrue();
         signal.LiveRsi!.Value.Should().BeLessThanOrEqualTo(RsiEntryLevels.CallMax);
     }
