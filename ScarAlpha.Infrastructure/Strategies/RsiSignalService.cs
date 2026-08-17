@@ -45,6 +45,7 @@ public sealed class RsiSignalService : IRsiSignalService
         var currentCandle = closed[^1];
         var closes = closed.Select(c => c.Close).ToList();
         var currentRsi = _calculator.CalculateRsi(closes, options);
+        var (callBacktest, putBacktest) = EvaluateBothBacktests(closes, options);
 
         // The candle must CLOSE inside the relevant RSI extreme. Touching the
         // level intra-candle is never visible here because open candles were
@@ -54,21 +55,43 @@ public sealed class RsiSignalService : IRsiSignalService
             RsiSignalType.None;
 
         var roundedRsi = Math.Round(currentRsi, 2, MidpointRounding.AwayFromZero);
+        var liveCloses = candles.OrderBy(c => c.Timestamp).Select(c => c.Close).ToList();
+        var liveRsi = liveCloses.Count >= options.Period + 1
+            ? Math.Round(_calculator.CalculateRsi(liveCloses, options), 2, MidpointRounding.AwayFromZero)
+            : roundedRsi;
         var timeframe = options.TimeframeSeconds.ToString();
+        // Always expose a live backtest: the side RSI is leaning toward.
+        var displayBacktest = signalType == RsiSignalType.Call ? callBacktest
+            : signalType == RsiSignalType.Put ? putBacktest
+            : currentRsi >= 50m ? putBacktest : callBacktest;
+        var entryBacktest = signalType == RsiSignalType.Call ? callBacktest
+            : signalType == RsiSignalType.Put ? putBacktest
+            : displayBacktest;
 
-        if (signalType == RsiSignalType.None)
-        {
-            return Task.FromResult(new StrategySignal(
-                StrategyId: "rsi",
-                Asset: asset.Trim(),
-                Signal: "None",
-                Rsi: roundedRsi,
-                CandleTime: currentCandle.Timestamp,
-                Timeframe: timeframe));
-        }
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+            "H-BT1",
+            "RsiSignalService.GetSignalAsync",
+            "backtest_always",
+            new
+            {
+                asset = asset.Trim(),
+                rsi = roundedRsi,
+                liveRsi,
+                rsiEqual = liveRsi == roundedRsi,
+                rsiSide = signalType.ToString(),
+                lookback = options.BacktestCandleCount,
+                callRate = callBacktest.SuccessRate,
+                callN = callBacktest.TotalSignals,
+                callPass = callBacktest.Passed,
+                putRate = putBacktest.SuccessRate,
+                putN = putBacktest.TotalSignals,
+                putPass = putBacktest.Passed
+            },
+            runId: "backtest-always");
+        // #endregion
 
-        var backtest = EvaluateBacktest(closes, signalType, options);
-        if (!backtest.Passed)
+        if (signalType == RsiSignalType.None || !entryBacktest.Passed)
         {
             return Task.FromResult(new StrategySignal(
                 StrategyId: "rsi",
@@ -77,8 +100,11 @@ public sealed class RsiSignalService : IRsiSignalService
                 Rsi: roundedRsi,
                 CandleTime: currentCandle.Timestamp,
                 Timeframe: timeframe,
-                Backtest: backtest));
+                Backtest: displayBacktest,
+                LiveRsi: liveRsi));
         }
+
+        var backtest = entryBacktest;
 
         // Instant entry only: if this closed candle is already old, the setup is gone.
         var closedAt = currentCandle.EndTimestamp!.Value;
@@ -111,7 +137,8 @@ public sealed class RsiSignalService : IRsiSignalService
                 CandleTime: currentCandle.Timestamp,
                 Timeframe: timeframe,
                 Backtest: backtest,
-                AutomationError: "SIGNAL_STALE"));
+                AutomationError: "SIGNAL_STALE",
+                LiveRsi: liveRsi));
         }
 
         var key = EmissionKey(userId, asset, options.TimeframeSeconds);
@@ -126,7 +153,8 @@ public sealed class RsiSignalService : IRsiSignalService
                 Rsi: roundedRsi,
                 CandleTime: currentCandle.Timestamp,
                 Timeframe: timeframe,
-                Backtest: backtest));
+                Backtest: backtest,
+                LiveRsi: liveRsi));
         }
 
         // Do NOT record emission here — analyze-then-execute needs a second Call/Put.
@@ -137,7 +165,8 @@ public sealed class RsiSignalService : IRsiSignalService
             Rsi: roundedRsi,
             CandleTime: currentCandle.Timestamp,
             Timeframe: timeframe,
-            Backtest: backtest));
+            Backtest: backtest,
+            LiveRsi: liveRsi));
     }
 
     public void MarkSignalEmitted(
@@ -154,47 +183,114 @@ public sealed class RsiSignalService : IRsiSignalService
     private static string EmissionKey(Guid userId, string asset, int timeframeSeconds) =>
         $"{userId:N}:{asset.Trim().ToUpperInvariant()}:{timeframeSeconds}";
 
-    private RsiBacktestStats EvaluateBacktest(
+    private (RsiBacktestStats Call, RsiBacktestStats Put) EvaluateBothBacktests(
         IReadOnlyList<decimal> closes,
-        RsiSignalType direction,
         RsiStrategyOptions options)
     {
         var currentIndex = closes.Count - 1;
-        // The lookback ends before the current entry and before any historical
-        // outcome would overlap the current candle. This prevents lookahead.
         var firstIndex = Math.Max(options.Period, currentIndex - options.BacktestCandleCount);
-        var lastIndex = currentIndex - options.ExpiryCandles - 1;
-        var total = 0;
-        var successful = 0;
+        var lastIndex = currentIndex - 1;
+        var rsiSeries = BuildRsiSeries(closes, options);
+        var callTotal = 0;
+        var callWins = 0;
+        var putTotal = 0;
+        var putWins = 0;
+        var inCallZone = false;
+        var inPutZone = false;
+        var callTouchIndex = -1;
+        var putTouchIndex = -1;
 
-        for (var entryIndex = firstIndex; entryIndex <= lastIndex; entryIndex++)
+        for (var i = firstIndex; i <= lastIndex; i++)
         {
-            var historicalRsi = _calculator.CalculateRsi(
-                closes.Take(entryIndex + 1).ToList(), options);
-            var matchesDirection = direction == RsiSignalType.Call
-                ? historicalRsi <= options.Oversold
-                : historicalRsi >= options.Overbought;
+            var historicalRsi = rsiSeries[i];
 
-            if (!matchesDirection)
-                continue;
+            if (historicalRsi <= options.Oversold)
+            {
+                if (!inCallZone)
+                {
+                    inCallZone = true;
+                    callTouchIndex = i;
+                }
+            }
+            else if (inCallZone)
+            {
+                callTotal++;
+                if (closes[i] > closes[callTouchIndex])
+                    callWins++;
+                inCallZone = false;
+                callTouchIndex = -1;
+            }
 
-            total++;
-            var entryClose = closes[entryIndex];
-            var expiryClose = closes[entryIndex + options.ExpiryCandles];
-            var won = direction == RsiSignalType.Call
-                ? expiryClose > entryClose
-                : expiryClose < entryClose;
-            if (won)
-                successful++;
+            if (historicalRsi >= options.Overbought)
+            {
+                if (!inPutZone)
+                {
+                    inPutZone = true;
+                    putTouchIndex = i;
+                }
+            }
+            else if (inPutZone)
+            {
+                putTotal++;
+                if (closes[i] < closes[putTouchIndex])
+                    putWins++;
+                inPutZone = false;
+                putTouchIndex = -1;
+            }
         }
 
-        var failed = total - successful;
+        return (ToStats(callTotal, callWins, options), ToStats(putTotal, putWins, options));
+    }
+
+    private static decimal[] BuildRsiSeries(IReadOnlyList<decimal> closes, RsiStrategyOptions options)
+    {
+        var series = new decimal[closes.Count];
+        if (closes.Count < options.Period + 1)
+            return series;
+
+        decimal gainSum = 0m;
+        decimal lossSum = 0m;
+        for (var i = 1; i <= options.Period; i++)
+        {
+            var delta = closes[i] - closes[i - 1];
+            if (delta > 0) gainSum += delta;
+            else lossSum += -delta;
+        }
+
+        var avgGain = gainSum / options.Period;
+        var avgLoss = lossSum / options.Period;
+        series[options.Period] = ToRsi(avgGain, avgLoss);
+
+        for (var i = options.Period + 1; i < closes.Count; i++)
+        {
+            var delta = closes[i] - closes[i - 1];
+            var gain = delta > 0 ? delta : 0m;
+            var loss = delta < 0 ? -delta : 0m;
+            avgGain = (avgGain * (options.Period - 1) + gain) / options.Period;
+            avgLoss = (avgLoss * (options.Period - 1) + loss) / options.Period;
+            series[i] = ToRsi(avgGain, avgLoss);
+        }
+
+        return series;
+    }
+
+    private static decimal ToRsi(decimal avgGain, decimal avgLoss)
+    {
+        if (avgLoss == 0m)
+            return avgGain == 0m ? 50m : 100m;
+        var rs = avgGain / avgLoss;
+        return 100m - (100m / (1m + rs));
+    }
+
+    private static RsiBacktestStats ToStats(int total, int wins, RsiStrategyOptions options)
+    {
+        var failed = total - wins;
         var successRate = total == 0
             ? 0m
-            : Math.Round(successful * 100m / total, 2, MidpointRounding.AwayFromZero);
+            : Math.Round(wins * 100m / total, 2, MidpointRounding.AwayFromZero);
         return new RsiBacktestStats(
             TotalSignals: total,
-            SuccessfulSignals: successful,
+            SuccessfulSignals: wins,
             FailedSignals: failed,
             SuccessRate: successRate,
             LookbackCandles: options.BacktestCandleCount,

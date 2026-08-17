@@ -14,7 +14,7 @@ public sealed record RsiStrategyOptions(
     decimal Oversold,
     decimal Overbought,
     int TimeframeSeconds,
-    int BacktestCandleCount = 40,
+    int BacktestCandleCount = 60,
     int ExpiryCandles = 5,
     decimal MinimumSuccessRate = 75m,
     /// <summary>
@@ -61,7 +61,8 @@ public sealed record StrategySignal(
     string Timeframe,
     RsiBacktestStats? Backtest = null,
     string? AutomatedTradeId = null,
-    string? AutomationError = null);
+    string? AutomationError = null,
+    decimal? LiveRsi = null);
 
 public interface IRsiCalculator
 {
@@ -75,10 +76,9 @@ public interface IRsiCalculator
 public interface IRsiSignalService
 {
     /// <summary>
-    /// Computes an RSI signal on the latest closed 1-minute candle only.
-    /// A CALL requires RSI <= Oversold and a PUT requires RSI >= Overbought.
-    /// The current signal is emitted only after the same-direction historical
-    /// backtest meets the configured success rate; no open-candle data is used.
+    /// Computes live RSI and a 60×1m zone-respect backtest on every snapshot.
+    /// Call/Put is emitted only when RSI is at an extreme AND the matching
+    /// zone (25/75) was touched and respected in the last hour.
     /// Anti-repeat is checked but not recorded here — call
     /// <see cref="MarkSignalEmitted"/> only after a successful trade place.
     /// </summary>

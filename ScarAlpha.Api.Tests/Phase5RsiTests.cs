@@ -35,40 +35,41 @@ public sealed class Phase5RsiTests
     }
 
     [Fact]
-    public async Task Closed_oversold_rsi_emits_call_without_waiting_for_a_crossing()
+    public async Task Closed_oversold_without_zone_respect_does_not_enter()
     {
         var service = new RsiSignalService(new RsiCalculator());
         var options = RsiStrategyOptions.Default60Seconds with { MinimumSuccessRate = 0m };
-        var candles = CreateCandles(Enumerable.Range(0, 26).Select(i => 100m - i).ToList());
+        var candles = CreateCandles(DumpCloses(26));
 
         var signal = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
 
-        signal.Signal.Should().Be("Call");
         signal.Rsi.Should().Be(0m);
+        signal.Signal.Should().Be("None");
         signal.Backtest.Should().NotBeNull();
-        signal.Backtest!.TotalSignals.Should().BeGreaterThan(0);
-        signal.Backtest.SuccessRate.Should().Be(0m);
+        signal.Backtest!.Passed.Should().BeFalse();
+        signal.Backtest.TotalSignals.Should().Be(0);
     }
 
     [Fact]
-    public async Task Closed_overbought_rsi_emits_put_without_waiting_for_a_crossing()
+    public async Task Closed_overbought_without_zone_respect_does_not_enter()
     {
         var service = new RsiSignalService(new RsiCalculator());
         var options = RsiStrategyOptions.Default60Seconds with { MinimumSuccessRate = 0m };
-        var candles = CreateCandles(Enumerable.Range(0, 26).Select(i => 100m + i).ToList());
+        var candles = CreateCandles(RallyCloses(26));
 
         var signal = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
 
-        signal.Signal.Should().Be("Put");
         signal.Rsi.Should().Be(100m);
-        signal.Backtest!.SuccessRate.Should().Be(0m);
+        signal.Signal.Should().Be("None");
+        signal.Backtest!.Passed.Should().BeFalse();
+        signal.Backtest.TotalSignals.Should().Be(0);
     }
 
     [Fact]
     public async Task Failed_historical_filter_suppresses_the_current_signal()
     {
         var service = new RsiSignalService(new RsiCalculator());
-        var candles = CreateCandles(Enumerable.Range(0, 26).Select(i => 100m - i).ToList());
+        var candles = CreateCandles(DumpCloses(26));
 
         var signal = await service.GetSignalAsync(UserId, Asset, candles, RsiStrategyOptions.Default60Seconds, Now);
 
@@ -82,14 +83,15 @@ public sealed class Phase5RsiTests
     public async Task Open_candle_is_never_used_for_signal_or_backtest()
     {
         var service = new RsiSignalService(new RsiCalculator());
-        var options = RsiStrategyOptions.Default60Seconds with { MinimumSuccessRate = 0m };
-        var closes = Enumerable.Range(0, 22).Select(i => 100m - i).Append(110m).ToList();
-        var candles = CreateCandles(closes, openLastIndex: 22);
+        var options = RsiStrategyOptions.Default60Seconds;
+        var closes = OversoldWithRespectedBounce();
+        closes.Add(110m);
+        var candles = CreateCandles(closes, openLastIndex: closes.Count - 1);
 
         var signal = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
 
         signal.Signal.Should().Be("Call");
-        signal.CandleTime.Should().Be(candles[21].Timestamp);
+        signal.CandleTime.Should().Be(candles[closes.Count - 2].Timestamp);
     }
 
     [Fact]
@@ -111,8 +113,8 @@ public sealed class Phase5RsiTests
     public async Task Analyze_twice_still_emits_until_MarkSignalEmitted()
     {
         var service = new RsiSignalService(new RsiCalculator());
-        var options = RsiStrategyOptions.Default60Seconds with { MinimumSuccessRate = 0m };
-        var candles = CreateCandles(Enumerable.Range(0, 26).Select(i => 100m - i).ToList());
+        var options = RsiStrategyOptions.Default60Seconds;
+        var candles = CreateCandles(OversoldWithRespectedBounce());
 
         var first = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
         var second = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
@@ -127,34 +129,45 @@ public sealed class Phase5RsiTests
     }
 
     [Fact]
-    public async Task Passed_is_true_when_success_rate_meets_minimum_exactly()
+    public async Task Respected_zone_passes_and_dump_without_exit_fails()
     {
-        // Pure downtrend historical CALL entries all lose → rate 0 → not passed at 75.
-        // With MinimumSuccessRate = 0, Passed becomes true when any historical signal exists.
         var service = new RsiSignalService(new RsiCalculator());
-        var candles = CreateCandles(Enumerable.Range(0, 26).Select(i => 100m - i).ToList());
 
-        var atZero = await service.GetSignalAsync(
-            UserId, Asset, candles,
-            RsiStrategyOptions.Default60Seconds with { MinimumSuccessRate = 0m },
-            Now);
-        atZero.Backtest!.Passed.Should().BeTrue();
-        atZero.Signal.Should().Be("Call");
+        var respected = await service.GetSignalAsync(
+            UserId, Asset, CreateCandles(OversoldWithRespectedBounce()),
+            RsiStrategyOptions.Default60Seconds, Now);
+        respected.Backtest!.Passed.Should().BeTrue();
+        respected.Signal.Should().Be("Call");
 
-        var atSeventyFive = await service.GetSignalAsync(
-            UserId, Asset, candles,
-            RsiStrategyOptions.Default60Seconds with { MinimumSuccessRate = 75m },
-            Now);
-        atSeventyFive.Backtest!.Passed.Should().BeFalse();
-        atSeventyFive.Signal.Should().Be("None");
-        atSeventyFive.Backtest.SuccessRate.Should().Be(0m);
+        var dump = await service.GetSignalAsync(
+            UserId, Asset, CreateCandles(DumpCloses(26)),
+            RsiStrategyOptions.Default60Seconds, Now);
+        dump.Backtest!.Passed.Should().BeFalse();
+        dump.Signal.Should().Be("None");
+        dump.Backtest.SuccessRate.Should().Be(0m);
+    }
+
+    [Fact]
+    public async Task Mid_range_rsi_still_runs_backtest_but_emits_none()
+    {
+        var service = new RsiSignalService(new RsiCalculator());
+        var options = RsiStrategyOptions.Default60Seconds with { MinimumSuccessRate = 0m };
+        // Flat series → RSI 50, between 25 and 75.
+        var candles = CreateCandles(Enumerable.Repeat(100m, 40).ToList());
+
+        var signal = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
+
+        signal.Signal.Should().Be("None");
+        signal.Rsi.Should().Be(50m);
+        signal.Backtest.Should().NotBeNull();
+        signal.Backtest!.LookbackCandles.Should().Be(60);
     }
 
     [Fact]
     public async Task Below_minimum_success_rate_emits_none()
     {
         var service = new RsiSignalService(new RsiCalculator());
-        var candles = CreateCandles(Enumerable.Range(0, 26).Select(i => 100m - i).ToList());
+        var candles = CreateCandles(DumpCloses(26));
         var options = RsiStrategyOptions.Default60Seconds with { MinimumSuccessRate = 75m };
 
         var signal = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
@@ -177,12 +190,8 @@ public sealed class Phase5RsiTests
     public async Task Stale_closed_candle_does_not_emit_call_or_put()
     {
         var service = new RsiSignalService(new RsiCalculator());
-        var options = RsiStrategyOptions.Default60Seconds with
-        {
-            MinimumSuccessRate = 0m,
-            MaxEntryLagSeconds = 20,
-        };
-        var candles = CreateCandles(Enumerable.Range(0, 26).Select(i => 100m - i).ToList());
+        var options = RsiStrategyOptions.Default60Seconds with { MaxEntryLagSeconds = 20 };
+        var candles = CreateCandles(OversoldWithRespectedBounce());
         // Candle closed long ago relative to Now+5min
         var lateNow = Now.AddMinutes(5);
 
@@ -194,15 +203,48 @@ public sealed class Phase5RsiTests
     }
 
     [Fact]
+    public async Task Zone_touch_then_bounce_passes_call_backtest()
+    {
+        var service = new RsiSignalService(new RsiCalculator());
+        var options = RsiStrategyOptions.Default60Seconds;
+        var signal = await service.GetSignalAsync(UserId, Asset, CreateCandles(OversoldWithRespectedBounce()), options, Now);
+
+        signal.Backtest.Should().NotBeNull();
+        signal.Backtest!.LookbackCandles.Should().Be(60);
+        signal.Backtest.TotalSignals.Should().BeGreaterThan(0);
+        signal.Backtest.Passed.Should().BeTrue();
+        signal.Backtest.SuccessRate.Should().BeGreaterThanOrEqualTo(75m);
+    }
+
+    [Fact]
     public async Task One_minute_is_the_only_supported_timeframe()
     {
         var service = new RsiSignalService(new RsiCalculator());
         var options = RsiStrategyOptions.Default60Seconds with { TimeframeSeconds = 300 };
-        var candles = CreateCandles(Enumerable.Range(0, 26).Select(i => 100m - i).ToList());
+        var candles = CreateCandles(DumpCloses(26));
 
         var act = () => service.GetSignalAsync(UserId, Asset, candles, options, Now);
         var error = await act.Should().ThrowAsync<ApiException>();
         error.Which.Code.Should().Be(ApiErrorCodes.ValidationError);
+    }
+
+    private static List<decimal> DumpCloses(int n) =>
+        Enumerable.Range(0, n).Select(i => 100m - i).ToList();
+
+    private static List<decimal> RallyCloses(int n) =>
+        Enumerable.Range(0, n).Select(i => 100m + i).ToList();
+
+    /// <summary>Touch RSI 25, bounce out of the zone, then return to oversold.</summary>
+    private static List<decimal> OversoldWithRespectedBounce()
+    {
+        var closes = new List<decimal>();
+        for (var i = 0; i < 16; i++)
+            closes.Add(80m - i * 3);
+        for (var i = 1; i <= 12; i++)
+            closes.Add(35m + i * 5);
+        for (var i = 1; i <= 16; i++)
+            closes.Add(95m - i * 4);
+        return closes;
     }
 
     private static List<RsiCandle> CreateCandles(List<decimal> closes, int? openLastIndex = null)

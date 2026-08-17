@@ -13,16 +13,14 @@ namespace ScarAlpha.Infrastructure.Workers;
 
 /// <summary>
 /// Keeps bots analyzing/trading while the Mini App is closed.
-/// Heals Binolla sessions, ignores stale open trades, scans in rotating batches.
+/// Scans every selected pair each tick (RSI + 60-candle zone backtest in parallel).
 /// </summary>
 public sealed class BotSignalWorker : IHostedService
 {
     private const int ScanParallelism = 8;
-    private const int BatchSize = 40;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IBotRuntimeService _botRuntime;
     private readonly ILogger<BotSignalWorker> _logger;
-    private readonly ConcurrentDictionary<Guid, int> _scanOffsets = new();
     private CancellationTokenSource? _cts;
     private Task? _loop;
 
@@ -149,7 +147,7 @@ public sealed class BotSignalWorker : IHostedService
         }
 
         var options = RsiStrategyOptions.FromBotDurationSeconds(bot.DurationSeconds);
-        var batch = NextBatch(bot);
+        var batch = bot.ResolvedAssets;
         var bag = new ConcurrentBag<(string Asset, StrategySignal Signal)>();
         var staleHits = 0;
         var softNone = 0;
@@ -223,6 +221,7 @@ public sealed class BotSignalWorker : IHostedService
                 softNone,
                 dbRace,
                 maxLag = options.MaxEntryLagSeconds,
+                lookback = options.BacktestCandleCount,
                 hasBest = best is not null,
                 scopedPerAsset = true
             });
@@ -296,20 +295,6 @@ public sealed class BotSignalWorker : IHostedService
     {
         var closedAt = signal.CandleTime.AddSeconds(options.TimeframeSeconds);
         return Math.Round((DateTimeOffset.UtcNow - closedAt).TotalSeconds, 2);
-    }
-
-    private IReadOnlyList<string> NextBatch(BotRuntimeConfig bot)
-    {
-        var assets = bot.ResolvedAssets;
-        if (assets.Count <= BatchSize)
-            return assets;
-
-        var offset = _scanOffsets.AddOrUpdate(bot.UserId, 0, (_, prev) => prev + BatchSize);
-        offset %= assets.Count;
-        var list = new List<string>(BatchSize);
-        for (var i = 0; i < BatchSize; i++)
-            list.Add(assets[(offset + i) % assets.Count]);
-        return list;
     }
 
     private static async Task<bool> HasBlockingOpenTradeAsync(

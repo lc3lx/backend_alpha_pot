@@ -749,6 +749,7 @@ public sealed class BinollaSession : IBinollaClient
                 candleCount = cached.Candles.Count,
                 tickCount = cached.TickHistory.Count
             });
+            LogHistoryVsQuote(key, cached, "cache");
             // #endregion
             return cached;
         }
@@ -851,6 +852,35 @@ public sealed class BinollaSession : IBinollaClient
         });
         // #endregion
         throw new BinollaTimeoutException("History not available for asset/period.");
+    }
+
+    private void LogHistoryVsQuote(string key, HistoryData history, string source)
+    {
+        // #region agent log
+        var last = history.Candles.Count > 0 ? history.Candles[^1] : null;
+        var quote = FindQuoteFor(key);
+        ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+            "H-LIVE1",
+            "BinollaSession.GetHistoryAsync",
+            "history_vs_quote",
+            new
+            {
+                symbol = key,
+                source,
+                candleCount = history.Candles.Count,
+                lastClose = last?.Close,
+                lastTs = last?.Timestamp,
+                lastEnd = last?.EndTimestamp,
+                quotePrice = quote?.Price,
+                quoteAgeMs = quote is null
+                    ? (double?)null
+                    : Math.Round((DateTimeOffset.UtcNow - quote.ReceivedAt).TotalMilliseconds, 0),
+                closeDiff = last is null || quote is null
+                    ? (double?)null
+                    : Math.Round(quote.Price - last.Close, 6)
+            },
+            runId: "live-rsi");
+        // #endregion
     }
 
     /// <summary>
