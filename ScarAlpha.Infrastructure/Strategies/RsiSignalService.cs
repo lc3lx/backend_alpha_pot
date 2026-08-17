@@ -291,7 +291,7 @@ public sealed class RsiSignalService : IRsiSignalService
             LookbackCandles: options.BacktestCandleCount,
             ExpiryCandles: options.ExpiryCandles,
             MinimumSuccessRate: options.MinimumSuccessRate,
-            Passed: total > 0 && successRate >= options.MinimumSuccessRate);
+            Passed: total > 0 && successRate >= Math.Max(options.MinimumSuccessRate, RsiEntryLevels.MinSuccessRate));
     }
 
     private static void ValidateOptions(RsiStrategyOptions options)

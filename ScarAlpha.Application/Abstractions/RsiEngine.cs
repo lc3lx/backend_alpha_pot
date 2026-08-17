@@ -38,24 +38,85 @@ public sealed record RsiStrategyOptions(
 }
 
 /// <summary>
-/// Hard entry levels. Put requires live RSI ≥ 75. Call requires live RSI ≤ 25.
-/// Backtest must also pass — neither condition alone is enough.
+/// Hard entry rules for live bot trades. ALL must pass before PlaceTrade:
+/// 1) Call: live RSI ≤ 25 — Put: live RSI ≥ 75
+/// 2) Matching zone-respect backtest Passed with ≥ 75% and at least one visit
+/// 3) Setup still within <see cref="SetupTtlSeconds"/> of first sight
 /// </summary>
 public static class RsiEntryLevels
 {
     public const decimal CallMax = 25m;
     public const decimal PutMin = 75m;
+    public const decimal MinSuccessRate = 75m;
     /// <summary>Enter on the first tick both conditions are true. After this, look for a new touch.</summary>
     public const int SetupTtlSeconds = 5;
 
     public static bool IsCallRsi(decimal rsi) => rsi <= CallMax;
     public static bool IsPutRsi(decimal rsi) => rsi >= PutMin;
 
+    public static bool BacktestOk(RsiBacktestStats? backtest) =>
+        backtest is { Passed: true, TotalSignals: > 0 } &&
+        backtest.SuccessRate >= MinSuccessRate &&
+        backtest.SuccessRate >= backtest.MinimumSuccessRate;
+
     public static bool CanEnterCall(decimal rsi, RsiBacktestStats? backtest) =>
-        IsCallRsi(rsi) && backtest is { Passed: true };
+        IsCallRsi(rsi) && BacktestOk(backtest);
 
     public static bool CanEnterPut(decimal rsi, RsiBacktestStats? backtest) =>
-        IsPutRsi(rsi) && backtest is { Passed: true };
+        IsPutRsi(rsi) && BacktestOk(backtest);
+
+    /// <summary>
+    /// Final gate before placing a bot trade. Rejects display-only / expired / incomplete setups.
+    /// </summary>
+    public static bool TryValidateForTrade(
+        StrategySignal signal,
+        DateTimeOffset now,
+        out string? rejectCode)
+    {
+        rejectCode = null;
+
+        if (!string.IsNullOrEmpty(signal.AutomationError) &&
+            signal.AutomationError is "SETUP_EXPIRED" or "SETUP_CONSUMED" or "SIGNAL_STALE")
+        {
+            rejectCode = signal.AutomationError;
+            return false;
+        }
+
+        if (signal.Signal is not ("Call" or "Put"))
+        {
+            rejectCode = "NO_SIGNAL";
+            return false;
+        }
+
+        if (signal.LiveRsi is not decimal liveRsi)
+        {
+            rejectCode = "LIVE_RSI_REQUIRED";
+            return false;
+        }
+
+        if (signal.Signal == "Call" && !CanEnterCall(liveRsi, signal.Backtest))
+        {
+            rejectCode = IsCallRsi(liveRsi) ? "BACKTEST_NOT_PASSED" : "RSI_NOT_OVERSOLD";
+            return false;
+        }
+
+        if (signal.Signal == "Put" && !CanEnterPut(liveRsi, signal.Backtest))
+        {
+            rejectCode = IsPutRsi(liveRsi) ? "BACKTEST_NOT_PASSED" : "RSI_NOT_OVERBOUGHT";
+            return false;
+        }
+
+        var ageSeconds = (now - signal.CandleTime).TotalSeconds;
+        if (ageSeconds < 0)
+            ageSeconds = 0;
+        if (ageSeconds > SetupTtlSeconds)
+        {
+            rejectCode = "SETUP_EXPIRED";
+            return false;
+        }
+
+        return true;
+    }
 }
 
 public sealed record RsiCandle(

@@ -211,7 +211,7 @@ public sealed class BotSignalWorker : IHostedService
                         else if (signal.Signal is not ("Call" or "Put"))
                             Interlocked.Increment(ref softNone);
 
-        if (!IsLiveSetup(signal))
+                        if (!IsLiveSetup(signal))
                             return;
 
                         bag.Add((asset, signal));
@@ -271,7 +271,7 @@ public sealed class BotSignalWorker : IHostedService
             }).ConfigureAwait(false);
 
         var scanMs = (DateTimeOffset.UtcNow - scanStarted).TotalMilliseconds;
-        var best = PickBest(bag.ToList(), options);
+        var best = PickBest(bag.ToList());
 
         // #region agent log
         ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
@@ -332,41 +332,24 @@ public sealed class BotSignalWorker : IHostedService
         return blocking > 0;
     }
 
-    private static bool IsLiveSetup(StrategySignal signal)
-    {
-        var rsi = signal.LiveRsi ?? signal.Rsi;
-        if (signal.Signal == "Call")
-            return RsiEntryLevels.CanEnterCall(rsi, signal.Backtest);
-        if (signal.Signal == "Put")
-            return RsiEntryLevels.CanEnterPut(rsi, signal.Backtest);
-        return false;
-    }
-
-    private static bool IsFresh(StrategySignal signal, RsiStrategyOptions options)
-    {
-        var closedAt = signal.CandleTime.AddSeconds(options.TimeframeSeconds);
-        return DateTimeOffset.UtcNow - closedAt <=
-               TimeSpan.FromSeconds(Math.Max(1, options.MaxEntryLagSeconds));
-    }
+    private static bool IsLiveSetup(StrategySignal signal) =>
+        RsiEntryLevels.TryValidateForTrade(signal, DateTimeOffset.UtcNow, out _);
 
     private static (string Asset, StrategySignal Signal)? PickBest(
-        List<(string Asset, StrategySignal Signal)> signals,
-        RsiStrategyOptions options)
+        List<(string Asset, StrategySignal Signal)> signals)
     {
         if (signals.Count == 0) return null;
 
-        var oversold = options.Oversold;
-        var overbought = options.Overbought;
-
         var ordered = signals
-            .Where(s => s.Signal.Backtest is { Passed: true } && IsFresh(s.Signal, options))
+            .Where(s => IsLiveSetup(s.Signal))
             .OrderByDescending(s => s.Signal.Backtest!.SuccessRate)
             .ThenByDescending(s =>
             {
+                var rsi = s.Signal.LiveRsi ?? s.Signal.Rsi;
                 if (s.Signal.Signal == "Call")
-                    return oversold - s.Signal.Rsi;
+                    return RsiEntryLevels.CallMax - rsi;
                 if (s.Signal.Signal == "Put")
-                    return s.Signal.Rsi - overbought;
+                    return rsi - RsiEntryLevels.PutMin;
                 return 0m;
             })
             .ToList();

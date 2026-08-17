@@ -68,7 +68,10 @@ public sealed class RsiSignalAppService
             throw new ApiException(ApiErrorCodes.ValidationError, "RSI Smart Backtest only supports the 1-minute timeframe.");
 
         if (!skipMarketAccess && await _demo.IsMarketingDemoAsync(_currentUser.UserId, ct))
-            return await ExecuteIfRequestedAsync(_demo.BuildRsiSignal(asset, periodSeconds), options, autoExecute, ct);
+        {
+            // Demo payloads are display-only — never auto-place from synthetic RSI.
+            return _demo.BuildRsiSignal(asset, periodSeconds);
+        }
 
         if (!skipMarketAccess)
         {
@@ -177,22 +180,16 @@ public sealed class RsiSignalAppService
     {
         var userId = _currentUser.UserId;
         var bot = _botRuntime.Get(userId);
-        // Home polls rsi/signal without autoExecute. If the bot is Running, place anyway.
-        if (bot.State != BotRunState.Running || signal.Signal is not ("Call" or "Put"))
+        // Home polls without autoExecute still place when Running — but only after full gate.
+        if (bot.State != BotRunState.Running)
             return signal;
 
-        var liveRsi = signal.LiveRsi ?? signal.Rsi;
-        if (signal.Signal == "Call" && !RsiEntryLevels.CanEnterCall(liveRsi, signal.Backtest))
-            return signal with { AutomationError = "RSI_NOT_OVERSOLD", Signal = "None" };
-        if (signal.Signal == "Put" && !RsiEntryLevels.CanEnterPut(liveRsi, signal.Backtest))
-            return signal with { AutomationError = "RSI_NOT_OVERBOUGHT", Signal = "None" };
-
-        if (signal.Backtest is null ||
-            !signal.Backtest.Passed ||
-            signal.Backtest.SuccessRate < options.MinimumSuccessRate ||
-            signal.Backtest.SuccessRate < signal.Backtest.MinimumSuccessRate)
+        var nowGate = DateTimeOffset.UtcNow;
+        if (!RsiEntryLevels.TryValidateForTrade(signal, nowGate, out var rejectCode))
         {
-            return signal with { AutomationError = "BACKTEST_NOT_PASSED", Signal = "None" };
+            if (rejectCode is null or "NO_SIGNAL")
+                return signal;
+            return signal with { AutomationError = rejectCode, Signal = "None" };
         }
 
         // #region agent log
@@ -207,6 +204,8 @@ public sealed class RsiSignalAppService
                 liveRsi = signal.LiveRsi,
                 closedRsi = signal.Rsi,
                 successRate = signal.Backtest?.SuccessRate,
+                totalSignals = signal.Backtest?.TotalSignals,
+                ageSec = Math.Round((nowGate - signal.CandleTime).TotalSeconds, 2),
                 botState = bot.State.ToString(),
                 autoExecute
             },
@@ -215,7 +214,7 @@ public sealed class RsiSignalAppService
 
         var selected = bot.ResolvedAssets;
         if (selected.Count > 0 && !BotAssetList.Contains(selected, signal.Asset))
-            return signal;
+            return signal with { AutomationError = "ASSET_NOT_SELECTED" };
 
         var dailyLimit = await GetReachedDailyLimitAsync(bot, ct);
         if (dailyLimit is not null)

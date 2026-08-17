@@ -280,14 +280,15 @@ public sealed class MarketingDemoService : IMarketingDemoService
         var now = DateTimeOffset.UtcNow;
         var bucket = now.ToUnixTimeSeconds() / Math.Max(15, periodSeconds / 4);
         var rsi = 28m + StableInt(Hash(symbol) ^ (int)bucket, 45);
-        var signal = rsi <= 32 ? "CALL" : rsi >= 68 ? "PUT" : "NONE";
+        // Display-only: never emit Call/Put that could satisfy live entry gates (25/75 + backtest).
         return new StrategySignal(
             StrategyId: "rsi",
             Asset: symbol,
-            Signal: signal,
+            Signal: "None",
             Rsi: Math.Round(rsi, 2),
             CandleTime: now.AddSeconds(-(now.ToUnixTimeSeconds() % periodSeconds)),
-            Timeframe: $"{periodSeconds}s");
+            Timeframe: $"{periodSeconds}s",
+            LiveRsi: Math.Round(rsi, 2));
     }
 
     private List<TradeDto> AllTrades(Guid userId)

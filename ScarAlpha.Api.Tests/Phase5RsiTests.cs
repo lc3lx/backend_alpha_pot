@@ -324,6 +324,35 @@ public sealed class Phase5RsiTests
     }
 
     [Fact]
+    public void Trade_gate_rejects_missing_live_rsi_mid_rsi_and_expired_setup()
+    {
+        var okBacktest = new RsiBacktestStats(4, 4, 0, 100m, 200, 5, 75m, true);
+        var callOk = new StrategySignal("rsi", Asset, "Call", 20m, Now, "60", okBacktest, LiveRsi: 20m);
+        RsiEntryLevels.TryValidateForTrade(callOk, Now.AddSeconds(1), out _).Should().BeTrue();
+
+        var noLive = callOk with { LiveRsi = null };
+        RsiEntryLevels.TryValidateForTrade(noLive, Now, out var noLiveCode).Should().BeFalse();
+        noLiveCode.Should().Be("LIVE_RSI_REQUIRED");
+
+        var mid = callOk with { LiveRsi = 40m };
+        RsiEntryLevels.TryValidateForTrade(mid, Now, out var midCode).Should().BeFalse();
+        midCode.Should().Be("RSI_NOT_OVERSOLD");
+
+        var weakBt = callOk with { Backtest = okBacktest with { Passed = false, SuccessRate = 50m, TotalSignals = 2 } };
+        RsiEntryLevels.TryValidateForTrade(weakBt, Now, out var btCode).Should().BeFalse();
+        btCode.Should().Be("BACKTEST_NOT_PASSED");
+
+        RsiEntryLevels.TryValidateForTrade(callOk, Now.AddSeconds(6), out var expCode).Should().BeFalse();
+        expCode.Should().Be("SETUP_EXPIRED");
+
+        var putOk = new StrategySignal("rsi", Asset, "Put", 80m, Now, "60", okBacktest, LiveRsi: 80m);
+        RsiEntryLevels.TryValidateForTrade(putOk, Now, out _).Should().BeTrue();
+        var putLow = putOk with { LiveRsi = 74m };
+        RsiEntryLevels.TryValidateForTrade(putLow, Now, out var putCode).Should().BeFalse();
+        putCode.Should().Be("RSI_NOT_OVERBOUGHT");
+    }
+
+    [Fact]
     public async Task One_minute_is_the_only_supported_timeframe()
     {
         var service = new RsiSignalService(new RsiCalculator());
