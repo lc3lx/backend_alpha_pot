@@ -355,12 +355,14 @@ public sealed class RsiSignalAppService
                     });
                 // #endregion
                 _logger.LogInformation(
-                    "Placed RSI {Direction} {Asset} trade={TradeId} duration={Duration}s rate={Rate:F0}%",
+                    "Placed RSI {Direction} {Asset} trade={TradeId} duration={Duration}s rate={Rate:F0}% liveRsi={LiveRsi} closedRsi={ClosedRsi}",
                     signal.Signal,
                     signal.Asset,
                     trade.Id,
                     durationSeconds,
-                    signal.Backtest.SuccessRate);
+                    signal.Backtest.SuccessRate,
+                    signal.LiveRsi,
+                    signal.Rsi);
                 return signal with { AutomatedTradeId = trade.Id };
             }
             catch (ApiException ex)
@@ -517,6 +519,7 @@ public sealed class RsiSignalAppService
             c.EndTimestamp is null ||
             c.EndTimestamp > now);
 
+        var lastClosedClose = candles.Count > 0 ? candles[^1].Close : (decimal?)null;
         candles.Add(new RsiCandle(
             Timestamp: bucketStart,
             Close: price,
@@ -531,6 +534,7 @@ public sealed class RsiSignalAppService
             {
                 symbol,
                 price,
+                lastClosedClose,
                 ageMs = Math.Round(ageMs, 0),
                 bucketStart = bucketStartUnix,
                 closedCount = candles.Count - 1
