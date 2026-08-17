@@ -223,10 +223,11 @@ public static class StrategyEndpoints
             [FromQuery] decimal minimumSuccessRate = 75m,
             [FromQuery] bool autoExecute = false) =>
         {
+            _ = (oversold, overbought);
             var options = new RsiStrategyOptions(
                 Period: rsiLength,
-                Oversold: oversold,
-                Overbought: overbought,
+                Oversold: RsiEntryLevels.CallMax,
+                Overbought: RsiEntryLevels.PutMin,
                 TimeframeSeconds: period,
                 BacktestCandleCount: backtestCandles,
                 ExpiryCandles: expiryCandles,

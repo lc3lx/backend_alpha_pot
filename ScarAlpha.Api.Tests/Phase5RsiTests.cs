@@ -107,7 +107,7 @@ public sealed class Phase5RsiTests
         var signal = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
 
         signal.Signal.Should().Be("Call");
-        signal.CandleTime.Should().Be(candles[^1].Timestamp);
+        signal.CandleTime.Should().Be(Now);
         signal.AutomationError.Should().BeNull();
         signal.Backtest!.Passed.Should().BeTrue();
         signal.LiveRsi.Should().NotBeNull();
@@ -184,6 +184,22 @@ public sealed class Phase5RsiTests
     }
 
     [Fact]
+    public async Task Backtest_alone_does_not_enter_when_live_rsi_is_between_25_and_75()
+    {
+        var service = new RsiSignalService(new RsiCalculator());
+        var closes = OversoldWithRespectedBounce();
+        closes.Add(110m);
+        var candles = CreateCandles(closes, openLastIndex: closes.Count - 1);
+
+        var signal = await service.GetSignalAsync(UserId, Asset, candles, RsiStrategyOptions.Default60Seconds, Now);
+
+        signal.Signal.Should().Be("None");
+        signal.LiveRsi.Should().NotBeNull();
+        signal.LiveRsi!.Value.Should().BeGreaterThan(RsiEntryLevels.CallMax);
+        signal.LiveRsi.Value.Should().BeLessThan(RsiEntryLevels.PutMin);
+    }
+
+    [Fact]
     public async Task Below_minimum_success_rate_emits_none()
     {
         var service = new RsiSignalService(new RsiCalculator());
@@ -207,20 +223,61 @@ public sealed class Phase5RsiTests
     }
 
     [Fact]
-    public async Task Live_rsi_at_extreme_enters_even_after_closed_candle_lag()
+    public async Task First_sight_of_both_conditions_enters_immediately()
     {
         var service = new RsiSignalService(new RsiCalculator());
-        var options = RsiStrategyOptions.Default60Seconds with { MaxEntryLagSeconds = 20 };
         var candles = CreateCandles(OversoldWithRespectedBounce());
         var lateNow = Now.AddMinutes(5);
 
-        var signal = await service.GetSignalAsync(UserId, Asset, candles, options, lateNow);
+        var signal = await service.GetSignalAsync(UserId, Asset, candles, RsiStrategyOptions.Default60Seconds, lateNow);
 
         signal.Signal.Should().Be("Call");
         signal.AutomationError.Should().BeNull();
+        signal.CandleTime.Should().Be(lateNow);
         signal.Backtest!.Passed.Should().BeTrue();
-        signal.LiveRsi.Should().NotBeNull();
-        signal.LiveRsi!.Value.Should().BeLessThanOrEqualTo(options.Oversold);
+        signal.LiveRsi!.Value.Should().BeLessThanOrEqualTo(RsiEntryLevels.CallMax);
+    }
+
+    [Fact]
+    public async Task Setup_expires_after_5_seconds_and_does_not_reenter_same_touch()
+    {
+        var service = new RsiSignalService(new RsiCalculator());
+        var options = RsiStrategyOptions.Default60Seconds;
+        var candles = CreateCandles(OversoldWithRespectedBounce());
+
+        var first = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
+        first.Signal.Should().Be("Call");
+
+        var stillInside = await service.GetSignalAsync(UserId, Asset, candles, options, Now.AddSeconds(4));
+        stillInside.Signal.Should().Be("Call");
+
+        var expired = await service.GetSignalAsync(UserId, Asset, candles, options, Now.AddSeconds(6));
+        expired.Signal.Should().Be("None");
+        expired.AutomationError.Should().Be("SETUP_EXPIRED");
+        expired.Backtest!.Passed.Should().BeTrue();
+
+        var stillExpired = await service.GetSignalAsync(UserId, Asset, candles, options, Now.AddSeconds(20));
+        stillExpired.Signal.Should().Be("None");
+        stillExpired.AutomationError.Should().Be("SETUP_EXPIRED");
+    }
+
+    [Fact]
+    public async Task New_touch_after_leaving_zone_is_a_fresh_setup()
+    {
+        var service = new RsiSignalService(new RsiCalculator());
+        var options = RsiStrategyOptions.Default60Seconds;
+        var oversold = CreateCandles(OversoldWithRespectedBounce());
+        var mid = CreateCandles(Enumerable.Repeat(100m, 40).ToList());
+
+        var first = await service.GetSignalAsync(UserId, Asset, oversold, options, Now);
+        first.Signal.Should().Be("Call");
+
+        var left = await service.GetSignalAsync(UserId, Asset, mid, options, Now.AddSeconds(2));
+        left.Signal.Should().Be("None");
+
+        var retouch = await service.GetSignalAsync(UserId, Asset, oversold, options, Now.AddSeconds(3));
+        retouch.Signal.Should().Be("Call");
+        retouch.AutomationError.Should().BeNull();
     }
 
     [Fact]
@@ -248,7 +305,22 @@ public sealed class Phase5RsiTests
         signal.Signal.Should().Be("Put");
         signal.Backtest!.Passed.Should().BeTrue();
         signal.LiveRsi.Should().NotBeNull();
-        signal.LiveRsi!.Value.Should().BeGreaterThanOrEqualTo(options.Overbought);
+        signal.LiveRsi!.Value.Should().BeGreaterThanOrEqualTo(RsiEntryLevels.PutMin);
+    }
+
+    [Fact]
+    public async Task Put_does_not_enter_when_live_rsi_is_below_75()
+    {
+        var service = new RsiSignalService(new RsiCalculator());
+        var closes = OverboughtWithRespectedDrop();
+        closes.Add(closes[^1] - 40m);
+        var candles = CreateCandles(closes, openLastIndex: closes.Count - 1);
+
+        var signal = await service.GetSignalAsync(UserId, Asset, candles, RsiStrategyOptions.Default60Seconds, Now);
+
+        signal.Signal.Should().Be("None");
+        signal.LiveRsi.Should().NotBeNull();
+        signal.LiveRsi!.Value.Should().BeLessThan(RsiEntryLevels.PutMin);
     }
 
     [Fact]

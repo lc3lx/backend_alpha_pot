@@ -69,10 +69,7 @@ public sealed class BotSignalWorker : IHostedService
 
             try
             {
-                var delay = SecondsIntoMinute() <= 22
-                    ? TimeSpan.FromSeconds(1)
-                    : TimeSpan.FromSeconds(3);
-                await Task.Delay(delay, ct).ConfigureAwait(false);
+                await Task.Delay(TimeSpan.FromSeconds(1), ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -214,7 +211,7 @@ public sealed class BotSignalWorker : IHostedService
                         else if (signal.Signal is not ("Call" or "Put"))
                             Interlocked.Increment(ref softNone);
 
-                        if (!IsLiveSetup(signal, options))
+        if (!IsLiveSetup(signal))
                             return;
 
                         bag.Add((asset, signal));
@@ -335,17 +332,14 @@ public sealed class BotSignalWorker : IHostedService
         return blocking > 0;
     }
 
-    private static bool IsLiveSetup(StrategySignal signal, RsiStrategyOptions options)
+    private static bool IsLiveSetup(StrategySignal signal)
     {
-        if (signal.Signal is not ("Call" or "Put") || signal.Backtest is not { Passed: true })
-            return false;
-        if (signal.LiveRsi is decimal lr)
-        {
-            if (signal.Signal == "Call" && lr <= options.Oversold) return true;
-            if (signal.Signal == "Put" && lr >= options.Overbought) return true;
-        }
-
-        return IsFresh(signal, options);
+        var rsi = signal.LiveRsi ?? signal.Rsi;
+        if (signal.Signal == "Call")
+            return RsiEntryLevels.CanEnterCall(rsi, signal.Backtest);
+        if (signal.Signal == "Put")
+            return RsiEntryLevels.CanEnterPut(rsi, signal.Backtest);
+        return false;
     }
 
     private static bool IsFresh(StrategySignal signal, RsiStrategyOptions options)

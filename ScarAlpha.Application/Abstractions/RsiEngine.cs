@@ -20,12 +20,12 @@ public sealed record RsiStrategyOptions(
     /// <summary>
     /// Max seconds after the last CLOSED bar to still allow Call/Put when the
     /// feed has no forming candle. Live RSI at 25/75 enters immediately and
-    /// ignores this lag.
+    /// ignores this lag. Default is <see cref="RsiEntryLevels.SetupTtlSeconds"/>.
     /// </summary>
-    int MaxEntryLagSeconds = 20)
+    int MaxEntryLagSeconds = 5)
 {
     public static RsiStrategyOptions Default60Seconds =>
-        new(Period: 14, Oversold: 25m, Overbought: 75m, TimeframeSeconds: 60);
+        new(Period: 14, Oversold: RsiEntryLevels.CallMax, Overbought: RsiEntryLevels.PutMin, TimeframeSeconds: 60);
 
     /// <summary>Maps bot trade duration (180/240/300) to expiry candles 3–5 (default 5).</summary>
     public static RsiStrategyOptions FromBotDurationSeconds(int durationSeconds)
@@ -35,6 +35,27 @@ public sealed record RsiStrategyOptions(
             candles = 5;
         return Default60Seconds with { ExpiryCandles = candles };
     }
+}
+
+/// <summary>
+/// Hard entry levels. Put requires live RSI ≥ 75. Call requires live RSI ≤ 25.
+/// Backtest must also pass — neither condition alone is enough.
+/// </summary>
+public static class RsiEntryLevels
+{
+    public const decimal CallMax = 25m;
+    public const decimal PutMin = 75m;
+    /// <summary>Enter on the first tick both conditions are true. After this, look for a new touch.</summary>
+    public const int SetupTtlSeconds = 5;
+
+    public static bool IsCallRsi(decimal rsi) => rsi <= CallMax;
+    public static bool IsPutRsi(decimal rsi) => rsi >= PutMin;
+
+    public static bool CanEnterCall(decimal rsi, RsiBacktestStats? backtest) =>
+        IsCallRsi(rsi) && backtest is { Passed: true };
+
+    public static bool CanEnterPut(decimal rsi, RsiBacktestStats? backtest) =>
+        IsPutRsi(rsi) && backtest is { Passed: true };
 }
 
 public sealed record RsiCandle(
@@ -80,7 +101,8 @@ public interface IRsiSignalService
     /// Computes live RSI and a 200×1m zone-respect backtest on every snapshot.
     /// Call = live RSI ≤ 25 AND the 200×1m call backtest passed (touch 25, leave, price up).
     /// Put  = live RSI ≥ 75 AND the 200×1m put backtest passed (touch 75, leave, price down).
-    /// Does not wait for the forming candle to close.
+    /// Emits on the first moment both conditions are true and expires after 5 seconds
+    /// — does not wait for the forming candle to close or for the next minute.
     /// Anti-repeat is checked but not recorded here — call
     /// <see cref="MarkSignalEmitted"/> only after a successful trade place.
     /// </summary>

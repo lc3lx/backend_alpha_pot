@@ -8,8 +8,8 @@ public sealed class RsiSignalService : IRsiSignalService
 {
     private readonly IRsiCalculator _calculator;
 
-    // Tracks last consumed (traded) signal candleTime per user+asset+timeframe.
-    private readonly ConcurrentDictionary<string, DateTimeOffset> _lastEmittedSignalCandleTime = new();
+    // First-seen live setup per user+asset. Expired or consumed until RSI leaves the zone.
+    private readonly ConcurrentDictionary<string, SetupWatch> _setups = new();
 
     public RsiSignalService(IRsiCalculator calculator)
     {
@@ -30,6 +30,12 @@ public sealed class RsiSignalService : IRsiSignalService
             throw new ArgumentNullException(nameof(candles));
 
         ValidateOptions(options);
+        options = options with
+        {
+            Oversold = RsiEntryLevels.CallMax,
+            Overbought = RsiEntryLevels.PutMin,
+            MaxEntryLagSeconds = RsiEntryLevels.SetupTtlSeconds
+        };
 
         // Closed only when EndTimestamp is known and not in the future — never treat null as closed.
         var closed = candles
@@ -57,13 +63,12 @@ public sealed class RsiSignalService : IRsiSignalService
             .OrderBy(c => c.Timestamp)
             .LastOrDefault();
 
-        // Call = live RSI touches 25 (oversold) AND the call backtest passed.
-        // Put  = live RSI touches 75 (overbought) AND the put backtest passed.
-        // Do not wait for the forming candle to close.
-        var touchedOversold = liveRsi <= options.Oversold;
-        var touchedOverbought = liveRsi >= options.Overbought;
-        var signalType = touchedOversold && callBacktest.Passed ? RsiSignalType.Call
-            : touchedOverbought && putBacktest.Passed ? RsiSignalType.Put
+        // Call = live RSI ≤ 25 AND call backtest passed. Put = live RSI ≥ 75 AND put backtest passed.
+        // No entry between 25 and 75, and no entry on backtest alone.
+        var touchedOversold = RsiEntryLevels.IsCallRsi(liveRsi);
+        var touchedOverbought = RsiEntryLevels.IsPutRsi(liveRsi);
+        var signalType = RsiEntryLevels.CanEnterCall(liveRsi, callBacktest) ? RsiSignalType.Call
+            : RsiEntryLevels.CanEnterPut(liveRsi, putBacktest) ? RsiSignalType.Put
             : RsiSignalType.None;
         var entryBacktest = signalType == RsiSignalType.Call ? callBacktest
             : signalType == RsiSignalType.Put ? putBacktest
@@ -73,9 +78,30 @@ public sealed class RsiSignalService : IRsiSignalService
         var displayBacktest = signalType == RsiSignalType.Call ? callBacktest
             : signalType == RsiSignalType.Put ? putBacktest
             : liveRsi >= 50m ? putBacktest : callBacktest;
-        var liveBucket = new DateTimeOffset(
-            now.Year, now.Month, now.Day, now.Hour, now.Minute, 0, now.Offset);
-        var entryCandleTime = forming?.Timestamp ?? liveBucket;
+        var key = EmissionKey(userId, asset, options.TimeframeSeconds);
+
+        if (signalType == RsiSignalType.None || entryBacktest is null)
+        {
+            _setups.TryRemove(key, out _);
+            return Task.FromResult(new StrategySignal(
+                StrategyId: "rsi",
+                Asset: asset.Trim(),
+                Signal: "None",
+                Rsi: roundedRsi,
+                CandleTime: currentCandle.Timestamp,
+                Timeframe: timeframe,
+                Backtest: displayBacktest,
+                LiveRsi: liveRsi));
+        }
+
+        var watch = _setups.AddOrUpdate(
+            key,
+            _ => new SetupWatch(signalType, now, Consumed: false),
+            (_, existing) => existing.Side == signalType
+                ? existing
+                : new SetupWatch(signalType, now, Consumed: false));
+        var ageSeconds = (now - watch.FirstSeenAt).TotalSeconds;
+        var fresh = !watch.Consumed && ageSeconds <= RsiEntryLevels.SetupTtlSeconds;
 
         // #region agent log
         ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
@@ -92,12 +118,12 @@ public sealed class RsiSignalService : IRsiSignalService
                 lookback = options.BacktestCandleCount,
                 touchedOversold,
                 touchedOverbought,
-                wouldEnter = signalType != RsiSignalType.None,
-                skip = signalType != RsiSignalType.None
+                ageSeconds = Math.Round(ageSeconds, 2),
+                consumed = watch.Consumed,
+                wouldEnter = fresh,
+                skip = fresh
                     ? "ok"
-                    : !touchedOversold && !touchedOverbought
-                        ? "midRsi"
-                        : "backtest",
+                    : watch.Consumed ? "consumed" : "expired",
                 callRate = callBacktest.SuccessRate,
                 callN = callBacktest.TotalSignals,
                 callPass = callBacktest.Passed,
@@ -108,33 +134,18 @@ public sealed class RsiSignalService : IRsiSignalService
             runId: "missed-entry");
         // #endregion
 
-        if (signalType == RsiSignalType.None || entryBacktest is null)
+        if (!fresh)
         {
             return Task.FromResult(new StrategySignal(
                 StrategyId: "rsi",
                 Asset: asset.Trim(),
                 Signal: "None",
                 Rsi: roundedRsi,
-                CandleTime: currentCandle.Timestamp,
+                CandleTime: watch.FirstSeenAt,
                 Timeframe: timeframe,
-                Backtest: displayBacktest,
-                LiveRsi: liveRsi));
-        }
-
-        var backtest = entryBacktest;
-        var key = EmissionKey(userId, asset, options.TimeframeSeconds);
-        if (_lastEmittedSignalCandleTime.TryGetValue(key, out var lastTime) &&
-            lastTime == entryCandleTime)
-        {
-            return Task.FromResult(new StrategySignal(
-                StrategyId: "rsi",
-                Asset: asset.Trim(),
-                Signal: "None",
-                Rsi: roundedRsi,
-                CandleTime: entryCandleTime,
-                Timeframe: timeframe,
-                Backtest: backtest,
-                LiveRsi: liveRsi));
+                Backtest: entryBacktest,
+                LiveRsi: liveRsi,
+                AutomationError: watch.Consumed ? "SETUP_CONSUMED" : "SETUP_EXPIRED"));
         }
 
         return Task.FromResult(new StrategySignal(
@@ -142,9 +153,9 @@ public sealed class RsiSignalService : IRsiSignalService
             Asset: asset.Trim(),
             Signal: signalType == RsiSignalType.Call ? "Call" : "Put",
             Rsi: roundedRsi,
-            CandleTime: entryCandleTime,
+            CandleTime: watch.FirstSeenAt,
             Timeframe: timeframe,
-            Backtest: backtest,
+            Backtest: entryBacktest,
             LiveRsi: liveRsi));
     }
 
@@ -156,8 +167,13 @@ public sealed class RsiSignalService : IRsiSignalService
     {
         if (string.IsNullOrWhiteSpace(asset))
             return;
-        _lastEmittedSignalCandleTime[EmissionKey(userId, asset, timeframeSeconds)] = candleTime;
+        _setups.AddOrUpdate(
+            EmissionKey(userId, asset, timeframeSeconds),
+            _ => new SetupWatch(RsiSignalType.None, candleTime, Consumed: true),
+            (_, existing) => existing with { Consumed = true });
     }
+
+    private readonly record struct SetupWatch(RsiSignalType Side, DateTimeOffset FirstSeenAt, bool Consumed);
 
     private static string EmissionKey(Guid userId, string asset, int timeframeSeconds) =>
         $"{userId:N}:{asset.Trim().ToUpperInvariant()}:{timeframeSeconds}";

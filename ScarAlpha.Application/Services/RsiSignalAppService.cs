@@ -182,12 +182,11 @@ public sealed class RsiSignalAppService
             return signal;
 
         var liveRsi = signal.LiveRsi ?? signal.Rsi;
-        if (signal.Signal == "Call" && liveRsi > options.Oversold)
+        if (signal.Signal == "Call" && !RsiEntryLevels.CanEnterCall(liveRsi, signal.Backtest))
             return signal with { AutomationError = "RSI_NOT_OVERSOLD", Signal = "None" };
-        if (signal.Signal == "Put" && liveRsi < options.Overbought)
+        if (signal.Signal == "Put" && !RsiEntryLevels.CanEnterPut(liveRsi, signal.Backtest))
             return signal with { AutomationError = "RSI_NOT_OVERBOUGHT", Signal = "None" };
 
-        // Dual gate: touching 25/75 is not enough — matching backtest must pass ≥ 75%.
         if (signal.Backtest is null ||
             !signal.Backtest.Passed ||
             signal.Backtest.SuccessRate < options.MinimumSuccessRate ||
