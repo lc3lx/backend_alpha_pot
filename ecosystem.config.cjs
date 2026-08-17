@@ -26,7 +26,7 @@ module.exports = {
       exec_mode: 'fork',
       autorestart: true,
       watch: false,
-      max_memory_restart: '512M',
+      max_memory_restart: '1024M',
       // Playwright/Chromium children can ignore SIGINT — force SIGKILL sooner
       kill_timeout: 8000,
       kill_retry_time: 100,

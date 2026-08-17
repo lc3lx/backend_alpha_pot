@@ -80,7 +80,7 @@ public sealed class RsiSignalAppService
         }
 
         // While a live trade is open for this user: do not analyze / place.
-        if (await HasBlockingOpenTradeAsync(ct))
+        if (await IsAnalysisPausedAsync(ct))
         {
             return SoftNone(asset.Trim(), periodSeconds) with
             {
@@ -103,9 +103,19 @@ public sealed class RsiSignalAppService
             return SoftNone(symbol, wirePeriod);
         }
 
+        if (await IsAnalysisPausedAsync(ct))
+        {
+            return SoftNone(symbol, wirePeriod) with { AutomationError = "OPEN_TRADE_EXISTS" };
+        }
+
         client.EnsureMarketDataWarm(symbol, wirePeriod);
         try
         {
+            if (await IsAnalysisPausedAsync(ct))
+            {
+                return SoftNone(symbol, wirePeriod) with { AutomationError = "OPEN_TRADE_EXISTS" };
+            }
+
             var history = await client.GetHistoryAsync(symbol, wirePeriod, CancellationToken.None);
 
             var now = DateTimeOffset.UtcNow;
@@ -128,6 +138,11 @@ public sealed class RsiSignalAppService
 
             if (candles.Count == 0)
                 return SoftNone(symbol, wirePeriod);
+
+            if (await IsAnalysisPausedAsync(ct))
+            {
+                return SoftNone(symbol, wirePeriod) with { AutomationError = "OPEN_TRADE_EXISTS" };
+            }
 
             _ = ApplyLiveQuoteToCandles(client, symbol, candles, wirePeriod, now);
 
@@ -300,6 +315,7 @@ public sealed class RsiSignalAppService
             if (expiryCandles is < 3 or > 5)
                 expiryCandles = options.ExpiryCandles is >= 3 and <= 5 ? options.ExpiryCandles : 5;
             var durationSeconds = expiryCandles * 60;
+            OpenTradeGate.MarkUserHeld(userId, durationSeconds);
 
             var key = $"bot:rsi:{signal.Asset.Trim().ToUpperInvariant()}:{signal.CandleTime.ToUnixTimeSeconds()}:{signal.Signal}";
             try
@@ -367,6 +383,7 @@ public sealed class RsiSignalAppService
             }
             catch (ApiException ex)
             {
+                OpenTradeGate.ReleaseUser(userId);
                 _logger.LogWarning(
                     "RSI place skipped {Asset} {Direction} code={Code}",
                     signal.Asset,
@@ -433,6 +450,27 @@ public sealed class RsiSignalAppService
         return Task.FromResult<IBinollaClient?>(null);
     }
 
+    private async Task<bool> IsAnalysisPausedAsync(CancellationToken ct)
+    {
+        if (OpenTradeGate.IsUserHeld(_currentUser.UserId))
+        {
+            if (OpenTradeGate.ShouldLogSkip(_currentUser.UserId))
+            {
+                // #region agent log
+                ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                    "H-STUCK1",
+                    "RsiSignalAppService.IsAnalysisPausedAsync",
+                    "memory_hold_skip",
+                    new { userId = _currentUser.UserId.ToString("N")[..8] },
+                    runId: "stuck-running");
+                // #endregion
+            }
+            return true;
+        }
+
+        return await HasBlockingOpenTradeAsync(ct);
+    }
+
     private async Task<bool> HasBlockingOpenTradeAsync(CancellationToken ct)
     {
         var now = DateTimeOffset.UtcNow;
@@ -444,26 +482,29 @@ public sealed class RsiSignalAppService
         if (blockers.Count > 0)
         {
             var first = blockers.OrderBy(t => t.CreatedAt).First();
-            // #region agent log
-            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-                "H-STUCK1",
-                "RsiSignalAppService.HasBlockingOpenTradeAsync",
-                "signal_skip_blocking_open",
-                new
-                {
-                    blocking = blockers.Count,
-                    running = running.Count,
-                    pending = pending.Count,
-                    asset = first.Asset,
-                    direction = first.Direction.ToString(),
-                    amount = first.Amount,
-                    durationSec = first.DurationSeconds,
-                    status = first.Status.ToString(),
-                    ageSec = Math.Round((now - first.CreatedAt).TotalSeconds, 0),
-                    tradeId = first.Id.ToString("N")[..8]
-                },
-                runId: "stuck-running");
-            // #endregion
+            if (OpenTradeGate.ShouldLogSkip(_currentUser.UserId))
+            {
+                // #region agent log
+                ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                    "H-STUCK1",
+                    "RsiSignalAppService.HasBlockingOpenTradeAsync",
+                    "signal_skip_blocking_open",
+                    new
+                    {
+                        blocking = blockers.Count,
+                        running = running.Count,
+                        pending = pending.Count,
+                        asset = first.Asset,
+                        direction = first.Direction.ToString(),
+                        amount = first.Amount,
+                        durationSec = first.DurationSeconds,
+                        status = first.Status.ToString(),
+                        ageSec = Math.Round((now - first.CreatedAt).TotalSeconds, 0),
+                        tradeId = first.Id.ToString("N")[..8]
+                    },
+                    runId: "stuck-running");
+                // #endregion
+            }
         }
 
         return blockers.Count > 0;

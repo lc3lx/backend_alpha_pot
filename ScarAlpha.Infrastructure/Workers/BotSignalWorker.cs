@@ -144,7 +144,8 @@ public sealed class BotSignalWorker : IHostedService
             }
 
             // Only block on truly live open trades — expired/stuck ones must not freeze the bot.
-            if (await HasBlockingOpenTradeAsync(trades, bot.UserId, ct).ConfigureAwait(false))
+            if (OpenTradeGate.IsUserHeld(bot.UserId) ||
+                await HasBlockingOpenTradeAsync(trades, bot.UserId, ct).ConfigureAwait(false))
             {
                 // #region agent log
                 ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
@@ -197,6 +198,8 @@ public sealed class BotSignalWorker : IHostedService
             {
                 if (Volatile.Read(ref claimed) != 0)
                     return;
+                if (OpenTradeGate.IsUserHeld(userId))
+                    return;
 
                 try
                 {
@@ -218,6 +221,8 @@ public sealed class BotSignalWorker : IHostedService
                         if (Interlocked.CompareExchange(ref claimed, 1, 0) != 0)
                             return;
 
+                        OpenTradeGate.MarkUserHeld(userId, bot.DurationSeconds);
+
                         // #region agent log
                         ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
                             "H-LIVE",
@@ -238,6 +243,8 @@ public sealed class BotSignalWorker : IHostedService
                         var executed = await rsi.TryAutoExecuteAsync(signal, options, token);
                         if (!string.IsNullOrEmpty(executed.AutomatedTradeId))
                             Interlocked.Increment(ref placedCount);
+                        else
+                            OpenTradeGate.ReleaseUser(userId);
                     }
                 }
                 catch (ObjectDisposedException ex)
