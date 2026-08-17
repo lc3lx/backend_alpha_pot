@@ -7,6 +7,8 @@ public static class ApiErrorCodes
     public const string EmailTaken = "EMAIL_TAKEN";
     public const string TelegramTaken = "TELEGRAM_TAKEN";
     public const string InvalidCredentials = "INVALID_CREDENTIALS";
+    public const string NotMarketingDemo = "NOT_MARKETING_DEMO";
+    public const string UseDemoLogin = "USE_DEMO_LOGIN";
     public const string PasswordNotSet = "PASSWORD_NOT_SET";
     public const string BinollaNotConnected = "BINOLLA_NOT_CONNECTED";
     public const string BinollaSessionExpired = "BINOLLA_SESSION_EXPIRED";

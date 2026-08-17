@@ -38,6 +38,15 @@ public static class AuthEndpoints
             return Results.Ok(new { accessToken = result.AccessToken, userId = result.UserId });
         });
 
+        group.MapPost("/demo-login", async (
+            [FromBody] EmailAuthRequest request,
+            AuthAppService auth,
+            CancellationToken ct) =>
+        {
+            var result = await auth.DemoLoginAsync(request, ct);
+            return Results.Ok(new { accessToken = result.AccessToken, userId = result.UserId });
+        });
+
         group.MapPost("/change-password", async (
             [FromBody] ChangePasswordRequest request,
             AuthAppService auth,

@@ -211,6 +211,12 @@ public sealed class AuthAppService
         if (user is null || string.IsNullOrEmpty(user.PasswordHash) || !_passwords.Verify(user.PasswordHash, request.Password))
             throw new ApiException(ApiErrorCodes.InvalidCredentials, "Invalid email or password.", 401);
 
+        if (user.IsMarketingDemo)
+            throw new ApiException(
+                ApiErrorCodes.UseDemoLogin,
+                "This is a marketing demo account. Sign in at /demo-login.",
+                403);
+
         var desiredRole = ResolveRole(user.TelegramUserId, user.Email);
         if (user.Role != desiredRole)
         {
@@ -218,6 +224,26 @@ public sealed class AuthAppService
             user.UpdatedAt = DateTimeOffset.UtcNow;
             await _users.UpdateAsync(user, ct);
         }
+
+        return new AuthSessionResponse(_jwt.CreateToken(user), user.Id.ToString());
+    }
+
+    /// <summary>Email/password for marketing demo accounts only (separate from /login).</summary>
+    public async Task<AuthSessionResponse> DemoLoginAsync(EmailAuthRequest request, CancellationToken ct)
+    {
+        var email = NormalizeEmail(request.Email);
+        if (string.IsNullOrEmpty(email) || string.IsNullOrEmpty(request.Password))
+            throw new ApiException(ApiErrorCodes.InvalidCredentials, "Invalid email or password.", 401);
+
+        var user = await _users.GetByEmailAsync(email, ct);
+        if (user is null || string.IsNullOrEmpty(user.PasswordHash) || !_passwords.Verify(user.PasswordHash, request.Password))
+            throw new ApiException(ApiErrorCodes.InvalidCredentials, "Invalid email or password.", 401);
+
+        if (!user.IsMarketingDemo)
+            throw new ApiException(
+                ApiErrorCodes.NotMarketingDemo,
+                "This is not a marketing demo account. Use the normal login page.",
+                403);
 
         return new AuthSessionResponse(_jwt.CreateToken(user), user.Id.ToString());
     }
