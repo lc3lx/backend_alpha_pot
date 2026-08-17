@@ -27,7 +27,10 @@ module.exports = {
       autorestart: true,
       watch: false,
       max_memory_restart: '512M',
-      kill_timeout: 10000,
+      // Playwright/Chromium children can ignore SIGINT — force SIGKILL sooner
+      kill_timeout: 8000,
+      kill_retry_time: 100,
+      shutdown_with_message: false,
       exp_backoff_restart_delay: 2000,
       error_file: path.join(__dirname, 'logs', 'pm2-error.log'),
       out_file: path.join(__dirname, 'logs', 'pm2-out.log'),
