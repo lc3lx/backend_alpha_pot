@@ -574,8 +574,8 @@ public sealed class RsiSignalAppService
     }
 
     /// <summary>
-    /// Overlay the latest tick as a forming candle so live RSI tracks price, not the last closed bar.
-    /// Without a fresh quote, closed-only RSI must not drive entries.
+    /// Overlay the latest tick as a forming candle so live RSI tracks price for display.
+    /// Entry decisions use closed bars only — forming RSI never places a trade.
     /// </summary>
     private static bool ApplyLiveQuoteToCandles(
         IBinollaClient client,

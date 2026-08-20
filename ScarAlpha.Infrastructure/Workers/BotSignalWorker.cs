@@ -13,19 +13,16 @@ namespace ScarAlpha.Infrastructure.Workers;
 
 /// <summary>
 /// Keeps bots analyzing/trading while the Mini App is closed.
-/// Each tick scans a rotating batch of pairs (RSI + 200-candle zone backtest in parallel)
-/// so we do not subscribe the whole universe on the WebSocket at once.
+/// Each tick scans every selected FX pair in one pass (RSI + zone backtest in parallel)
+/// so a closed 25/75 setup is not missed by rotating batches.
 /// </summary>
 public sealed class BotSignalWorker : IHostedService
 {
+    /// <summary>Cap concurrent Binolla history/quote work so the WS is not flooded.</summary>
     private const int ScanParallelism = 8;
-    private const int ScanBatchSize = 8;
-    /// <summary>Hold the same 8 pairs for this many ticks so Binolla quotes can arrive.</summary>
-    private const int ScanHoldTicks = 2;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IBotRuntimeService _botRuntime;
     private readonly ILogger<BotSignalWorker> _logger;
-    private readonly ConcurrentDictionary<Guid, (int Offset, int Hold)> _scanOffsets = new();
     private CancellationTokenSource? _cts;
     private Task? _loop;
 
@@ -183,17 +180,11 @@ public sealed class BotSignalWorker : IHostedService
         }
 
         var options = RsiStrategyOptions.FromBotDurationSeconds(bot.DurationSeconds);
-        var allAssets = bot.ResolvedAssets;
-        var slot = _scanOffsets.GetOrAdd(bot.UserId, _ => (0, 0));
-        var offset = slot.Offset;
-        var batch = TakeRotatingBatch(allAssets, offset, ScanBatchSize);
-        var hold = slot.Hold + 1;
-        if (hold >= ScanHoldTicks && allAssets.Count > 0)
-        {
-            offset = (offset + ScanBatchSize) % allAssets.Count;
-            hold = 0;
-        }
-        _scanOffsets[bot.UserId] = (offset, hold);
+        // One pass over every selected FX pair — no rotating batches.
+        var allAssets = FxCurrencyAssets.FilterSymbols(bot.ResolvedAssets);
+        if (allAssets.Count == 0)
+            return;
+
         var bag = new ConcurrentBag<(string Asset, StrategySignal Signal)>();
         var staleHits = 0;
         var softNone = 0;
@@ -204,10 +195,10 @@ public sealed class BotSignalWorker : IHostedService
         var scanStarted = DateTimeOffset.UtcNow;
         var secIntoMin = SecondsIntoMinute();
 
-        // Analyze in parallel (no place). First live Call/Put executes immediately
-        // on that pair's own scope so we do not wait for the rest of the universe.
+        // Analyze all selected pairs this tick. First valid Call/Put executes immediately
+        // on that pair's own scope so we do not wait for the rest of the list.
         await Parallel.ForEachAsync(
-            batch,
+            allAssets,
             new ParallelOptions { MaxDegreeOfParallelism = ScanParallelism, CancellationToken = ct },
             async (asset, token) =>
             {
@@ -303,10 +294,8 @@ public sealed class BotSignalWorker : IHostedService
             new
             {
                 userId = bot.UserId.ToString("N")[..8],
-                assetCount = bot.ResolvedAssets.Count,
-                batch = batch.Count,
-                scanOffset = slot.Offset,
-                scanHold = slot.Hold,
+                assetCount = allAssets.Count,
+                batch = allAssets.Count,
                 scanMs = Math.Round(scanMs, 0),
                 secIntoMin,
                 candidates = bag.Count,
@@ -319,23 +308,11 @@ public sealed class BotSignalWorker : IHostedService
                 lookback = options.BacktestCandleCount,
                 hasBest = best is not null,
                 skipMarketAccess,
-                scopedPerAsset = true
+                scopedPerAsset = true,
+                fullScan = true
             },
             runId: "missed-entry");
         // #endregion
-    }
-
-    private static List<string> TakeRotatingBatch(IReadOnlyList<string> assets, int offset, int size)
-    {
-        if (assets.Count == 0 || assets.Count <= size)
-            return assets.ToList();
-
-        var batch = new List<string>(size);
-        var n = assets.Count;
-        var start = ((offset % n) + n) % n;
-        for (var i = 0; i < size; i++)
-            batch.Add(assets[(start + i) % n]);
-        return batch;
     }
 
     private static async Task<bool> HasBlockingOpenTradeAsync(
@@ -390,7 +367,7 @@ public sealed class BotSignalWorker : IHostedService
             .OrderByDescending(s => s.Signal.Backtest!.SuccessRate)
             .ThenByDescending(s =>
             {
-                var rsi = s.Signal.LiveRsi ?? s.Signal.Rsi;
+                var rsi = s.Signal.Rsi;
                 if (s.Signal.Signal == "Call")
                     return RsiEntryLevels.CallMax - rsi;
                 if (s.Signal.Signal == "Put")

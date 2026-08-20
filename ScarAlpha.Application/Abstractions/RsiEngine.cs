@@ -18,9 +18,9 @@ public sealed record RsiStrategyOptions(
     int ExpiryCandles = 5,
     decimal MinimumSuccessRate = 75m,
     /// <summary>
-    /// Max seconds after the last CLOSED bar to still allow Call/Put when the
-    /// feed has no forming candle. Live RSI at 25/75 enters immediately and
-    /// ignores this lag. Default is <see cref="RsiEntryLevels.SetupTtlSeconds"/>.
+    /// Max seconds after the last CLOSED bar's close time to still allow Call/Put.
+    /// Entry uses closed RSI only (not the forming bar). Default is
+    /// <see cref="RsiEntryLevels.SetupTtlSeconds"/>.
     /// </summary>
     int MaxEntryLagSeconds = 5)
 {
@@ -43,11 +43,12 @@ public sealed record RsiStrategyOptions(
 }
 
 /// <summary>
-/// Entry order (strict):
-/// 1) Live RSI of the pair is primary — Put only if ≥ 75, Call only if ≤ 25.
-/// 2) Backtest runs in parallel and is ready, but has ZERO entry value until step 1 is true.
-/// 3) Only after RSI is at the extreme, require matching backtest Passed (≥ 75%, visits &gt; 0).
-/// 4) Setup must still be within <see cref="SetupTtlSeconds"/> of first sight.
+/// Entry order (strict) — candle-close confirmation:
+/// 1) Wait for the 1m candle that touched 25/75 to CLOSE.
+/// 2) Put only if closed RSI stayed above 75; Call only if closed RSI stayed below 25.
+///    If it closed back under 75 / above 25 → no entry.
+/// 3) Backtest has ZERO entry value until step 2 is true, then must Pass (≥ 75%).
+/// 4) Setup must still be within <see cref="SetupTtlSeconds"/> of that candle's close.
 /// </summary>
 public static class RsiEntryLevels
 {
@@ -57,10 +58,12 @@ public static class RsiEntryLevels
     /// <summary>Put side: 80 → 74. Call side below 26: 20 → 26.</summary>
     public const decimal BinollaAlignDelta = 6m;
     public const decimal BinollaCallBoostBelow = 26m;
-    /// <summary>Enter on the first tick both conditions are true. After this, look for a new touch.</summary>
+    /// <summary>Enter in the first seconds after the extreme candle closes. Then wait for a new closed touch.</summary>
     public const int SetupTtlSeconds = 5;
 
+    /// <summary>Call: candle closed at/below 25 (still under the level).</summary>
     public static bool IsCallRsi(decimal rsi) => rsi <= CallMax;
+    /// <summary>Put: candle closed at/above 75 (still above the level).</summary>
     public static bool IsPutRsi(decimal rsi) => rsi >= PutMin;
 
     public static decimal AlignToBinolla(decimal rsi)
@@ -78,16 +81,16 @@ public static class RsiEntryLevels
         backtest.SuccessRate >= MinSuccessRate &&
         backtest.SuccessRate >= backtest.MinimumSuccessRate;
 
-    /// <summary>RSI first; backtest only consulted when live RSI is already at the extreme.</summary>
-    public static bool CanEnterCall(decimal rsi, RsiBacktestStats? backtest) =>
-        IsCallRsi(rsi) && BacktestOk(backtest);
+    /// <summary>Closed RSI first; backtest only consulted when the closed bar is still at the extreme.</summary>
+    public static bool CanEnterCall(decimal closedRsi, RsiBacktestStats? backtest) =>
+        IsCallRsi(closedRsi) && BacktestOk(backtest);
 
-    /// <summary>RSI first; backtest only consulted when live RSI is already at the extreme.</summary>
-    public static bool CanEnterPut(decimal rsi, RsiBacktestStats? backtest) =>
-        IsPutRsi(rsi) && BacktestOk(backtest);
+    /// <summary>Closed RSI first; backtest only consulted when the closed bar is still at the extreme.</summary>
+    public static bool CanEnterPut(decimal closedRsi, RsiBacktestStats? backtest) =>
+        IsPutRsi(closedRsi) && BacktestOk(backtest);
 
     /// <summary>
-    /// Final gate before placing a bot trade. Live RSI is checked before backtest.
+    /// Final gate before placing a bot trade. Closed RSI is checked before backtest.
     /// </summary>
     public static bool TryValidateForTrade(
         StrategySignal signal,
@@ -103,16 +106,11 @@ public static class RsiEntryLevels
             return false;
         }
 
-        if (signal.LiveRsi is not decimal liveRsi)
-        {
-            rejectCode = "LIVE_RSI_REQUIRED";
-            return false;
-        }
-
-        // Primary gate: live RSI. Until this passes, backtest is irrelevant.
+        // Primary gate: closed candle RSI (signal.Rsi). Forming/live RSI does not enter.
+        var closedRsi = signal.Rsi;
         if (signal.Signal == "Call")
         {
-            if (!IsCallRsi(liveRsi))
+            if (!IsCallRsi(closedRsi))
             {
                 rejectCode = "RSI_NOT_OVERSOLD";
                 // #region agent log
@@ -120,7 +118,7 @@ public static class RsiEntryLevels
                     "H-A",
                     "RsiEntryLevels.TryValidateForTrade",
                     "gate_reject_rsi",
-                    new { signal = signal.Signal, liveRsi, closedRsi = signal.Rsi, rejectCode, callMax = CallMax, putMin = PutMin },
+                    new { signal = signal.Signal, liveRsi = signal.LiveRsi, closedRsi, rejectCode, callMax = CallMax, putMin = PutMin },
                     runId: "rsi-zone");
                 // #endregion
                 return false;
@@ -134,7 +132,7 @@ public static class RsiEntryLevels
         }
         else if (signal.Signal == "Put")
         {
-            if (!IsPutRsi(liveRsi))
+            if (!IsPutRsi(closedRsi))
             {
                 rejectCode = "RSI_NOT_OVERBOUGHT";
                 // #region agent log
@@ -142,7 +140,7 @@ public static class RsiEntryLevels
                     "H-A",
                     "RsiEntryLevels.TryValidateForTrade",
                     "gate_reject_rsi",
-                    new { signal = signal.Signal, liveRsi, closedRsi = signal.Rsi, rejectCode, callMax = CallMax, putMin = PutMin },
+                    new { signal = signal.Signal, liveRsi = signal.LiveRsi, closedRsi, rejectCode, callMax = CallMax, putMin = PutMin },
                     runId: "rsi-zone");
                 // #endregion
                 return false;
@@ -160,6 +158,7 @@ public static class RsiEntryLevels
             return false;
         }
 
+        // CandleTime is the closed bar's close instant.
         var ageSeconds = (now - signal.CandleTime).TotalSeconds;
         if (ageSeconds < 0)
             ageSeconds = 0;
@@ -169,8 +168,8 @@ public static class RsiEntryLevels
             return false;
         }
 
-        var violation = (signal.Signal == "Put" && liveRsi < PutMin) ||
-                        (signal.Signal == "Call" && liveRsi > CallMax);
+        var violation = (signal.Signal == "Put" && closedRsi < PutMin) ||
+                        (signal.Signal == "Call" && closedRsi > CallMax);
         // #region agent log
         ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
             "H-A",
@@ -179,11 +178,10 @@ public static class RsiEntryLevels
             new
             {
                 signal = signal.Signal,
-                liveRsi,
-                closedRsi = signal.Rsi,
-                rsiEqClosed = liveRsi == signal.Rsi,
-                putOk = liveRsi >= PutMin,
-                callOk = liveRsi <= CallMax,
+                liveRsi = signal.LiveRsi,
+                closedRsi,
+                putOk = closedRsi >= PutMin,
+                callOk = closedRsi <= CallMax,
                 violation,
                 ageSec = Math.Round(ageSeconds, 2)
             },
@@ -233,12 +231,11 @@ public interface IRsiCalculator
 public interface IRsiSignalService
 {
     /// <summary>
-    /// Computes live RSI and a 200×1m zone-respect backtest on every snapshot.
-    /// Call = live RSI ≤ 25 first, then call backtest must pass.
-    /// Put  = live RSI ≥ 75 first, then put backtest must pass.
-    /// Backtest runs in parallel but has no entry value until live RSI is at the extreme.
-    /// Emits on the first moment both conditions are true and expires after 5 seconds
-    /// — does not wait for the forming candle to close or for the next minute.
+    /// Computes closed + live RSI and a 200×1m zone-respect backtest on every snapshot.
+    /// Call = last CLOSED bar RSI ≤ 25, then call backtest must pass.
+    /// Put  = last CLOSED bar RSI ≥ 75, then put backtest must pass.
+    /// Forming-bar (live) RSI is display-only — a wick to 75/25 that closes back inside does not enter.
+    /// Emits in the first <see cref="RsiEntryLevels.SetupTtlSeconds"/> after that candle closes.
     /// Anti-repeat is checked but not recorded here — call
     /// <see cref="MarkSignalEmitted"/> only after a successful trade place.
     /// </summary>

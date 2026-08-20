@@ -8,7 +8,7 @@ public sealed class RsiSignalService : IRsiSignalService
 {
     private readonly IRsiCalculator _calculator;
 
-    // First-seen live setup per user+asset. Expired or consumed until RSI leaves the zone.
+    // First-seen closed setup per user+asset. Expired or consumed until a new closed extreme.
     private readonly ConcurrentDictionary<string, SetupWatch> _setups = new();
 
     public RsiSignalService(IRsiCalculator calculator)
@@ -59,9 +59,10 @@ public sealed class RsiSignalService : IRsiSignalService
             throw new ApiException(ApiErrorCodes.ValidationError, "Insufficient closed candles for RSI backtest.");
 
         var currentCandle = closed[^1];
+        var closeTime = currentCandle.Timestamp + barLength;
         var closes = closed.Select(c => c.Close).ToList();
         var currentRsi = _calculator.CalculateRsi(closes, options);
-        // Backtest is always ready before the live RSI gate is consulted.
+        // Backtest is always ready before the closed RSI gate is consulted.
         var (callBacktest, putBacktest) = RsiZoneBacktest.Evaluate(closes, options);
 
         var roundedRsi = RsiEntryLevels.AlignToBinolla(
@@ -75,19 +76,12 @@ public sealed class RsiSignalService : IRsiSignalService
                 Math.Round(_calculator.CalculateRsi(liveCloses, options), 2, MidpointRounding.AwayFromZero))
             : roundedRsi;
 
-        // Live RSI is the primary gate. Backtest is computed in parallel but ignored for entry
-        // until RSI is ≤25 (Call) or ≥75 (Put). Only then does matching backtest matter.
-        // Without a forming bar (fresh quote), closed-only RSI must not trigger entries.
+        // Closed RSI is the primary gate. Live/forming RSI is display-only —
+        // a touch of 75/25 that closes back inside the range does not enter.
         RsiSignalType signalType;
         RsiBacktestStats? entryBacktest;
         string? midSkip;
-        if (forming is null)
-        {
-            signalType = RsiSignalType.None;
-            entryBacktest = null;
-            midSkip = "noLiveQuote";
-        }
-        else if (RsiEntryLevels.IsCallRsi(liveRsi))
+        if (RsiEntryLevels.IsCallRsi(roundedRsi))
         {
             if (RsiEntryLevels.BacktestOk(callBacktest))
             {
@@ -102,7 +96,7 @@ public sealed class RsiSignalService : IRsiSignalService
                 midSkip = "backtest";
             }
         }
-        else if (RsiEntryLevels.IsPutRsi(liveRsi))
+        else if (RsiEntryLevels.IsPutRsi(roundedRsi))
         {
             if (RsiEntryLevels.BacktestOk(putBacktest))
             {
@@ -119,20 +113,30 @@ public sealed class RsiSignalService : IRsiSignalService
         }
         else
         {
-            // Mid-range live RSI — backtest has no entry value.
+            // Closed mid-range — wick on forming bar has no entry value.
             signalType = RsiSignalType.None;
             entryBacktest = null;
             midSkip = "midRsi";
         }
 
-        var touchedOversold = RsiEntryLevels.IsCallRsi(liveRsi);
-        var touchedOverbought = RsiEntryLevels.IsPutRsi(liveRsi);
+        var secondsSinceClose = (now - closeTime).TotalSeconds;
+        if (signalType != RsiSignalType.None &&
+            (secondsSinceClose < 0 || secondsSinceClose > RsiEntryLevels.SetupTtlSeconds))
+        {
+            // Extreme closed candle is already older than the entry window.
+            midSkip = "closeLag";
+            signalType = RsiSignalType.None;
+            entryBacktest = null;
+        }
+
+        var touchedOversold = RsiEntryLevels.IsCallRsi(roundedRsi);
+        var touchedOverbought = RsiEntryLevels.IsPutRsi(roundedRsi);
 
         var timeframe = options.TimeframeSeconds.ToString();
-        // Display: when at extreme show that side's backtest; otherwise show either for info only.
+        // Display: when closed at extreme show that side's backtest; otherwise show either for info only.
         var displayBacktest = touchedOversold ? callBacktest
             : touchedOverbought ? putBacktest
-            : liveRsi >= 50m ? putBacktest : callBacktest;
+            : roundedRsi >= 50m ? putBacktest : callBacktest;
         var key = EmissionKey(userId, asset, options.TimeframeSeconds);
 
         if (signalType == RsiSignalType.None || entryBacktest is null)
@@ -142,7 +146,7 @@ public sealed class RsiSignalService : IRsiSignalService
             ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
                 "H-LIVE",
                 "RsiSignalService.GetSignalAsync",
-                "live_entry_eval",
+                "closed_entry_eval",
                 new
                 {
                     asset = asset.Trim(),
@@ -150,7 +154,8 @@ public sealed class RsiSignalService : IRsiSignalService
                     liveRsi,
                     lastClosedClose = currentCandle.Close,
                     lastClosedStart = currentCandle.Timestamp.ToUnixTimeSeconds(),
-                    lastClosedAgeSec = Math.Round((now - (currentCandle.Timestamp + TimeSpan.FromSeconds(options.TimeframeSeconds))).TotalSeconds, 1),
+                    closeTimeUnix = closeTime.ToUnixTimeSeconds(),
+                    secondsSinceClose = Math.Round(secondsSinceClose, 1),
                     formingClose = forming?.Close,
                     formingStart = forming?.Timestamp.ToUnixTimeSeconds(),
                     hasForming = forming is not null,
@@ -174,46 +179,48 @@ public sealed class RsiSignalService : IRsiSignalService
                 Asset: asset.Trim(),
                 Signal: "None",
                 Rsi: roundedRsi,
-                CandleTime: currentCandle.Timestamp,
+                CandleTime: closeTime,
                 Timeframe: timeframe,
                 Backtest: displayBacktest,
-                LiveRsi: liveRsi));
+                LiveRsi: liveRsi,
+                AutomationError: midSkip == "closeLag" ? "SETUP_EXPIRED" : null));
         }
 
         var watch = _setups.AddOrUpdate(
             key,
-            _ => new SetupWatch(signalType, now, Consumed: false),
-            (_, existing) => existing.Side == signalType
+            _ => new SetupWatch(signalType, currentCandle.Timestamp, closeTime, Consumed: false),
+            (_, existing) => existing.Side == signalType && existing.CandleStart == currentCandle.Timestamp
                 ? existing
-                : new SetupWatch(signalType, now, Consumed: false));
-        var ageSeconds = (now - watch.FirstSeenAt).TotalSeconds;
+                : new SetupWatch(signalType, currentCandle.Timestamp, closeTime, Consumed: false));
+        var ageSeconds = (now - watch.CloseTime).TotalSeconds;
         var fresh = !watch.Consumed && ageSeconds <= RsiEntryLevels.SetupTtlSeconds;
 
         // #region agent log
         ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
             "H-LIVE",
             "RsiSignalService.GetSignalAsync",
-            "live_entry_eval",
+            "closed_entry_eval",
             new
             {
                 asset = asset.Trim(),
-                    rsi = roundedRsi,
-                    liveRsi,
-                    lastClosedClose = currentCandle.Close,
-                    lastClosedStart = currentCandle.Timestamp.ToUnixTimeSeconds(),
-                    lastClosedAgeSec = Math.Round((now - (currentCandle.Timestamp + TimeSpan.FromSeconds(options.TimeframeSeconds))).TotalSeconds, 1),
-                    formingClose = forming?.Close,
-                    formingStart = forming?.Timestamp.ToUnixTimeSeconds(),
-                    hasForming = forming is not null,
-                    rsiSide = signalType.ToString(),
+                rsi = roundedRsi,
+                liveRsi,
+                lastClosedClose = currentCandle.Close,
+                lastClosedStart = currentCandle.Timestamp.ToUnixTimeSeconds(),
+                closeTimeUnix = closeTime.ToUnixTimeSeconds(),
+                secondsSinceClose = Math.Round(secondsSinceClose, 1),
+                formingClose = forming?.Close,
+                formingStart = forming?.Timestamp.ToUnixTimeSeconds(),
+                hasForming = forming is not null,
+                rsiSide = signalType.ToString(),
                 lookback = RsiZoneBacktest.LookbackCandles,
                 touchedOversold,
                 touchedOverbought,
                 ageSeconds = Math.Round(ageSeconds, 2),
                 consumed = watch.Consumed,
                 wouldEnter = fresh,
-                putOk = RsiEntryLevels.IsPutRsi(liveRsi),
-                callOk = RsiEntryLevels.IsCallRsi(liveRsi),
+                putOk = RsiEntryLevels.IsPutRsi(roundedRsi),
+                callOk = RsiEntryLevels.IsCallRsi(roundedRsi),
                 skip = fresh
                     ? "ok"
                     : watch.Consumed ? "consumed" : "expired",
@@ -234,7 +241,7 @@ public sealed class RsiSignalService : IRsiSignalService
                 Asset: asset.Trim(),
                 Signal: "None",
                 Rsi: roundedRsi,
-                CandleTime: watch.FirstSeenAt,
+                CandleTime: watch.CloseTime,
                 Timeframe: timeframe,
                 Backtest: entryBacktest,
                 LiveRsi: liveRsi,
@@ -246,7 +253,7 @@ public sealed class RsiSignalService : IRsiSignalService
             Asset: asset.Trim(),
             Signal: signalType == RsiSignalType.Call ? "Call" : "Put",
             Rsi: roundedRsi,
-            CandleTime: watch.FirstSeenAt,
+            CandleTime: watch.CloseTime,
             Timeframe: timeframe,
             Backtest: entryBacktest,
             LiveRsi: liveRsi));
@@ -262,11 +269,15 @@ public sealed class RsiSignalService : IRsiSignalService
             return;
         _setups.AddOrUpdate(
             EmissionKey(userId, asset, timeframeSeconds),
-            _ => new SetupWatch(RsiSignalType.None, candleTime, Consumed: true),
+            _ => new SetupWatch(RsiSignalType.None, candleTime, candleTime, Consumed: true),
             (_, existing) => existing with { Consumed = true });
     }
 
-    private readonly record struct SetupWatch(RsiSignalType Side, DateTimeOffset FirstSeenAt, bool Consumed);
+    private readonly record struct SetupWatch(
+        RsiSignalType Side,
+        DateTimeOffset CandleStart,
+        DateTimeOffset CloseTime,
+        bool Consumed);
 
     private static string EmissionKey(Guid userId, string asset, int timeframeSeconds) =>
         $"{userId:N}:{asset.Trim().ToUpperInvariant()}:{timeframeSeconds}";

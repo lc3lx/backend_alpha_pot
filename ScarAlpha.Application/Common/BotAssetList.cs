@@ -1,9 +1,9 @@
 namespace ScarAlpha.Application.Common;
 
-/// <summary>Normalize bot trading-pair lists (all available market pairs; hard ceiling for safety).</summary>
+/// <summary>Normalize bot trading-pair lists to FX currency pairs only.</summary>
 public static class BotAssetList
 {
-    /// <summary>Hard ceiling only — high enough to cover full Binolla asset lists.</summary>
+    /// <summary>Hard ceiling — enough for full Binolla FX lists.</summary>
     public const int MaxAssets = 2000;
 
     public static IReadOnlyList<string> Normalize(string? asset, IEnumerable<string>? assets)
@@ -13,6 +13,8 @@ public static class BotAssetList
         {
             if (string.IsNullOrWhiteSpace(value)) return;
             var trimmed = value.Trim();
+            if (!FxCurrencyAssets.IsCurrencyPair(trimmed))
+                return;
             if (set.Any(x => string.Equals(x, trimmed, StringComparison.OrdinalIgnoreCase)))
                 return;
             if (set.Count >= MaxAssets) return;
