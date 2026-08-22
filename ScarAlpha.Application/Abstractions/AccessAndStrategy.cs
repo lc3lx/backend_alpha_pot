@@ -93,7 +93,9 @@ public sealed record BotRuntimeConfig(
     /// <summary>PnL for daily limits is counted only from this timestamp (set on each Start).</summary>
     DateTimeOffset? PnlSessionStartedAt = null,
     /// <summary>Why the bot last stopped — e.g. DAILY_PROFIT_TARGET_REACHED.</summary>
-    string? StopReason = null)
+    string? StopReason = null,
+    /// <summary>Which strategy the bot executes: "rsi" or "ema".</summary>
+    string StrategyId = "rsi")
 {
     /// <summary>Selected pairs to analyze (falls back to single Asset).</summary>
     public IReadOnlyList<string> ResolvedAssets =>
@@ -118,7 +120,8 @@ public interface IBotRuntimeService
         bool autoStopAtLoss = true,
         bool signalConfirmationEnabled = true,
         string riskLevel = "risk-medium",
-        bool notificationsEnabled = true);
+        bool notificationsEnabled = true,
+        string strategyId = "rsi");
     BotRuntimeConfig Pause(Guid userId);
     BotRuntimeConfig Stop(Guid userId, string? stopReason = null);
     BotRuntimeConfig Apply(
@@ -133,7 +136,8 @@ public interface IBotRuntimeService
         bool? signalConfirmationEnabled = null,
         string? riskLevel = null,
         bool? notificationsEnabled = null,
-        IReadOnlyList<string>? assets = null);
+        IReadOnlyList<string>? assets = null,
+        string? strategyId = null);
     IReadOnlyList<BotRuntimeConfig> ListKnown();
     /// <summary>Load persisted runtime into memory (API startup). Does not rewrite DB.</summary>
     void RestoreFromPersistence(BotRuntimeConfig config);

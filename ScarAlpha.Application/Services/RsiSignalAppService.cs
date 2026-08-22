@@ -17,6 +17,8 @@ public sealed class RsiSignalAppService
     private readonly IBinollaSessionManager _sessions;
     private readonly IBotAccessService _botAccess;
     private readonly IRsiSignalService _signalService;
+    private readonly IEmaRsiSignalService _emaSignalService;
+    private readonly MarketAnalysisCache _analysisCache;
     private readonly IBinollaSessionRestorer _restorer;
     private readonly IMarketingDemoService _demo;
     private readonly TradeAppService _trades;
@@ -29,6 +31,8 @@ public sealed class RsiSignalAppService
         IBinollaSessionManager sessions,
         IBotAccessService botAccess,
         IRsiSignalService signalService,
+        IEmaRsiSignalService emaSignalService,
+        MarketAnalysisCache analysisCache,
         IBinollaSessionRestorer restorer,
         IMarketingDemoService demo,
         TradeAppService trades,
@@ -40,6 +44,8 @@ public sealed class RsiSignalAppService
         _sessions = sessions;
         _botAccess = botAccess;
         _signalService = signalService;
+        _emaSignalService = emaSignalService;
+        _analysisCache = analysisCache;
         _restorer = restorer;
         _demo = demo;
         _trades = trades;
@@ -60,7 +66,8 @@ public sealed class RsiSignalAppService
         RsiStrategyOptions options,
         bool autoExecute,
         CancellationToken ct,
-        bool skipMarketAccess = false)
+        bool skipMarketAccess = false,
+        string strategyId = "rsi")
     {
         if (string.IsNullOrWhiteSpace(asset))
             throw new ApiException(ApiErrorCodes.ValidationError, "asset is required.");
@@ -123,30 +130,21 @@ public sealed class RsiSignalAppService
                 return SoftNone(symbol, wirePeriod) with { AutomationError = "OPEN_TRADE_EXISTS" };
             }
 
-            var history = await client.GetHistoryAsync(symbol, wirePeriod, CancellationToken.None);
-
             if (!quoteFresh)
                 quoteFresh = await WaitForFreshQuoteAsync(client, symbol, maxQuoteAgeSeconds, ct);
 
             var now = DateTimeOffset.UtcNow;
             var period = TimeSpan.FromSeconds(wirePeriod);
-            List<CandlestickData> raw;
-            lock (history.Candles)
-                raw = history.Candles.ToList();
-            var normalized = MinuteBars.Normalize(raw, wirePeriod);
-            var candles = normalized
-                .Select(c =>
-                {
-                    var startUnix = MinuteBars.BucketStartUnix(c.Timestamp, wirePeriod);
-                    var start = DateTimeOffset.FromUnixTimeSeconds(startUnix);
-                    // Period end, never Binolla's last-tick EndTimestamp.
-                    return new RsiCandle(
-                        Timestamp: start,
-                        Close: (decimal)c.Close,
-                        EndTimestamp: start + period);
-                })
-                .ToList();
 
+            // One analysis per pair per closed bar, shared by every account: the first
+            // caller fetches and computes, the rest reuse the identical closed series.
+            // Two accounts on the same pair therefore always see the same signal, and
+            // 100 users cost the same history traffic as one.
+            var analysis = await GetSharedAnalysisAsync(client, symbol, wirePeriod, options, now, ct);
+            if (analysis is null)
+                return SoftNone(symbol, wirePeriod) with { AutomationError = "INSUFFICIENT_HISTORY" };
+
+            var candles = analysis.ClosedCandles.ToList();
             if (candles.Count == 0)
                 return SoftNone(symbol, wirePeriod);
 
@@ -178,13 +176,28 @@ public sealed class RsiSignalAppService
                 return SoftNone(symbol, wirePeriod);
             }
 
-            var signal = await _signalService.GetSignalAsync(
-                userId: _currentUser.UserId,
-                asset: symbol,
-                candles: candles,
-                options: options,
-                now: now,
-                ct: ct);
+            var emaOptions = EmaRsiOptions.FromBotDurationSeconds(options.ExpiryCandles * 60)
+                with { UseTrendFilter = EmaTrendFilterEnabled };
+
+            var signal = IsEma(strategyId)
+                ? await _emaSignalService.GetSignalAsync(
+                    userId: _currentUser.UserId,
+                    asset: symbol,
+                    candles: candles,
+                    // Pine's htfTF series. EMA200 on 15m needs ~3000 minutes of data, far
+                    // more than the 1m cache holds, so this is a real 15m subscription —
+                    // shared and refreshed only once per pair per 15m bar.
+                    trendCloses: await GetTrendClosesAsync(client, symbol, emaOptions, now, ct),
+                    options: emaOptions,
+                    now: now,
+                    ct: ct)
+                : await _signalService.GetSignalAsync(
+                    userId: _currentUser.UserId,
+                    asset: symbol,
+                    candles: candles,
+                    options: options,
+                    now: now,
+                    ct: ct);
             return await ExecuteIfRequestedAsync(signal, options, autoExecute, ct);
         }
         catch (BinollaAuthenticationException)
@@ -222,6 +235,169 @@ public sealed class RsiSignalAppService
         }
     }
 
+    /// <summary>
+    /// Pine's <c>useTrend</c>. Kept operator-tunable (appsettings
+    /// <c>Strategy:EmaUseTrendFilter</c>) because it depends on the broker actually
+    /// serving ~200 bars of 15m history; without that the trend is Unknown and the
+    /// strategy correctly refuses to trade.
+    /// </summary>
+    public static bool EmaTrendFilterEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Closes of the trend timeframe (Pine htfTF, default 15m), shared across accounts
+    /// and refetched only once per pair per trend bar. Returns an empty list when the
+    /// broker cannot supply enough history — the engine then reports TREND_UNKNOWN
+    /// rather than assuming the trend agrees.
+    /// </summary>
+    private async Task<IReadOnlyList<decimal>> GetTrendClosesAsync(
+        IBinollaClient client,
+        string symbol,
+        EmaRsiOptions emaOptions,
+        DateTimeOffset now,
+        CancellationToken ct)
+    {
+        if (!emaOptions.UseTrendFilter)
+            return Array.Empty<decimal>();
+
+        var tf = BinollaMarketPeriods.NormalizeHistoryPeriod(emaOptions.TrendTimeframeSeconds);
+
+        try
+        {
+            var trend = await _analysisCache.GetOrAddAsync(symbol, tf, now, async _ =>
+            {
+                var history = await client.GetHistoryAsync(symbol, tf, CancellationToken.None);
+                var period = TimeSpan.FromSeconds(tf);
+
+                List<CandlestickData> raw;
+                lock (history.Candles)
+                    raw = history.Candles.ToList();
+
+                var bars = MinuteBars.Normalize(raw, tf)
+                    .Select(c =>
+                    {
+                        var start = DateTimeOffset.FromUnixTimeSeconds(
+                            MinuteBars.BucketStartUnix(c.Timestamp, tf));
+                        return new RsiCandle(start, (decimal)c.Close, start + period);
+                    })
+                    .ToList();
+
+                var prepared = CandleSeries.Prepare(bars, tf, now);
+                if (prepared.Count < IndicatorWarmup.ForEma(emaOptions.TrendEmaLength))
+                {
+                    // #region agent log
+                    ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                        "H-TREND",
+                        "RsiSignalAppService.GetTrendClosesAsync",
+                        "trend_history_too_short",
+                        new
+                        {
+                            symbol,
+                            timeframe = tf,
+                            closed = prepared.Count,
+                            required = IndicatorWarmup.ForEma(emaOptions.TrendEmaLength)
+                        },
+                        runId: "ema-trend");
+                    // #endregion
+                    return null;
+                }
+
+                return new MarketAnalysis(
+                    Asset: symbol,
+                    TimeframeSeconds: tf,
+                    ClosedBarTime: prepared.Last.Timestamp + period,
+                    ClosedCandles: prepared.Closed,
+                    Closes: prepared.Closes,
+                    Rsi: 0m,
+                    CallBacktest: null,
+                    PutBacktest: null);
+            }, ct);
+
+            return trend?.Closes ?? Array.Empty<decimal>();
+        }
+        catch (Exception)
+        {
+            // Trend data is a filter, not a data source — a failure means "cannot
+            // confirm", which blocks the entry rather than allowing an unfiltered one.
+            return Array.Empty<decimal>();
+        }
+    }
+
+    internal static bool IsEma(string? strategyId) =>
+        string.Equals(strategyId?.Trim(), "ema", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Builds (or reuses) the account-independent analysis for one pair and closed bar.
+    ///
+    /// Returns null — and therefore caches nothing — when the series is not good enough
+    /// to trust: too little warmup for Wilder RSI, or a gap in the minutes. Emitting no
+    /// signal is correct there; emitting an RSI the broker chart disagrees with is not.
+    /// </summary>
+    private Task<MarketAnalysis?> GetSharedAnalysisAsync(
+        IBinollaClient client,
+        string symbol,
+        int wirePeriod,
+        RsiStrategyOptions options,
+        DateTimeOffset now,
+        CancellationToken ct) =>
+        _analysisCache.GetOrAddAsync(symbol, wirePeriod, now, async _ =>
+        {
+            var history = await client.GetHistoryAsync(symbol, wirePeriod, CancellationToken.None);
+            var period = TimeSpan.FromSeconds(wirePeriod);
+
+            List<CandlestickData> raw;
+            lock (history.Candles)
+                raw = history.Candles.ToList();
+
+            var candles = MinuteBars.Normalize(raw, wirePeriod)
+                .Select(c =>
+                {
+                    var start = DateTimeOffset.FromUnixTimeSeconds(
+                        MinuteBars.BucketStartUnix(c.Timestamp, wirePeriod));
+                    // Period end, never Binolla's last-tick EndTimestamp.
+                    return new RsiCandle(start, (decimal)c.Close, start + period);
+                })
+                .ToList();
+
+            var prepared = CandleSeries.Prepare(candles, wirePeriod, now);
+            var warmup = Math.Max(
+                IndicatorWarmup.ForRsi(options.Period),
+                options.Period + options.ExpiryCandles + 2);
+            if (prepared.Count < warmup)
+            {
+                // #region agent log
+                ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                    "H-WARMUP",
+                    "RsiSignalAppService.GetSharedAnalysisAsync",
+                    "insufficient_warmup",
+                    new
+                    {
+                        symbol,
+                        closed = prepared.Count,
+                        rawClosed = prepared.RawCount,
+                        gapsDropped = prepared.GapsDropped,
+                        required = warmup
+                    },
+                    runId: "rsi-parity");
+                // #endregion
+                return null;
+            }
+
+            var closes = prepared.Closes;
+            var rsi = Math.Round(
+                Indicators.Rsi(closes, options.Period)!.Value, 2, MidpointRounding.AwayFromZero);
+            var (call, put) = RsiZoneBacktest.Evaluate(closes, options);
+
+            return new MarketAnalysis(
+                Asset: symbol,
+                TimeframeSeconds: wirePeriod,
+                ClosedBarTime: prepared.Last.Timestamp + period,
+                ClosedCandles: prepared.Closed,
+                Closes: closes,
+                Rsi: rsi,
+                CallBacktest: call,
+                PutBacktest: put);
+        }, ct);
+
     private static StrategySignal SoftNone(string symbol, int periodSeconds) =>
         new(
             StrategyId: "rsi",
@@ -244,7 +420,7 @@ public sealed class RsiSignalAppService
             return signal;
 
         var nowGate = DateTimeOffset.UtcNow;
-        if (!RsiEntryLevels.TryValidateForTrade(signal, nowGate, out var rejectCode))
+        if (!StrategyGate.TryValidateForTrade(signal, nowGate, out var rejectCode))
         {
             if (rejectCode is null or "NO_SIGNAL")
                 return signal;
@@ -349,7 +525,8 @@ public sealed class RsiSignalAppService
             var durationSeconds = expiryCandles * 60;
             OpenTradeGate.MarkUserHeld(userId, durationSeconds);
 
-            var key = $"bot:rsi:{signal.Asset.Trim().ToUpperInvariant()}:{signal.CandleTime.ToUnixTimeSeconds()}:{signal.Signal}";
+            var strategyKey = IsEma(signal.StrategyId) ? "ema" : "rsi";
+            var key = $"bot:{strategyKey}:{signal.Asset.Trim().ToUpperInvariant()}:{signal.CandleTime.ToUnixTimeSeconds()}:{signal.Signal}";
             try
             {
                 var putOk = signal.LiveRsi is decimal lr && lr >= RsiEntryLevels.PutMin;
@@ -379,13 +556,18 @@ public sealed class RsiSignalAppService
                     Direction: signal.Signal.ToUpperInvariant(),
                     Amount: bot.Amount,
                     DurationSeconds: durationSeconds,
-                    StrategyId: "rsi"), key, ct);
+                    StrategyId: strategyKey), key, ct);
 
-                _signalService.MarkSignalEmitted(
-                    userId,
-                    signal.Asset,
-                    options.TimeframeSeconds,
-                    signal.CandleTime);
+                if (IsEma(signal.StrategyId))
+                {
+                    _emaSignalService.MarkSignalEmitted(
+                        userId, signal.Asset, options.TimeframeSeconds, signal.CandleTime);
+                }
+                else
+                {
+                    _signalService.MarkSignalEmitted(
+                        userId, signal.Asset, options.TimeframeSeconds, signal.CandleTime);
+                }
 
                 // #region agent log
                 var tradeIdShort = trade.Id.Length >= 8 ? trade.Id[..8] : trade.Id;

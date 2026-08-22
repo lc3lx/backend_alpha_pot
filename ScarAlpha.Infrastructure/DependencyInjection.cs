@@ -6,6 +6,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.IdentityModel.Tokens;
 using ScarAlpha.Application.Abstractions;
+using ScarAlpha.Application.Common;
 using ScarAlpha.Application.Services;
 using ScarAlpha.Binolla.Abstractions;
 using ScarAlpha.Binolla.Session;
@@ -78,7 +79,21 @@ public static class DependencyInjection
         services.AddSingleton<IBinollaCredentialAuth, NodeBinollaCredentialAuth>();
 
         services.AddSingleton<IRsiCalculator, RsiCalculator>();
+        // Wilder RSI is recursive: too little history and the value drifts away from the
+        // broker chart. Default 150 bars; lower only if Binolla pushes shallow history.
+        var warmup = configuration.GetValue<int?>("Strategy:MinRsiWarmupCandles");
+        if (warmup is int w)
+            IndicatorWarmup.MinRsiCandles = w;
+
+        // Pine useTrend. Turn off only if Binolla does not serve ~200 bars of 15m history.
+        var emaTrend = configuration.GetValue<bool?>("Strategy:EmaUseTrendFilter");
+        if (emaTrend is bool t)
+            RsiSignalAppService.EmaTrendFilterEnabled = t;
+
         services.AddSingleton<IRsiSignalService, RsiSignalService>();
+        services.AddSingleton<IEmaRsiSignalService, EmaRsiSignalService>();
+        // Shared across all users: one analysis per pair per closed bar.
+        services.AddSingleton<MarketAnalysisCache>();
 
         var binollaOptions = new BinollaSessionManagerOptions
         {

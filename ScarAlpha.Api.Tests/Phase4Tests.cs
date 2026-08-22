@@ -94,7 +94,7 @@ public sealed class Phase4BusinessModelTests : IClassFixture<ApiFactory>
     }
 
     [Fact]
-    public async Task Strategies_lists_RSI_active_and_others_coming_soon()
+    public async Task Strategies_lists_RSI_and_EMA_active_and_the_rest_coming_soon()
     {
         var token = await LoginAsync(8101);
         using var req = Authed(HttpMethod.Get, "/api/strategies", token);
@@ -109,8 +109,12 @@ public sealed class Phase4BusinessModelTests : IClassFixture<ApiFactory>
         rsi.GetProperty("enabled").GetBoolean().Should().BeTrue();
 
         var ema = strategies.Single(s => s.GetProperty("id").GetString() == "ema");
-        ema.GetProperty("status").GetString().Should().Be("ComingSoon");
-        ema.GetProperty("enabled").GetBoolean().Should().BeFalse();
+        ema.GetProperty("status").GetString().Should().Be("Active");
+        ema.GetProperty("enabled").GetBoolean().Should().BeTrue();
+
+        var macd = strategies.Single(s => s.GetProperty("id").GetString() == "macd");
+        macd.GetProperty("status").GetString().Should().Be("ComingSoon");
+        macd.GetProperty("enabled").GetBoolean().Should().BeFalse();
     }
 
     [Fact]

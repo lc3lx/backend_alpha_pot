@@ -214,7 +214,8 @@ public sealed class BotSignalWorker : IHostedService
                     using (AmbientUserContext.Use(userId))
                     {
                         var signal = await rsi.GetSignalAsync(
-                            asset, 60, options, autoExecute: false, token, skipMarketAccess);
+                            asset, 60, options, autoExecute: false, token, skipMarketAccess,
+                            strategyId: bot.StrategyId);
                         if (signal.AutomationError == "SIGNAL_STALE")
                             Interlocked.Increment(ref staleHits);
                         else if (signal.Signal is not ("Call" or "Put"))
@@ -355,18 +356,23 @@ public sealed class BotSignalWorker : IHostedService
     }
 
     private static bool IsLiveSetup(StrategySignal signal) =>
-        RsiEntryLevels.TryValidateForTrade(signal, DateTimeOffset.UtcNow, out _);
+        StrategyGate.TryValidateForTrade(signal, DateTimeOffset.UtcNow, out _);
 
     private static (string Asset, StrategySignal Signal)? PickBest(
         List<(string Asset, StrategySignal Signal)> signals)
     {
         if (signals.Count == 0) return null;
 
+        // RSI ranks by zone-backtest strength then by how deep into the zone the bar
+        // closed. The EMA strategy has no backtest, so those tiebreakers are 0 and the
+        // freshest cross simply wins.
         var ordered = signals
             .Where(s => IsLiveSetup(s.Signal))
-            .OrderByDescending(s => s.Signal.Backtest!.SuccessRate)
+            .OrderByDescending(s => s.Signal.Backtest?.SuccessRate ?? 0m)
             .ThenByDescending(s =>
             {
+                if (!string.Equals(s.Signal.StrategyId, "rsi", StringComparison.OrdinalIgnoreCase))
+                    return 0m;
                 var rsi = s.Signal.Rsi;
                 if (s.Signal.Signal == "Call")
                     return RsiEntryLevels.CallMax - rsi;

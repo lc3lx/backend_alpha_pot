@@ -36,7 +36,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
         bool autoStopAtLoss = true,
         bool signalConfirmationEnabled = true,
         string riskLevel = "risk-medium",
-        bool notificationsEnabled = true) =>
+        bool notificationsEnabled = true,
+        string strategyId = "rsi") =>
         Set(
             userId,
             BotRunState.Running,
@@ -52,6 +53,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
             notificationsEnabled,
             pnlSessionStartedAt: DateTimeOffset.UtcNow,
             stopReason: null,
+            strategyId: strategyId,
             persist: true);
 
     public BotRuntimeConfig Pause(Guid userId)
@@ -72,6 +74,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
             current.NotificationsEnabled,
             pnlSessionStartedAt: current.PnlSessionStartedAt,
             stopReason: current.StopReason,
+            strategyId: current.StrategyId,
             persist: true);
     }
 
@@ -93,6 +96,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
             current.NotificationsEnabled,
             pnlSessionStartedAt: current.PnlSessionStartedAt,
             stopReason: stopReason,
+            strategyId: current.StrategyId,
             persist: true);
     }
 
@@ -108,7 +112,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
         bool? signalConfirmationEnabled = null,
         string? riskLevel = null,
         bool? notificationsEnabled = null,
-        IReadOnlyList<string>? assets = null)
+        IReadOnlyList<string>? assets = null,
+        string? strategyId = null)
     {
         var current = Get(userId);
         var nextAssets = assets is not null || asset is not null
@@ -129,6 +134,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
             notificationsEnabled ?? current.NotificationsEnabled,
             pnlSessionStartedAt: current.PnlSessionStartedAt,
             stopReason: current.StopReason,
+            strategyId: strategyId ?? current.StrategyId,
             persist: true);
     }
 
@@ -155,7 +161,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
         bool notificationsEnabled,
         DateTimeOffset? pnlSessionStartedAt,
         string? stopReason,
-        bool persist)
+        bool persist,
+        string strategyId = "rsi")
     {
         if (amount <= 0 || amount > 100_000m)
             throw new ArgumentOutOfRangeException(nameof(amount));
@@ -180,7 +187,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
             riskLevel,
             notificationsEnabled,
             pnlSessionStartedAt,
-            stopReason);
+            stopReason,
+            strategyId);
         _states[userId] = next;
         if (persist)
             QueuePersist(next);
@@ -222,7 +230,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
         string riskLevel = "risk-medium",
         bool notificationsEnabled = true,
         DateTimeOffset? pnlSessionStartedAt = null,
-        string? stopReason = null)
+        string? stopReason = null,
+        string strategyId = "rsi")
     {
         var list = BotAssetList.Normalize(null, assets);
         return new BotRuntimeConfig(
@@ -241,8 +250,13 @@ public sealed class BotRuntimeService : IBotRuntimeService
             notificationsEnabled,
             list,
             pnlSessionStartedAt,
-            stopReason);
+            stopReason,
+            NormalizeStrategy(strategyId));
     }
+
+    /// <summary>Unknown ids fall back to the always-available RSI strategy.</summary>
+    internal static string NormalizeStrategy(string? strategyId) =>
+        string.Equals(strategyId?.Trim(), "ema", StringComparison.OrdinalIgnoreCase) ? "ema" : "rsi";
 
     public sealed record StoredBotRuntime(
         string State,
@@ -257,7 +271,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
         string RiskLevel,
         bool NotificationsEnabled,
         DateTimeOffset? PnlSessionStartedAt,
-        string? StopReason)
+        string? StopReason,
+        string StrategyId = "rsi")
     {
         public static StoredBotRuntime From(BotRuntimeConfig c) => new(
             c.State.ToString(),
@@ -272,7 +287,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
             c.RiskLevel,
             c.NotificationsEnabled,
             c.PnlSessionStartedAt,
-            c.StopReason);
+            c.StopReason,
+            c.StrategyId);
 
         public BotRuntimeConfig ToConfig(Guid userId)
         {
@@ -294,7 +310,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
                 NotificationsEnabled,
                 assets,
                 PnlSessionStartedAt,
-                StopReason);
+                StopReason,
+                NormalizeStrategy(StrategyId));
         }
 
         public static BotRuntimeConfig? TryParse(Guid userId, string? json)

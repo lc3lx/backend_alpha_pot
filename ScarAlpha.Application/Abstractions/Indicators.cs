@@ -1,0 +1,151 @@
+namespace ScarAlpha.Application.Abstractions;
+
+/// <summary>
+/// TradingView/Pine-compatible indicator math, shared by every strategy.
+///
+/// Parity rules that make these values match a broker chart (Binolla, TradingView, …):
+///  * <c>ta.rsi</c> is Wilder smoothing (RMA) seeded with the simple average of the
+///    first <c>length</c> deltas — <see cref="RsiSeries"/>.
+///  * <c>ta.ema</c> seeds with the SMA of the first <c>length</c> values, then applies
+///    alpha = 2/(length+1) — <see cref="EmaSeries"/>.
+///  * Both are recursive: the value depends on how much history you feed them.
+///    Feeding 20 bars and feeding 300 bars produce DIFFERENT numbers for the same
+///    last bar. See <see cref="IndicatorWarmup"/>.
+/// </summary>
+public static class Indicators
+{
+    /// <summary>
+    /// Wilder RSI for every index. Entries before <paramref name="length"/> are 0
+    /// (undefined — never read them).
+    /// </summary>
+    public static decimal[] RsiSeries(IReadOnlyList<decimal> closes, int length)
+    {
+        if (closes is null) throw new ArgumentNullException(nameof(closes));
+        if (length <= 0) throw new ArgumentOutOfRangeException(nameof(length));
+
+        var series = new decimal[closes.Count];
+        if (closes.Count < length + 1)
+            return series;
+
+        decimal gainSum = 0m;
+        decimal lossSum = 0m;
+        for (var i = 1; i <= length; i++)
+        {
+            var delta = closes[i] - closes[i - 1];
+            if (delta > 0) gainSum += delta;
+            else lossSum += -delta;
+        }
+
+        var avgGain = gainSum / length;
+        var avgLoss = lossSum / length;
+        series[length] = ToRsi(avgGain, avgLoss);
+
+        for (var i = length + 1; i < closes.Count; i++)
+        {
+            var delta = closes[i] - closes[i - 1];
+            var gain = delta > 0 ? delta : 0m;
+            var loss = delta < 0 ? -delta : 0m;
+            avgGain = (avgGain * (length - 1) + gain) / length;
+            avgLoss = (avgLoss * (length - 1) + loss) / length;
+            series[i] = ToRsi(avgGain, avgLoss);
+        }
+
+        return series;
+    }
+
+    /// <summary>Last Wilder RSI value, or null when there is not enough history.</summary>
+    public static decimal? Rsi(IReadOnlyList<decimal> closes, int length)
+    {
+        if (closes.Count < length + 1) return null;
+        return RsiSeries(closes, length)[^1];
+    }
+
+    private static decimal ToRsi(decimal avgGain, decimal avgLoss)
+    {
+        if (avgLoss == 0m)
+            return avgGain == 0m ? 50m : 100m;
+        var rs = avgGain / avgLoss;
+        return 100m - (100m / (1m + rs));
+    }
+
+    /// <summary>
+    /// Pine <c>ta.ema</c>: SMA-seeded exponential moving average.
+    /// Entries before <paramref name="length"/> - 1 are 0 (undefined).
+    /// </summary>
+    public static decimal[] EmaSeries(IReadOnlyList<decimal> values, int length)
+    {
+        if (values is null) throw new ArgumentNullException(nameof(values));
+        if (length <= 0) throw new ArgumentOutOfRangeException(nameof(length));
+
+        var series = new decimal[values.Count];
+        if (values.Count < length)
+            return series;
+
+        decimal seed = 0m;
+        for (var i = 0; i < length; i++)
+            seed += values[i];
+        var ema = seed / length;
+        series[length - 1] = ema;
+
+        var alpha = 2m / (length + 1m);
+        for (var i = length; i < values.Count; i++)
+        {
+            ema = alpha * values[i] + (1m - alpha) * ema;
+            series[i] = ema;
+        }
+
+        return series;
+    }
+
+    /// <summary>Last EMA value, or null when there is not enough history.</summary>
+    public static decimal? Ema(IReadOnlyList<decimal> values, int length)
+    {
+        if (values.Count < length) return null;
+        return EmaSeries(values, length)[^1];
+    }
+}
+
+/// <summary>
+/// How much history a recursive indicator needs before its value stops depending
+/// on where the series happened to start.
+///
+/// Wilder RSI carries its seed forward with weight (1 - 1/length) per bar. With
+/// length 14 the seed still contributes ~22% after 20 bars and ~0.06% only after
+/// ~100 bars. Computing RSI(14) on 20 candles and comparing it to a broker chart
+/// (which runs over its full loaded history) can differ by 10+ RSI points — that
+/// is exactly the "bot says 78, platform says 71" class of bug, and no constant
+/// offset can correct it because the error depends on the seed window.
+/// </summary>
+public static class IndicatorWarmup
+{
+    /// <summary>
+    /// Bars of warmup required before an RSI value is considered chart-accurate.
+    /// (1 - 1/14)^150 ≈ 1.4e-5 — the seed is numerically irrelevant by then.
+    /// </summary>
+    public const int DefaultMinRsiCandles = 150;
+
+    private static int _minRsiCandles = DefaultMinRsiCandles;
+
+    /// <summary>
+    /// Tuning knob for brokers that push shallow history. Lowering it trades chart
+    /// parity for earlier signals: at 60 bars the Wilder seed still contributes ~2%,
+    /// which is roughly a 1–3 point RSI difference from the platform. Set once at
+    /// startup (see appsettings <c>Strategy:MinRsiWarmupCandles</c>); read-only after.
+    /// </summary>
+    public static int MinRsiCandles
+    {
+        get => _minRsiCandles;
+        set => _minRsiCandles = value is >= 20 and <= 500
+            ? value
+            : throw new ArgumentOutOfRangeException(nameof(value), "Warmup must be between 20 and 500 candles.");
+    }
+
+    /// <summary>Warmup multiple applied to any EMA length (EMA200 ⇒ 200 bars minimum).</summary>
+    public const int EmaWarmupMultiplier = 1;
+
+    /// <summary>Minimum closed candles needed to trust <c>RSI(length)</c>.</summary>
+    public static int ForRsi(int length) => Math.Max(MinRsiCandles, length + 1);
+
+    /// <summary>Minimum closed candles needed to trust <c>EMA(length)</c>.</summary>
+    public static int ForEma(int length) => length * EmaWarmupMultiplier + 1;
+}

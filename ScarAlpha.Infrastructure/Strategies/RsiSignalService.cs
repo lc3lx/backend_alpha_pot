@@ -39,41 +39,39 @@ public sealed class RsiSignalService : IRsiSignalService
         };
         ValidateOptions(options);
 
-        // Closed 1m bars only: a bar is closed when its minute has elapsed.
+        // Closed 1m bars only, deduplicated per minute and trimmed to a gap-free tail.
         // Binolla wire EndTimestamp is the last tick, not the period close — never use it
         // to treat the forming minute as a completed 1m candle.
         var periodSeconds = options.TimeframeSeconds;
         var barLength = TimeSpan.FromSeconds(periodSeconds);
-        var ordered = candles
-            .OrderBy(c => c.Timestamp)
-            .GroupBy(c => c.Timestamp.ToUnixTimeSeconds() / periodSeconds)
-            .Select(g => g.Last())
-            .ToList();
-        var closed = ordered
-            .Where(c => c.Timestamp + barLength <= now)
-            .ToList();
+        var prepared = CandleSeries.Prepare(candles, periodSeconds, now);
+        var closed = prepared.Closed;
 
-        // One current candle, a completed expiry window for at least one
-        // historical entry, and enough closes for Wilder RSI.
-        if (closed.Count < options.Period + options.ExpiryCandles + 2)
+        // Wilder RSI is recursive: its value depends on how far back the series starts.
+        // Anything short of the warmup floor produces a number the broker chart does not
+        // agree with, so we emit nothing rather than a wrong RSI.
+        var warmup = Math.Max(
+            IndicatorWarmup.ForRsi(options.Period),
+            options.Period + options.ExpiryCandles + 2);
+        if (closed.Count < warmup)
             throw new ApiException(ApiErrorCodes.ValidationError, "Insufficient closed candles for RSI backtest.");
 
         var currentCandle = closed[^1];
         var closeTime = currentCandle.Timestamp + barLength;
-        var closes = closed.Select(c => c.Close).ToList();
+        var closes = prepared.Closes;
         var currentRsi = _calculator.CalculateRsi(closes, options);
         // Backtest is always ready before the closed RSI gate is consulted.
         var (callBacktest, putBacktest) = RsiZoneBacktest.Evaluate(closes, options);
 
-        var roundedRsi = RsiEntryLevels.AlignToBinolla(
-            Math.Round(currentRsi, 2, MidpointRounding.AwayFromZero));
-        var forming = ordered.LastOrDefault(c => c.Timestamp + barLength > now);
+        // Raw Wilder RSI — no broker "alignment" offset. If this disagrees with the
+        // platform the cause is the input series (warmup/gaps), never a constant.
+        var roundedRsi = Math.Round(currentRsi, 2, MidpointRounding.AwayFromZero);
+        var forming = prepared.Forming;
         var liveCloses = forming is null
             ? closes
             : closes.Concat(new[] { forming.Close }).ToList();
         var liveRsi = liveCloses.Count >= options.Period + 1
-            ? RsiEntryLevels.AlignToBinolla(
-                Math.Round(_calculator.CalculateRsi(liveCloses, options), 2, MidpointRounding.AwayFromZero))
+            ? Math.Round(_calculator.CalculateRsi(liveCloses, options), 2, MidpointRounding.AwayFromZero)
             : roundedRsi;
 
         // Closed RSI is the primary gate. Live/forming RSI is display-only —

@@ -103,7 +103,9 @@ public sealed record BotStartRequest(
     bool SignalConfirmationEnabled = true,
     string RiskLevel = "risk-medium",
     bool NotificationsEnabled = true,
-    IReadOnlyList<string>? Assets = null);
+    IReadOnlyList<string>? Assets = null,
+    /// <summary>Strategy to run: "rsi" (default) or "ema".</summary>
+    string StrategyId = "rsi");
 public sealed record BotApplyRequest(
     string? Asset = null,
     decimal? Amount = null,
@@ -115,7 +117,8 @@ public sealed record BotApplyRequest(
     bool? SignalConfirmationEnabled = null,
     string? RiskLevel = null,
     bool? NotificationsEnabled = null,
-    IReadOnlyList<string>? Assets = null);
+    IReadOnlyList<string>? Assets = null,
+    string? StrategyId = null);
 public sealed record BotRuntimeDto(
     string State,
     string? Asset,
@@ -131,7 +134,8 @@ public sealed record BotRuntimeDto(
     bool NotificationsEnabled,
     IReadOnlyList<string> Assets,
     DateTimeOffset? PnlSessionStartedAt = null,
-    string? StopReason = null);
+    string? StopReason = null,
+    string StrategyId = "rsi");
 
 public sealed record BinollaStatusDto(
     bool Connected,

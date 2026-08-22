@@ -1,5 +1,7 @@
+using ScarAlpha.Application.Abstractions;
 using ScarAlpha.Binolla.Abstractions;
 using ScarAlpha.Binolla.Models;
+using ScarAlpha.Binolla.Protocol;
 using ScarAlpha.Binolla.Session;
 
 namespace ScarAlpha.Binolla.Smoke;
@@ -68,6 +70,9 @@ public static class Program
             var history = await session.GetHistoryAsync(symbol, 60);
             Console.WriteLine($"Candles: {history.Candles.Count}");
 
+            if (args.Any(a => a.Equals("--rsi", StringComparison.OrdinalIgnoreCase)))
+                await ReportRsiParityAsync(session, symbol);
+
             if (placeTrade)
             {
                 Console.WriteLine($"Placing Demo trade on {symbol} amount=1 duration=60...");
@@ -92,6 +97,92 @@ public static class Program
         finally
         {
             await session.DisconnectAsync();
+        }
+    }
+
+    /// <summary>
+    /// Prints everything needed to check the bot's RSI against the Binolla chart.
+    ///
+    /// Compare "RSI(14) closed" below with the RSI the platform draws on the same pair
+    /// at the same minute. They should now agree to ~0.1. The drift table shows why the
+    /// old constant offset could never work: the same last bar yields a different RSI
+    /// depending on how much history you feed it.
+    /// </summary>
+    private static async Task ReportRsiParityAsync(BinollaSession session, string symbol)
+    {
+        var now = DateTimeOffset.UtcNow;
+        Console.WriteLine();
+        Console.WriteLine($"=== RSI parity for {symbol} @ {now:HH:mm:ss} UTC ===");
+
+        var oneMin = await LoadClosedAsync(session, symbol, 60, now);
+        Console.WriteLine($"1m closed+contiguous : {oneMin.Count}  (need {IndicatorWarmup.ForRsi(14)} for chart parity)");
+
+        if (oneMin.Count < 15)
+        {
+            Console.WriteLine("Not enough 1m data to compute RSI.");
+            return;
+        }
+
+        var closes = oneMin.Select(c => c.Close).ToList();
+        var last = oneMin[^1];
+        Console.WriteLine($"last closed bar      : {last.Timestamp:HH:mm} -> {last.Timestamp.AddMinutes(1):HH:mm}  close={last.Close}");
+        Console.WriteLine($"RSI(14) closed       : {Indicators.Rsi(closes, 14):F2}   <-- compare with the platform");
+
+        Console.WriteLine();
+        Console.WriteLine("  drift by history depth (same last bar, different start):");
+        foreach (var depth in new[] { 20, 30, 50, 100, 150, 200, 300 })
+        {
+            if (closes.Count < depth) continue;
+            var slice = closes.Skip(closes.Count - depth).ToList();
+            Console.WriteLine($"    last {depth,3} bars -> RSI {Indicators.Rsi(slice, 14):F2}");
+        }
+
+        Console.WriteLine();
+        var emaFast = Indicators.Ema(closes, 9);
+        var emaSlow = Indicators.Ema(closes, 21);
+        Console.WriteLine($"EMA9 / EMA21         : {emaFast:F5} / {emaSlow:F5}");
+
+        var trend = await LoadClosedAsync(session, symbol, 900, now);
+        var needed = IndicatorWarmup.ForEma(200);
+        Console.WriteLine($"15m closed+contiguous: {trend.Count}  (need {needed} for the EMA200 trend filter)");
+        Console.WriteLine(trend.Count >= needed
+            ? $"  EMA200(15m)        : {Indicators.Ema(trend.Select(c => c.Close).ToList(), 200):F5}  -> trend filter USABLE"
+            : "  -> NOT enough 15m history: set Strategy:EmaUseTrendFilter=false or the EMA strategy will skip every cross.");
+    }
+
+    /// <summary>Fetches one timeframe and reduces it to the gap-free closed series the bot uses.</summary>
+    private static async Task<IReadOnlyList<RsiCandle>> LoadClosedAsync(
+        BinollaSession session,
+        string symbol,
+        int period,
+        DateTimeOffset now)
+    {
+        try
+        {
+            var history = await session.GetHistoryAsync(symbol, period);
+            List<CandlestickData> raw;
+            lock (history.Candles)
+                raw = history.Candles.ToList();
+
+            var span = TimeSpan.FromSeconds(period);
+            var candles = MinuteBars.Normalize(raw, period)
+                .Select(c =>
+                {
+                    var start = DateTimeOffset.FromUnixTimeSeconds(
+                        MinuteBars.BucketStartUnix(c.Timestamp, period));
+                    return new RsiCandle(start, (decimal)c.Close, start + span);
+                })
+                .ToList();
+
+            var prepared = CandleSeries.Prepare(candles, period, now);
+            if (prepared.GapsDropped > 0)
+                Console.WriteLine($"  ({period}s) dropped {prepared.GapsDropped} bars before a time gap");
+            return prepared.Closed;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  ({period}s) history unavailable: {ex.GetType().Name}: {ex.Message}");
+            return Array.Empty<RsiCandle>();
         }
     }
 }

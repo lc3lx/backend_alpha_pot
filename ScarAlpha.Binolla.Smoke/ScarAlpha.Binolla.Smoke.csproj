@@ -10,6 +10,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\ScarAlpha.Binolla\ScarAlpha.Binolla.csproj" />
+    <ProjectReference Include="..\ScarAlpha.Application\ScarAlpha.Application.csproj" />
   </ItemGroup>
 
 </Project>

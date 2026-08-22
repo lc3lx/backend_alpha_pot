@@ -55,9 +55,6 @@ public static class RsiEntryLevels
     public const decimal CallMax = 25m;
     public const decimal PutMin = 75m;
     public const decimal MinSuccessRate = 75m;
-    /// <summary>Put side: 80 → 74. Call side below 26: 20 → 26.</summary>
-    public const decimal BinollaAlignDelta = 6m;
-    public const decimal BinollaCallBoostBelow = 26m;
     /// <summary>Enter in the first seconds after the extreme candle closes. Then wait for a new closed touch.</summary>
     public const int SetupTtlSeconds = 5;
 
@@ -65,16 +62,6 @@ public static class RsiEntryLevels
     public static bool IsCallRsi(decimal rsi) => rsi <= CallMax;
     /// <summary>Put: candle closed at/above 75 (still above the level).</summary>
     public static bool IsPutRsi(decimal rsi) => rsi >= PutMin;
-
-    public static decimal AlignToBinolla(decimal rsi)
-    {
-        var shifted = rsi < BinollaCallBoostBelow
-            ? rsi + BinollaAlignDelta
-            : rsi - BinollaAlignDelta;
-        if (shifted < 0m) return 0m;
-        if (shifted > 100m) return 100m;
-        return shifted;
-    }
 
     public static bool BacktestOk(RsiBacktestStats? backtest) =>
         backtest is { Passed: true, TotalSignals: > 0 } &&

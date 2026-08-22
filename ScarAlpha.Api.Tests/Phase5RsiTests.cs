@@ -13,13 +13,73 @@ public sealed class Phase5RsiTests
     private static readonly DateTimeOffset Now = new(2026, 8, 5, 10, 0, 0, TimeSpan.Zero);
 
     [Fact]
-    public void AlignToBinolla_shifts_80_to_74()
+    public void Rsi_matches_the_reference_wilder_value_with_no_broker_offset()
     {
-        RsiEntryLevels.AlignToBinolla(80m).Should().Be(74m);
-        RsiEntryLevels.AlignToBinolla(5m).Should().Be(11m);
-        RsiEntryLevels.AlignToBinolla(25m).Should().Be(31m);
-        RsiEntryLevels.AlignToBinolla(26m).Should().Be(20m);
-        RsiEntryLevels.AlignToBinolla(100m).Should().Be(94m);
+        // Wilder's own worked example (New Concepts in Technical Trading Systems).
+        // Any constant "alignment" offset would break this.
+        var closes = new[]
+        {
+            44.34m, 44.09m, 44.15m, 43.61m, 44.33m, 44.83m, 45.10m, 45.42m,
+            45.84m, 46.08m, 45.89m, 46.03m, 45.61m, 46.28m, 46.28m, 46.00m,
+            46.03m, 46.41m, 46.22m, 45.64m
+        };
+
+        var rsi = Indicators.Rsi(closes, 14);
+
+        rsi.Should().NotBeNull();
+        Math.Round(rsi!.Value, 3).Should().Be(57.915m);
+
+        // The seeding bar is the textbook ~70.5 first value.
+        var seed = Indicators.RsiSeries(closes, 14)[14];
+        Math.Round(seed, 2).Should().Be(70.46m);
+    }
+
+    [Fact]
+    public void Short_history_and_long_history_disagree_which_is_why_warmup_is_enforced()
+    {
+        // Same tail, different start. Wilder RSI is recursive, so the value drifts
+        // until the seed washes out — this is the real cause of "bot 78 / platform 71",
+        // and it is why no constant offset can fix it.
+        var full = Enumerable.Range(0, 400)
+            .Select(i => 100m + (i % 7) - (i % 5) * 0.5m)
+            .ToList();
+        var truncated = full.Skip(full.Count - 20).ToList();
+
+        var fromFull = Indicators.Rsi(full, 14)!.Value;
+        var fromShort = Indicators.Rsi(truncated, 14)!.Value;
+
+        Math.Abs(fromFull - fromShort).Should().BeGreaterThan(1m);
+
+        // Past the warmup floor the two agree to within a rounding step.
+        var warm = full.Skip(full.Count - IndicatorWarmup.ForRsi(14)).ToList();
+        Math.Abs(fromFull - Indicators.Rsi(warm, 14)!.Value).Should().BeLessThan(0.01m);
+    }
+
+    [Fact]
+    public async Task Below_warmup_floor_emits_no_rsi_instead_of_a_wrong_one()
+    {
+        var service = new RsiSignalService(new RsiCalculator());
+        // Comfortably past the old Period+Expiry+2 floor, still short of chart accuracy.
+        var candles = CreateClosedCandles(WithWarmup(DumpCloses(20), bars: 60));
+
+        var act = () => service.GetSignalAsync(UserId, Asset, candles, RsiStrategyOptions.Default60Seconds, Now);
+        var error = await act.Should().ThrowAsync<ApiException>();
+        error.Which.Code.Should().Be(ApiErrorCodes.ValidationError);
+    }
+
+    [Fact]
+    public async Task Time_gaps_are_trimmed_so_rsi_never_spans_a_missing_minute()
+    {
+        var service = new RsiSignalService(new RsiCalculator());
+        var closes = OversoldWithRespectedBounce();
+        var candles = CreateClosedCandles(closes);
+
+        // Punch a hole 10 bars back: the contiguous tail is then too short to trust.
+        candles.RemoveAt(candles.Count - 10);
+
+        var act = () => service.GetSignalAsync(UserId, Asset, candles, RsiStrategyOptions.Default60Seconds, Now);
+        var error = await act.Should().ThrowAsync<ApiException>();
+        error.Which.Code.Should().Be(ApiErrorCodes.ValidationError);
     }
 
     [Fact]
@@ -49,11 +109,11 @@ public sealed class Phase5RsiTests
     {
         var service = new RsiSignalService(new RsiCalculator());
         var options = RsiStrategyOptions.Default60Seconds with { MinimumSuccessRate = 0m };
-        var candles = CreateClosedCandles(DumpCloses(26));
+        var candles = CreateClosedCandles(DumpCloses(200));
 
         var signal = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
 
-        signal.Rsi.Should().Be(RsiEntryLevels.AlignToBinolla(0m));
+        signal.Rsi.Should().Be(0m);
         signal.Signal.Should().Be("None");
         signal.Backtest.Should().NotBeNull();
         signal.Backtest!.Passed.Should().BeFalse();
@@ -65,11 +125,11 @@ public sealed class Phase5RsiTests
     {
         var service = new RsiSignalService(new RsiCalculator());
         var options = RsiStrategyOptions.Default60Seconds with { MinimumSuccessRate = 0m };
-        var candles = CreateClosedCandles(RallyCloses(26));
+        var candles = CreateClosedCandles(RallyCloses(200));
 
         var signal = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
 
-        signal.Rsi.Should().Be(RsiEntryLevels.AlignToBinolla(100m));
+        signal.Rsi.Should().Be(100m);
         signal.Signal.Should().Be("None");
         signal.Backtest!.Passed.Should().BeFalse();
         signal.Backtest.TotalSignals.Should().Be(0);
@@ -79,7 +139,7 @@ public sealed class Phase5RsiTests
     public async Task Failed_historical_filter_suppresses_the_current_signal()
     {
         var service = new RsiSignalService(new RsiCalculator());
-        var candles = CreateClosedCandles(DumpCloses(26));
+        var candles = CreateClosedCandles(DumpCloses(200));
 
         var signal = await service.GetSignalAsync(UserId, Asset, candles, RsiStrategyOptions.Default60Seconds, Now);
 
@@ -220,7 +280,7 @@ public sealed class Phase5RsiTests
         respected.Signal.Should().Be("Call");
 
         var dump = await service.GetSignalAsync(
-            UserId, Asset, CreateClosedCandles(DumpCloses(26)),
+            UserId, Asset, CreateClosedCandles(DumpCloses(200)),
             RsiStrategyOptions.Default60Seconds, Now);
         dump.Backtest!.Passed.Should().BeFalse();
         dump.Signal.Should().Be("None");
@@ -233,12 +293,12 @@ public sealed class Phase5RsiTests
         var service = new RsiSignalService(new RsiCalculator());
         var options = RsiStrategyOptions.Default60Seconds with { MinimumSuccessRate = 0m };
         // Flat series → RSI 50, between 25 and 75.
-        var candles = CreateClosedCandles(Enumerable.Repeat(100m, 40).ToList());
+        var candles = CreateClosedCandles(Enumerable.Repeat(100m, 220).ToList());
 
         var signal = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
 
         signal.Signal.Should().Be("None");
-        signal.Rsi.Should().Be(RsiEntryLevels.AlignToBinolla(50m));
+        signal.Rsi.Should().Be(50m);
         signal.Backtest.Should().NotBeNull();
         signal.Backtest!.LookbackCandles.Should().Be(200);
     }
@@ -262,7 +322,7 @@ public sealed class Phase5RsiTests
     public async Task Below_minimum_success_rate_emits_none()
     {
         var service = new RsiSignalService(new RsiCalculator());
-        var candles = CreateClosedCandles(DumpCloses(26));
+        var candles = CreateClosedCandles(DumpCloses(200));
         var options = RsiStrategyOptions.Default60Seconds with { MinimumSuccessRate = 75m };
 
         var signal = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
@@ -326,7 +386,7 @@ public sealed class Phase5RsiTests
         var service = new RsiSignalService(new RsiCalculator());
         var options = RsiStrategyOptions.Default60Seconds;
         var oversold = CreateClosedCandles(OversoldWithRespectedBounce());
-        var mid = CreateClosedCandles(Enumerable.Repeat(100m, 40).ToList());
+        var mid = CreateClosedCandles(Enumerable.Repeat(100m, 220).ToList());
 
         var first = await service.GetSignalAsync(UserId, Asset, oversold, options, Now);
         first.Signal.Should().Be("Call");
@@ -443,38 +503,55 @@ public sealed class Phase5RsiTests
         error.Which.Code.Should().Be(ApiErrorCodes.ValidationError);
     }
 
+    /// <summary>Bars of neutral history prepended so RSI is past <see cref="IndicatorWarmup"/>.</summary>
+    private const int WarmupBars = 170;
+
+    /// <summary>
+    /// Wilder RSI is recursive, so a fixture must carry the same warmup the live path
+    /// requires. A tight zigzag holds pre-pattern RSI at 50 (no zone visits, so the
+    /// backtest still only counts the pattern below) and lets the pattern drive the extreme.
+    /// </summary>
+    private static List<decimal> WithWarmup(List<decimal> pattern, int bars = WarmupBars)
+    {
+        var anchor = pattern[0];
+        var series = new List<decimal>(bars + pattern.Count);
+        for (var i = 0; i < bars; i++)
+            series.Add(anchor + (i % 2 == 0 ? 0.5m : -0.5m));
+        series.AddRange(pattern);
+        return series;
+    }
+
     private static List<decimal> DumpCloses(int n) =>
-        Enumerable.Range(0, n).Select(i => 100m - i).ToList();
+        Enumerable.Range(0, n).Select(i => 500m - i).ToList();
 
     private static List<decimal> RallyCloses(int n) =>
         Enumerable.Range(0, n).Select(i => 100m + i).ToList();
 
-    /// <summary>Touch RSI 25, bounce out of the zone, then return to oversold.</summary>
+    /// <summary>
+    /// Dip that crosses 25 on the last down bar, bounces back out ABOVE the touch
+    /// price (so the zone counts as respected), then slides back into oversold for
+    /// the current bar. Yields exactly one winning call visit and no put visits.
+    /// </summary>
     private static List<decimal> OversoldWithRespectedBounce()
     {
-        var closes = new List<decimal>();
-        for (var i = 0; i < 16; i++)
-            closes.Add(80m - i * 3);
-        for (var i = 1; i <= 12; i++)
-            closes.Add(35m + i * 5);
-        for (var i = 1; i <= 16; i++)
-            closes.Add(95m - i * 4);
-        for (var i = 1; i <= 8; i++)
-            closes.Add(closes[^1] - 6m);
-        return closes;
+        var closes = new List<decimal> { 100m };
+        for (var i = 0; i < 3; i++) closes.Add(closes[^1] - 6m);   // touch 25
+        for (var i = 0; i < 6; i++) closes.Add(closes[^1] + 5m);   // bounce out, higher
+        for (var i = 0; i < 8; i++) closes.Add(closes[^1] - 8m);   // back into the zone
+        return WithWarmup(closes);
     }
 
-    /// <summary>Touch RSI 75, drop out of the zone, then return to overbought.</summary>
+    /// <summary>
+    /// Mirror of <see cref="OversoldWithRespectedBounce"/>: crosses 75, drops back out
+    /// BELOW the touch price, then rallies. One winning put visit, no call visits.
+    /// </summary>
     private static List<decimal> OverboughtWithRespectedDrop()
     {
-        var closes = new List<decimal>();
-        for (var i = 0; i < 16; i++)
-            closes.Add(20m + i * 3);
-        for (var i = 1; i <= 12; i++)
-            closes.Add(65m - i * 5);
-        for (var i = 1; i <= 16; i++)
-            closes.Add(5m + i * 4);
-        return closes;
+        var closes = new List<decimal> { 100m };
+        for (var i = 0; i < 3; i++) closes.Add(closes[^1] + 6m);   // touch 75
+        for (var i = 0; i < 6; i++) closes.Add(closes[^1] - 5m);   // drop out, lower
+        for (var i = 0; i < 6; i++) closes.Add(closes[^1] + 8m);   // rally back up
+        return WithWarmup(closes);
     }
 
     private static List<RsiCandle> CreateCandles(List<decimal> closes, int? openLastIndex = null)

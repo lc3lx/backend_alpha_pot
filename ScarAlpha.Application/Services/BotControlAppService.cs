@@ -37,7 +37,8 @@ public sealed class BotControlAppService
             request.AutoStopAtLoss,
             request.SignalConfirmationEnabled,
             request.RiskLevel,
-            request.NotificationsEnabled));
+            request.NotificationsEnabled,
+            request.StrategyId));
     }
 
     public BotRuntimeDto Pause() => Map(_runtime.Pause(_currentUser.UserId));
@@ -56,7 +57,8 @@ public sealed class BotControlAppService
             request.SignalConfirmationEnabled,
             request.RiskLevel,
             request.NotificationsEnabled,
-            request.Assets));
+            request.Assets,
+            request.StrategyId));
 
     private static BotRuntimeDto Map(BotRuntimeConfig value) =>
         new(
@@ -74,5 +76,6 @@ public sealed class BotControlAppService
             value.NotificationsEnabled,
             value.ResolvedAssets,
             value.PnlSessionStartedAt,
-            value.StopReason);
+            value.StopReason,
+            value.StrategyId);
 }
