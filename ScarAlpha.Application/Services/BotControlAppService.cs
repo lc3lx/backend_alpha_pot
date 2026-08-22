@@ -9,12 +9,37 @@ public sealed class BotControlAppService
     private readonly ICurrentUser _currentUser;
     private readonly IBotRuntimeService _runtime;
     private readonly IBotAccessService _access;
+    private readonly IStrategyRegistry _strategies;
 
-    public BotControlAppService(ICurrentUser currentUser, IBotRuntimeService runtime, IBotAccessService access)
+    public BotControlAppService(
+        ICurrentUser currentUser,
+        IBotRuntimeService runtime,
+        IBotAccessService access,
+        IStrategyRegistry strategies)
     {
         _currentUser = currentUser;
         _runtime = runtime;
         _access = access;
+        _strategies = strategies;
+    }
+
+    /// <summary>
+    /// Rejects unknown or not-yet-released strategies instead of quietly falling back to
+    /// RSI — running a different strategy than the one you asked for is worse than an error.
+    /// </summary>
+    private string RequireRunnableStrategy(string? strategyId)
+    {
+        if (string.IsNullOrWhiteSpace(strategyId))
+            return "rsi";
+
+        var id = strategyId.Trim();
+        var info = _strategies.Get(id);
+        if (info is null)
+            throw new ApiException(ApiErrorCodes.ValidationError, $"Unknown strategy '{id}'.");
+        if (!info.Enabled || info.Status != StrategyCatalogStatus.Active)
+            throw new ApiException(ApiErrorCodes.ValidationError, $"Strategy '{info.Name}' is not available yet.");
+
+        return info.Id;
     }
 
     public BotRuntimeDto Get() => Map(_runtime.Get(_currentUser.UserId));
@@ -38,7 +63,7 @@ public sealed class BotControlAppService
             request.SignalConfirmationEnabled,
             request.RiskLevel,
             request.NotificationsEnabled,
-            request.StrategyId));
+            RequireRunnableStrategy(request.StrategyId)));
     }
 
     public BotRuntimeDto Pause() => Map(_runtime.Pause(_currentUser.UserId));
@@ -58,7 +83,7 @@ public sealed class BotControlAppService
             request.RiskLevel,
             request.NotificationsEnabled,
             request.Assets,
-            request.StrategyId));
+            request.StrategyId is null ? null : RequireRunnableStrategy(request.StrategyId)));
 
     private static BotRuntimeDto Map(BotRuntimeConfig value) =>
         new(

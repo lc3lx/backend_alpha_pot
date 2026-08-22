@@ -94,6 +94,7 @@ public static class DependencyInjection
         services.AddSingleton<IEmaRsiSignalService, EmaRsiSignalService>();
         // Shared across all users: one analysis per pair per closed bar.
         services.AddSingleton<MarketAnalysisCache>();
+        services.AddSingleton<EmaRsiTradeTracker>();
 
         var binollaOptions = new BinollaSessionManagerOptions
         {

@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using ScarAlpha.Application.Common;
 using ScarAlpha.Application.Abstractions;
 using ScarAlpha.Application.Contracts;
 using ScarAlpha.Application.Services;
@@ -210,9 +211,22 @@ public static class StrategyEndpoints
     {
         var group = app.MapGroup("/api/strategies").WithTags("Strategies").RequireAuthorization();
         group.MapGet("/", (StrategyAppService svc) => Results.Ok(svc.ListStrategies()));
+
+        // Live equivalent of the Pine corner table for the EMA 9/21 + RSI strategy.
+        group.MapGet("/ema/stats", (EmaRsiTradeTracker tracker, ICurrentUser user) =>
+            Results.Ok(tracker.GetStats(user.UserId)));
+        group.MapPost("/ema/stats/reset", (EmaRsiTradeTracker tracker, ICurrentUser user) =>
+        {
+            tracker.Reset(user.UserId);
+            return Results.Ok(tracker.GetStats(user.UserId));
+        });
+        // Kept at the historical /rsi/ path the Mini App already polls, but it now
+        // evaluates whichever strategy the bot is configured for.
         group.MapGet("/rsi/signal/{asset}", async (
             string asset,
             RsiSignalAppService svc,
+            IBotRuntimeService botRuntime,
+            ICurrentUser currentUser,
             CancellationToken ct,
             [FromQuery] int period = 60,
             [FromQuery] int rsiLength = 14,
@@ -232,7 +246,9 @@ public static class StrategyEndpoints
                 BacktestCandleCount: backtestCandles,
                 ExpiryCandles: expiryCandles,
                 MinimumSuccessRate: minimumSuccessRate);
-            return Results.Ok(await svc.GetSignalAsync(asset, period, options, autoExecute, ct));
+            var strategyId = botRuntime.Get(currentUser.UserId).StrategyId;
+            return Results.Ok(await svc.GetSignalAsync(
+                asset, period, options, autoExecute, ct, strategyId: strategyId));
         });
         return group;
     }

@@ -27,6 +27,8 @@ public sealed record EmaRsiOptions(
     int TimeframeSeconds = 60,
     /// <summary>Pine: tradeDurationBars — bars held, i.e. the option expiry in minutes.</summary>
     int ExpiryCandles = 5,
+    /// <summary>Pine: checkpointBars — early "is it winning yet?" probe after N bars.</summary>
+    int CheckpointBars = 2,
     /// <summary>Pine: useTrend — require the higher-timeframe EMA200 to agree.</summary>
     bool UseTrendFilter = true,
     /// <summary>Pine: htfTF — trend timeframe, default 15m.</summary>

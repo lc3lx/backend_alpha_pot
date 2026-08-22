@@ -19,6 +19,7 @@ public sealed class RsiSignalAppService
     private readonly IRsiSignalService _signalService;
     private readonly IEmaRsiSignalService _emaSignalService;
     private readonly MarketAnalysisCache _analysisCache;
+    private readonly EmaRsiTradeTracker _emaTracker;
     private readonly IBinollaSessionRestorer _restorer;
     private readonly IMarketingDemoService _demo;
     private readonly TradeAppService _trades;
@@ -33,6 +34,7 @@ public sealed class RsiSignalAppService
         IRsiSignalService signalService,
         IEmaRsiSignalService emaSignalService,
         MarketAnalysisCache analysisCache,
+        EmaRsiTradeTracker emaTracker,
         IBinollaSessionRestorer restorer,
         IMarketingDemoService demo,
         TradeAppService trades,
@@ -46,6 +48,7 @@ public sealed class RsiSignalAppService
         _signalService = signalService;
         _emaSignalService = emaSignalService;
         _analysisCache = analysisCache;
+        _emaTracker = emaTracker;
         _restorer = restorer;
         _demo = demo;
         _trades = trades;
@@ -147,6 +150,9 @@ public sealed class RsiSignalAppService
             var candles = analysis.ClosedCandles.ToList();
             if (candles.Count == 0)
                 return SoftNone(symbol, wirePeriod);
+
+            // Pine's checkpoint + win/loss counters, advanced on the closed series.
+            _emaTracker.Resolve(_currentUser.UserId, symbol, analysis.ClosedCandles, wirePeriod);
 
             if (await IsAnalysisPausedAsync(ct))
             {
@@ -419,6 +425,12 @@ public sealed class RsiSignalAppService
         if (bot.State != BotRunState.Running)
             return signal;
 
+        // Only the strategy the user selected may trade. The Mini App polls the RSI
+        // endpoint directly, so without this a bot configured for EMA could still have
+        // an RSI setup placed underneath it.
+        if (IsEma(bot.StrategyId) != IsEma(signal.StrategyId))
+            return signal with { AutomationError = "STRATEGY_MISMATCH", Signal = "None" };
+
         var nowGate = DateTimeOffset.UtcNow;
         if (!StrategyGate.TryValidateForTrade(signal, nowGate, out var rejectCode))
         {
@@ -562,6 +574,23 @@ public sealed class RsiSignalAppService
                 {
                     _emaSignalService.MarkSignalEmitted(
                         userId, signal.Asset, options.TimeframeSeconds, signal.CandleTime);
+
+                    // Pine scores from the close of the signal bar, which is where we entered.
+                    var entryClose = _analysisCache
+                        .TryGet(signal.Asset, options.TimeframeSeconds, DateTimeOffset.UtcNow)?
+                        .ClosedCandles[^1].Close;
+                    if (entryClose is decimal price)
+                    {
+                        _emaTracker.RecordEntry(
+                            userId,
+                            signal.Asset,
+                            signal.Signal,
+                            price,
+                            signal.CandleTime,
+                            checkpointBars: EmaRsiOptions.Default.CheckpointBars,
+                            durationBars: expiryCandles,
+                            timeframeSeconds: options.TimeframeSeconds);
+                    }
                 }
                 else
                 {
