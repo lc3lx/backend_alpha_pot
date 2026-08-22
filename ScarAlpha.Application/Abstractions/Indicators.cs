@@ -148,4 +148,14 @@ public static class IndicatorWarmup
 
     /// <summary>Minimum closed candles needed to trust <c>EMA(length)</c>.</summary>
     public static int ForEma(int length) => length * EmaWarmupMultiplier + 1;
+
+    /// <summary>Minimum closed candles needed to trust <c>ATR(length)</c>.</summary>
+    public static int ForAtr(int length) => Math.Max(MinRsiCandles, length + 1);
+
+    /// <summary>
+    /// Minimum closed candles needed to trust <c>ADX(length)</c>. ADX smooths twice, so
+    /// it needs about double — still under the RSI floor, which means regime detection
+    /// costs no extra history at all.
+    /// </summary>
+    public static int ForAdx(int length) => Math.Max(MinRsiCandles, 2 * length + 1);
 }

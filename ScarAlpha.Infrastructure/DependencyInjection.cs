@@ -90,6 +90,17 @@ public static class DependencyInjection
         if (emaTrend is bool t)
             RsiSignalAppService.EmaTrendFilterEnabled = t;
 
+        // Regime filtering. Off keeps the pre-regime behaviour exactly.
+        StrategyGate.RegimeEnabled = configuration.GetValue("Strategy:Regime:Enabled", false);
+
+        // Entry levels are tunable so they can be rolled back without a rebuild.
+        var callMax = configuration.GetValue<decimal?>("Strategy:RsiCallMax");
+        if (callMax is decimal cm) RsiEntryLevels.CallMax = cm;
+        var putMin = configuration.GetValue<decimal?>("Strategy:RsiPutMin");
+        if (putMin is decimal pm) RsiEntryLevels.PutMin = pm;
+        var minVisits = configuration.GetValue<int?>("Strategy:MinZoneVisits");
+        if (minVisits is int mv) RsiEntryLevels.MinZoneVisits = mv;
+
         services.AddSingleton<IRsiSignalService, RsiSignalService>();
         services.AddSingleton<IEmaRsiSignalService, EmaRsiSignalService>();
         // Shared across all users: one analysis per pair per closed bar.

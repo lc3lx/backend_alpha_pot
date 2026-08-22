@@ -44,27 +44,67 @@ public sealed record RsiStrategyOptions(
 
 /// <summary>
 /// Entry order (strict) — candle-close confirmation:
-/// 1) Wait for the 1m candle that touched 25/75 to CLOSE.
-/// 2) Put only if closed RSI stayed above 75; Call only if closed RSI stayed below 25.
-///    If it closed back under 75 / above 25 → no entry.
+/// 1) Wait for the 1m candle that touched the entry level to CLOSE.
+/// 2) Put only if closed RSI stayed at/above <see cref="PutMin"/>; Call only if it
+///    stayed at/below <see cref="CallMax"/>. Closing back inside the range → no entry.
 /// 3) Backtest has ZERO entry value until step 2 is true, then must Pass (≥ 75%).
 /// 4) Setup must still be within <see cref="SetupTtlSeconds"/> of that candle's close.
 /// </summary>
 public static class RsiEntryLevels
 {
-    public const decimal CallMax = 25m;
-    public const decimal PutMin = 75m;
+    private static decimal _callMax = 20m;
+    private static decimal _putMin = 80m;
+    private static int _minZoneVisits = 2;
+
+    /// <summary>
+    /// Call entry ceiling — RSI must close at or below this. Configurable
+    /// (<c>Strategy:RsiCallMax</c>) because tightening the levels is the change most
+    /// likely to need rolling back under live observation.
+    /// </summary>
+    public static decimal CallMax
+    {
+        get => _callMax;
+        set => _callMax = value is >= 5m and <= 45m
+            ? value
+            : throw new ArgumentOutOfRangeException(nameof(value), "Call level must be between 5 and 45.");
+    }
+
+    /// <summary>Put entry floor — RSI must close at or above this (<c>Strategy:RsiPutMin</c>).</summary>
+    public static decimal PutMin
+    {
+        get => _putMin;
+        set => _putMin = value is >= 55m and <= 95m
+            ? value
+            : throw new ArgumentOutOfRangeException(nameof(value), "Put level must be between 55 and 95.");
+    }
+
+    /// <summary>
+    /// Zone visits the backtest must have seen before its success rate means anything.
+    ///
+    /// <para>At 20/80 a 200-bar window often contains only one visit, and a single lucky
+    /// visit scores 100% — which would make the backtest filter stop filtering exactly
+    /// when the levels got stricter.</para>
+    /// </summary>
+    public static int MinZoneVisits
+    {
+        get => _minZoneVisits;
+        set => _minZoneVisits = value is >= 1 and <= 20
+            ? value
+            : throw new ArgumentOutOfRangeException(nameof(value), "Minimum zone visits must be between 1 and 20.");
+    }
+
     public const decimal MinSuccessRate = 75m;
     /// <summary>Enter in the first seconds after the extreme candle closes. Then wait for a new closed touch.</summary>
     public const int SetupTtlSeconds = 5;
 
-    /// <summary>Call: candle closed at/below 25 (still under the level).</summary>
+    /// <summary>Call: candle closed at/below the entry level.</summary>
     public static bool IsCallRsi(decimal rsi) => rsi <= CallMax;
-    /// <summary>Put: candle closed at/above 75 (still above the level).</summary>
+    /// <summary>Put: candle closed at/above the entry level.</summary>
     public static bool IsPutRsi(decimal rsi) => rsi >= PutMin;
 
     public static bool BacktestOk(RsiBacktestStats? backtest) =>
-        backtest is { Passed: true, TotalSignals: > 0 } &&
+        backtest is { Passed: true } &&
+        backtest.TotalSignals >= MinZoneVisits &&
         backtest.SuccessRate >= MinSuccessRate &&
         backtest.SuccessRate >= backtest.MinimumSuccessRate;
 
@@ -178,10 +218,32 @@ public static class RsiEntryLevels
     }
 }
 
+/// <summary>
+/// One bar as the strategy layer sees it.
+///
+/// <para>Close is always real. High/Low/Open/Volume are optional because not every bar
+/// has them: a bar synthesised from a single live quote has no true range, and Binolla
+/// only sends volume on wide enough history rows (never on forming bars). Indicators
+/// that need a range must go through <see cref="HasRange"/> rather than assuming.</para>
+/// </summary>
 public sealed record RsiCandle(
     DateTimeOffset Timestamp,
     decimal Close,
-    DateTimeOffset? EndTimestamp);
+    DateTimeOffset? EndTimestamp,
+    decimal? High = null,
+    decimal? Low = null,
+    decimal? Open = null,
+    decimal? Volume = null)
+{
+    /// <summary>True when this bar carries a real high/low, not just a close.</summary>
+    public bool HasRange => High is not null && Low is not null;
+
+    /// <summary>High, or the close when the bar carries no range.</summary>
+    public decimal HighOrClose => High ?? Close;
+
+    /// <summary>Low, or the close when the bar carries no range.</summary>
+    public decimal LowOrClose => Low ?? Close;
+}
 
 public sealed record RsiBacktestStats(
     int TotalSignals,
@@ -204,7 +266,18 @@ public sealed record StrategySignal(
     RsiBacktestStats? Backtest = null,
     string? AutomatedTradeId = null,
     string? AutomationError = null,
-    decimal? LiveRsi = null);
+    decimal? LiveRsi = null,
+    /// <summary>
+    /// Market regime this signal was produced in. <see cref="MarketRegime.Unclear"/>
+    /// when regime detection is off, which is why <see cref="RegimeApplied"/> exists —
+    /// "not measured" and "measured as unclear" must not look the same.
+    /// </summary>
+    MarketRegime Regime = MarketRegime.Unclear,
+    string? RegimeReason = null,
+    /// <summary>True when the regime filter was actually evaluated for this signal.</summary>
+    bool RegimeApplied = false,
+    decimal? RelativeVolume = null,
+    bool VolumeOk = true);
 
 public interface IRsiCalculator
 {

@@ -139,7 +139,9 @@ public sealed record MarketAnalysis(
     decimal Rsi,
     /// <summary>Null on higher-timeframe entries, which exist only to carry closes.</summary>
     RsiBacktestStats? CallBacktest,
-    RsiBacktestStats? PutBacktest)
+    RsiBacktestStats? PutBacktest,
+    /// <summary>Market regime for this bar. Null on higher-timeframe entries.</summary>
+    RegimeSnapshot? Regime = null)
 {
     public int CandleCount => Closes.Count;
 }

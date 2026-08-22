@@ -255,8 +255,13 @@ public sealed class BotRuntimeService : IBotRuntimeService
     }
 
     /// <summary>Unknown ids fall back to the always-available RSI strategy.</summary>
-    internal static string NormalizeStrategy(string? strategyId) =>
-        string.Equals(strategyId?.Trim(), "ema", StringComparison.OrdinalIgnoreCase) ? "ema" : "rsi";
+    internal static string NormalizeStrategy(string? strategyId)
+    {
+        var id = strategyId?.Trim();
+        if (string.Equals(id, "ema", StringComparison.OrdinalIgnoreCase)) return "ema";
+        if (string.Equals(id, "smart", StringComparison.OrdinalIgnoreCase)) return "smart";
+        return "rsi";
+    }
 
     public sealed record StoredBotRuntime(
         string State,

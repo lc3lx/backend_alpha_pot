@@ -198,7 +198,7 @@ public sealed class Phase5RsiTests
     }
 
     [Fact]
-    public async Task Closed_above_25_after_oversold_touch_does_not_enter_call()
+    public async Task Closed_above_the_call_level_after_a_touch_does_not_enter()
     {
         var service = new RsiSignalService(new RsiCalculator());
         var closes = OversoldWithRespectedBounce();
@@ -304,7 +304,7 @@ public sealed class Phase5RsiTests
     }
 
     [Fact]
-    public async Task Backtest_alone_does_not_enter_when_closed_rsi_is_between_25_and_75()
+    public async Task Backtest_alone_does_not_enter_when_closed_rsi_is_mid_range()
     {
         var service = new RsiSignalService(new RsiCalculator());
         var closes = OversoldWithRespectedBounce();
@@ -430,7 +430,7 @@ public sealed class Phase5RsiTests
     }
 
     [Fact]
-    public async Task Put_does_not_enter_when_closed_rsi_is_below_75()
+    public async Task Put_does_not_enter_when_closed_rsi_is_below_the_put_level()
     {
         var service = new RsiSignalService(new RsiCalculator());
         var closes = OverboughtWithRespectedDrop();
@@ -534,10 +534,16 @@ public sealed class Phase5RsiTests
     /// </summary>
     private static List<decimal> OversoldWithRespectedBounce()
     {
+        // Two respected dips, because BacktestOk now demands more than a single lucky
+        // visit — at RSI 20 a 200-bar window rarely contains more than one.
         var closes = new List<decimal> { 100m };
-        for (var i = 0; i < 3; i++) closes.Add(closes[^1] - 6m);   // touch 25
-        for (var i = 0; i < 6; i++) closes.Add(closes[^1] + 5m);   // bounce out, higher
-        for (var i = 0; i < 8; i++) closes.Add(closes[^1] - 8m);   // back into the zone
+        for (var visit = 0; visit < 2; visit++)
+        {
+            for (var i = 0; i < 3; i++) closes.Add(closes[^1] - 6m);   // dip through the level
+            closes.Add(closes[^1] + 4m);                              // bounce out, above the touch
+        }
+
+        for (var i = 0; i < 6; i++) closes.Add(closes[^1] - 8m);       // close back inside
         return WithWarmup(closes);
     }
 
@@ -548,9 +554,13 @@ public sealed class Phase5RsiTests
     private static List<decimal> OverboughtWithRespectedDrop()
     {
         var closes = new List<decimal> { 100m };
-        for (var i = 0; i < 3; i++) closes.Add(closes[^1] + 6m);   // touch 75
-        for (var i = 0; i < 6; i++) closes.Add(closes[^1] - 5m);   // drop out, lower
-        for (var i = 0; i < 6; i++) closes.Add(closes[^1] + 8m);   // rally back up
+        for (var visit = 0; visit < 2; visit++)
+        {
+            for (var i = 0; i < 3; i++) closes.Add(closes[^1] + 6m);   // push through the level
+            closes.Add(closes[^1] - 4m);                              // drop out, below the touch
+        }
+
+        for (var i = 0; i < 6; i++) closes.Add(closes[^1] + 8m);       // close back inside
         return WithWarmup(closes);
     }
 

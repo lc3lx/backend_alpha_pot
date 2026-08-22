@@ -221,7 +221,9 @@ public sealed class BotSignalWorker : IHostedService
                         else if (signal.Signal is not ("Call" or "Put"))
                             Interlocked.Increment(ref softNone);
 
-                        if (!IsLiveSetup(signal))
+                        // Gate BEFORE MarkUserHeld below — a rejection after the hold
+                        // would freeze this user for a whole trade duration.
+                        if (!IsLiveSetup(signal, bot.StrategyId))
                             return;
 
                         bag.Add((asset, signal));
@@ -355,8 +357,14 @@ public sealed class BotSignalWorker : IHostedService
         return blockers.Count > 0;
     }
 
-    private static bool IsLiveSetup(StrategySignal signal) =>
-        StrategyGate.TryValidateForTrade(signal, DateTimeOffset.UtcNow, out _);
+    private static bool IsLiveSetup(StrategySignal signal, string? botStrategyId = null) =>
+        StrategyGate.TryValidateForTrade(
+            signal,
+            DateTimeOffset.UtcNow,
+            botStrategyId,
+            // The signal already carries its regime; the gate rehydrates from it.
+            regime: null,
+            out _);
 
     private static (string Asset, StrategySignal Signal)? PickBest(
         List<(string Asset, StrategySignal Signal)> signals)

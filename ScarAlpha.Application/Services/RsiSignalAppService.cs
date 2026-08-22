@@ -182,10 +182,28 @@ public sealed class RsiSignalAppService
                 return SoftNone(symbol, wirePeriod);
             }
 
+            // When regime is on it already establishes the trend from the 1m series, so
+            // the Pine 15m EMA200 filter is redundant — and dropping it removes a second
+            // subscription per pair plus the TREND_UNKNOWN failure mode entirely.
             var emaOptions = EmaRsiOptions.FromBotDurationSeconds(options.ExpiryCandles * 60)
-                with { UseTrendFilter = EmaTrendFilterEnabled };
+                with { UseTrendFilter = EmaTrendFilterEnabled && !StrategyGate.RegimeEnabled };
 
-            var signal = IsEma(strategyId)
+            // Smart mode hands engine choice to the regime; an explicit choice is kept.
+            var engineId = RegimeRouting.IsSmart(strategyId)
+                ? RegimeRouting.EngineFor(analysis.Regime?.Regime ?? MarketRegime.Unclear)
+                : strategyId;
+            if (engineId is null)
+            {
+                return SoftNone(symbol, wirePeriod) with
+                {
+                    AutomationError = RegimeRouting.RejectUnclear,
+                    Regime = analysis.Regime?.Regime ?? MarketRegime.Unclear,
+                    RegimeReason = analysis.Regime?.Reason,
+                    RegimeApplied = analysis.Regime is not null,
+                };
+            }
+
+            var signal = IsEma(engineId)
                 ? await _emaSignalService.GetSignalAsync(
                     userId: _currentUser.UserId,
                     asset: symbol,
@@ -204,7 +222,17 @@ public sealed class RsiSignalAppService
                     options: options,
                     now: now,
                     ct: ct);
-            return await ExecuteIfRequestedAsync(signal, options, autoExecute, ct);
+
+            signal = signal with
+            {
+                Regime = analysis.Regime?.Regime ?? MarketRegime.Unclear,
+                RegimeReason = analysis.Regime?.Reason,
+                RegimeApplied = analysis.Regime is not null,
+                RelativeVolume = analysis.Regime?.RelativeVolume,
+                VolumeOk = analysis.Regime?.VolumeOk ?? true,
+            };
+
+            return await ExecuteIfRequestedAsync(signal, options, autoExecute, ct, analysis.Regime);
         }
         catch (BinollaAuthenticationException)
         {
@@ -283,7 +311,7 @@ public sealed class RsiSignalAppService
                     {
                         var start = DateTimeOffset.FromUnixTimeSeconds(
                             MinuteBars.BucketStartUnix(c.Timestamp, tf));
-                        return new RsiCandle(start, (decimal)c.Close, start + period);
+                        return ToCandle(c, start, period);
                     })
                     .ToList();
 
@@ -328,6 +356,21 @@ public sealed class RsiSignalAppService
         }
     }
 
+    /// <summary>
+    /// Full bar for the strategy layer: range and volume are carried through so ATR/ADX
+    /// and the volume filter have something to work with. Volume stays null whenever
+    /// Binolla did not send it — the filter treats that as "not available", not as zero.
+    /// </summary>
+    private static RsiCandle ToCandle(CandlestickData c, DateTimeOffset start, TimeSpan period) =>
+        new(
+            Timestamp: start,
+            Close: (decimal)c.Close,
+            EndTimestamp: start + period,
+            High: (decimal)c.High,
+            Low: (decimal)c.Low,
+            Open: (decimal)c.Open,
+            Volume: c.Volume is double v ? (decimal)v : null);
+
     internal static bool IsEma(string? strategyId) =>
         string.Equals(strategyId?.Trim(), "ema", StringComparison.OrdinalIgnoreCase);
 
@@ -360,7 +403,7 @@ public sealed class RsiSignalAppService
                     var start = DateTimeOffset.FromUnixTimeSeconds(
                         MinuteBars.BucketStartUnix(c.Timestamp, wirePeriod));
                     // Period end, never Binolla's last-tick EndTimestamp.
-                    return new RsiCandle(start, (decimal)c.Close, start + period);
+                    return ToCandle(c, start, period);
                 })
                 .ToList();
 
@@ -392,6 +435,8 @@ public sealed class RsiSignalAppService
             var rsi = Math.Round(
                 Indicators.Rsi(closes, options.Period)!.Value, 2, MidpointRounding.AwayFromZero);
             var (call, put) = RsiZoneBacktest.Evaluate(closes, options);
+            // Same closed series, so every account sees the same regime for this bar.
+            var regime = MarketRegimeClassifier.Analyze(prepared.Closed, MarketRegimeOptions.Default);
 
             return new MarketAnalysis(
                 Asset: symbol,
@@ -401,7 +446,8 @@ public sealed class RsiSignalAppService
                 Closes: closes,
                 Rsi: rsi,
                 CallBacktest: call,
-                PutBacktest: put);
+                PutBacktest: put,
+                Regime: regime);
         }, ct);
 
     private static StrategySignal SoftNone(string symbol, int periodSeconds) =>
@@ -417,7 +463,8 @@ public sealed class RsiSignalAppService
         StrategySignal signal,
         RsiStrategyOptions options,
         bool autoExecute,
-        CancellationToken ct)
+        CancellationToken ct,
+        RegimeSnapshot? regime = null)
     {
         var userId = _currentUser.UserId;
         var bot = _botRuntime.Get(userId);
@@ -428,11 +475,14 @@ public sealed class RsiSignalAppService
         // Only the strategy the user selected may trade. The Mini App polls the RSI
         // endpoint directly, so without this a bot configured for EMA could still have
         // an RSI setup placed underneath it.
-        if (IsEma(bot.StrategyId) != IsEma(signal.StrategyId))
+        // A smart bot legitimately runs either engine, so the mismatch check only
+        // applies when the user pinned one.
+        if (!RegimeRouting.IsSmart(bot.StrategyId) &&
+            IsEma(bot.StrategyId) != IsEma(signal.StrategyId))
             return signal with { AutomationError = "STRATEGY_MISMATCH", Signal = "None" };
 
         var nowGate = DateTimeOffset.UtcNow;
-        if (!StrategyGate.TryValidateForTrade(signal, nowGate, out var rejectCode))
+        if (!StrategyGate.TryValidateForTrade(signal, nowGate, bot.StrategyId, regime, out var rejectCode))
         {
             if (rejectCode is null or "NO_SIGNAL")
                 return signal;
