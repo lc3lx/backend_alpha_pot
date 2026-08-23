@@ -103,6 +103,7 @@ public static class DependencyInjection
 
         services.AddSingleton<IRsiSignalService, RsiSignalService>();
         services.AddSingleton<IEmaRsiSignalService, EmaRsiSignalService>();
+        services.AddSingleton<IAlternatingSignalService, AlternatingSignalService>();
         // Shared across all users: one analysis per pair per closed bar.
         services.AddSingleton<MarketAnalysisCache>();
         services.AddSingleton<EmaRsiTradeTracker>();

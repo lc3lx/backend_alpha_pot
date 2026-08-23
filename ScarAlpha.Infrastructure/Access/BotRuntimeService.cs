@@ -260,6 +260,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
         var id = strategyId?.Trim();
         if (string.Equals(id, "ema", StringComparison.OrdinalIgnoreCase)) return "ema";
         if (string.Equals(id, "smart", StringComparison.OrdinalIgnoreCase)) return "smart";
+        if (string.Equals(id, "alt5", StringComparison.OrdinalIgnoreCase)) return "alt5";
         return "rsi";
     }
 

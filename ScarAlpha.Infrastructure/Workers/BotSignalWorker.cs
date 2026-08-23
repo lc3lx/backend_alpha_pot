@@ -214,7 +214,12 @@ public sealed class BotSignalWorker : IHostedService
                     using (AmbientUserContext.Use(userId))
                     {
                         var signal = await rsi.GetSignalAsync(
-                            asset, 60, options, autoExecute: false, token, skipMarketAccess,
+                            asset,
+                            StrategyTimeframes.For(bot.StrategyId),
+                            options,
+                            autoExecute: false,
+                            token,
+                            skipMarketAccess,
                             strategyId: bot.StrategyId);
                         if (signal.AutomationError == "SIGNAL_STALE")
                             Interlocked.Increment(ref staleHits);

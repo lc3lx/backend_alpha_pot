@@ -18,6 +18,7 @@ public sealed class RsiSignalAppService
     private readonly IBotAccessService _botAccess;
     private readonly IRsiSignalService _signalService;
     private readonly IEmaRsiSignalService _emaSignalService;
+    private readonly IAlternatingSignalService _alternatingSignalService;
     private readonly MarketAnalysisCache _analysisCache;
     private readonly EmaRsiTradeTracker _emaTracker;
     private readonly IBinollaSessionRestorer _restorer;
@@ -33,6 +34,7 @@ public sealed class RsiSignalAppService
         IBotAccessService botAccess,
         IRsiSignalService signalService,
         IEmaRsiSignalService emaSignalService,
+        IAlternatingSignalService alternatingSignalService,
         MarketAnalysisCache analysisCache,
         EmaRsiTradeTracker emaTracker,
         IBinollaSessionRestorer restorer,
@@ -47,6 +49,7 @@ public sealed class RsiSignalAppService
         _botAccess = botAccess;
         _signalService = signalService;
         _emaSignalService = emaSignalService;
+        _alternatingSignalService = alternatingSignalService;
         _analysisCache = analysisCache;
         _emaTracker = emaTracker;
         _restorer = restorer;
@@ -74,8 +77,11 @@ public sealed class RsiSignalAppService
     {
         if (string.IsNullOrWhiteSpace(asset))
             throw new ApiException(ApiErrorCodes.ValidationError, "asset is required.");
-        if (periodSeconds != 60)
-            throw new ApiException(ApiErrorCodes.ValidationError, "RSI Smart Backtest only supports the 1-minute timeframe.");
+        var expectedPeriod = StrategyTimeframes.For(strategyId);
+        if (periodSeconds != expectedPeriod)
+            throw new ApiException(
+                ApiErrorCodes.ValidationError,
+                $"This strategy analyses the {expectedPeriod / 60}-minute timeframe.");
 
         if (!skipMarketAccess && await _demo.IsMarketingDemoAsync(_currentUser.UserId, ct))
         {
@@ -143,7 +149,10 @@ public sealed class RsiSignalAppService
             // caller fetches and computes, the rest reuse the identical closed series.
             // Two accounts on the same pair therefore always see the same signal, and
             // 100 users cost the same history traffic as one.
-            var analysis = await GetSharedAnalysisAsync(client, symbol, wirePeriod, options, now, ct);
+            var alternating = AlternatingStrategy.Is(strategyId);
+            var analysis = await GetSharedAnalysisAsync(
+                client, symbol, wirePeriod, options, now, ct,
+                minCandles: alternating ? AlternatingOptions.Default.PatternLength + 1 : null);
             if (analysis is null)
                 return SoftNone(symbol, wirePeriod) with { AutomationError = "INSUFFICIENT_HISTORY" };
 
@@ -187,6 +196,28 @@ public sealed class RsiSignalAppService
             // subscription per pair plus the TREND_UNKNOWN failure mode entirely.
             var emaOptions = EmaRsiOptions.FromBotDurationSeconds(options.ExpiryCandles * 60)
                 with { UseTrendFilter = EmaTrendFilterEnabled && !StrategyGate.RegimeEnabled };
+
+            if (alternating)
+            {
+                var altSignal = await _alternatingSignalService.GetSignalAsync(
+                    userId: _currentUser.UserId,
+                    asset: symbol,
+                    candles: candles,
+                    options: AlternatingOptions.Default,
+                    now: now,
+                    ct: ct);
+
+                altSignal = altSignal with
+                {
+                    Regime = analysis.Regime?.Regime ?? MarketRegime.Unclear,
+                    RegimeReason = analysis.Regime?.Reason,
+                    RegimeApplied = analysis.Regime is not null,
+                    RelativeVolume = analysis.Regime?.RelativeVolume,
+                    VolumeOk = analysis.Regime?.VolumeOk ?? true,
+                };
+
+                return await ExecuteIfRequestedAsync(altSignal, options, autoExecute, ct, analysis.Regime);
+            }
 
             // Smart mode hands engine choice to the regime; an explicit choice is kept.
             var engineId = RegimeRouting.IsSmart(strategyId)
@@ -387,7 +418,8 @@ public sealed class RsiSignalAppService
         int wirePeriod,
         RsiStrategyOptions options,
         DateTimeOffset now,
-        CancellationToken ct) =>
+        CancellationToken ct,
+        int? minCandles = null) =>
         _analysisCache.GetOrAddAsync(symbol, wirePeriod, now, async _ =>
         {
             var history = await client.GetHistoryAsync(symbol, wirePeriod, CancellationToken.None);
@@ -408,9 +440,13 @@ public sealed class RsiSignalAppService
                 .ToList();
 
             var prepared = CandleSeries.Prepare(candles, wirePeriod, now);
-            var warmup = Math.Max(
+            // The alternating rule reads candle bodies only, so it must not be blocked by
+            // an RSI warmup it never uses. Indicators below are then computed
+            // opportunistically and left absent when there is not enough history.
+            var indicatorWarmup = Math.Max(
                 IndicatorWarmup.ForRsi(options.Period),
                 options.Period + options.ExpiryCandles + 2);
+            var warmup = minCandles ?? indicatorWarmup;
             if (prepared.Count < warmup)
             {
                 // #region agent log
@@ -432,11 +468,20 @@ public sealed class RsiSignalAppService
             }
 
             var closes = prepared.Closes;
-            var rsi = Math.Round(
-                Indicators.Rsi(closes, options.Period)!.Value, 2, MidpointRounding.AwayFromZero);
-            var (call, put) = RsiZoneBacktest.Evaluate(closes, options);
-            // Same closed series, so every account sees the same regime for this bar.
-            var regime = MarketRegimeClassifier.Analyze(prepared.Closed, MarketRegimeOptions.Default);
+            var indicatorsReady = prepared.Count >= indicatorWarmup;
+
+            var rsi = indicatorsReady
+                ? Math.Round(Indicators.Rsi(closes, options.Period)!.Value, 2, MidpointRounding.AwayFromZero)
+                : 0m;
+            RsiBacktestStats? call = null;
+            RsiBacktestStats? put = null;
+            RegimeSnapshot? regime = null;
+            if (indicatorsReady)
+            {
+                (call, put) = RsiZoneBacktest.Evaluate(closes, options);
+                // Same closed series, so every account sees the same regime for this bar.
+                regime = MarketRegimeClassifier.Analyze(prepared.Closed, MarketRegimeOptions.Default);
+            }
 
             return new MarketAnalysis(
                 Asset: symbol,
@@ -477,7 +522,11 @@ public sealed class RsiSignalAppService
         // an RSI setup placed underneath it.
         // A smart bot legitimately runs either engine, so the mismatch check only
         // applies when the user pinned one.
+        if (AlternatingStrategy.Is(bot.StrategyId) != AlternatingStrategy.Is(signal.StrategyId))
+            return signal with { AutomationError = "STRATEGY_MISMATCH", Signal = "None" };
+
         if (!RegimeRouting.IsSmart(bot.StrategyId) &&
+            !AlternatingStrategy.Is(bot.StrategyId) &&
             IsEma(bot.StrategyId) != IsEma(signal.StrategyId))
             return signal with { AutomationError = "STRATEGY_MISMATCH", Signal = "None" };
 
@@ -582,12 +631,14 @@ public sealed class RsiSignalAppService
 
             // Trade duration must match the backtest expiry window (3–5 minutes on 1m).
             var expiryCandles = signal.Backtest.ExpiryCandles;
-            if (expiryCandles is < 3 or > 5)
+            if (!AlternatingStrategy.Is(signal.StrategyId) && expiryCandles is < 3 or > 5)
                 expiryCandles = options.ExpiryCandles is >= 3 and <= 5 ? options.ExpiryCandles : 5;
-            var durationSeconds = expiryCandles * 60;
+            var durationSeconds = expiryCandles * StrategyTimeframes.For(signal.StrategyId);
             OpenTradeGate.MarkUserHeld(userId, durationSeconds);
 
-            var strategyKey = IsEma(signal.StrategyId) ? "ema" : "rsi";
+            var strategyKey = AlternatingStrategy.Is(signal.StrategyId)
+                ? AlternatingStrategy.Id
+                : IsEma(signal.StrategyId) ? "ema" : "rsi";
             var key = $"bot:{strategyKey}:{signal.Asset.Trim().ToUpperInvariant()}:{signal.CandleTime.ToUnixTimeSeconds()}:{signal.Signal}";
             try
             {
@@ -620,7 +671,12 @@ public sealed class RsiSignalAppService
                     DurationSeconds: durationSeconds,
                     StrategyId: strategyKey), key, ct);
 
-                if (IsEma(signal.StrategyId))
+                if (AlternatingStrategy.Is(signal.StrategyId))
+                {
+                    _alternatingSignalService.MarkSignalEmitted(
+                        userId, signal.Asset, AlternatingStrategy.TimeframeSeconds, signal.CandleTime);
+                }
+                else if (IsEma(signal.StrategyId))
                 {
                     _emaSignalService.MarkSignalEmitted(
                         userId, signal.Asset, options.TimeframeSeconds, signal.CandleTime);
