@@ -29,7 +29,15 @@ public sealed record EmaRsiOptions(
     int ExpiryCandles = 5,
     /// <summary>Pine: checkpointBars — early "is it winning yet?" probe after N bars.</summary>
     int CheckpointBars = 2,
-    /// <summary>Pine: useTrend — require the higher-timeframe EMA200 to agree.</summary>
+    /// <summary>
+    /// Pine: useTrend — require the higher-timeframe EMA200 to agree.
+    ///
+    /// <para>MEASURED ON BINOLLA: unusable. The broker caps <c>s_history/last</c> at 200
+    /// candles per timeframe, so the 15m series yields 199 closed bars while EMA200 needs
+    /// 201 — and at exactly 200 it would be a bare SMA seed with no smoothing. Left on,
+    /// this filter reports TREND_UNKNOWN and blocks every cross. The market-regime
+    /// classifier (ADX on the 1m series) replaces it.</para>
+    /// </summary>
     bool UseTrendFilter = true,
     /// <summary>Pine: htfTF — trend timeframe, default 15m.</summary>
     int TrendTimeframeSeconds = 900,

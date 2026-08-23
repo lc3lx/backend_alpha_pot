@@ -37,10 +37,14 @@ public static class Program
 
         await using var session = new BinollaSession("smoke-user", options);
 
-        Console.WriteLine("Connecting (Demo)...");
+        // Binolla's WS handshake usually needs the same cookies the login produced
+        // (notably __cf_bm). capture.mjs returns them alongside the token.
+        var cookies = Environment.GetEnvironmentVariable("BINOLLA_COOKIES");
+
+        Console.WriteLine($"Connecting (Demo){(string.IsNullOrWhiteSpace(cookies) ? "" : " with cookies")}...");
         try
         {
-            await session.ConnectAsync(ssid);
+            await session.ConnectAsync(ssid, CancellationToken.None, cookieHeader: cookies);
             Console.WriteLine($"State: {session.Lifecycle}");
 
             var balance = await session.GetBalanceAsync();
