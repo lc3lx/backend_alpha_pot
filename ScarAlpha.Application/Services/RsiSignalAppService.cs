@@ -191,11 +191,9 @@ public sealed class RsiSignalAppService
                 return SoftNone(symbol, wirePeriod);
             }
 
-            // When regime is on it already establishes the trend from the 1m series, so
-            // the Pine 15m EMA200 filter is redundant — and dropping it removes a second
-            // subscription per pair plus the TREND_UNKNOWN failure mode entirely.
+            // EMA runs purely on its own settings — no coupling to the regime switch.
             var emaOptions = EmaRsiOptions.FromBotDurationSeconds(options.ExpiryCandles * 60)
-                with { UseTrendFilter = EmaTrendFilterEnabled && !StrategyGate.RegimeEnabled };
+                with { UseTrendFilter = EmaTrendFilterEnabled };
 
             if (alternating)
             {

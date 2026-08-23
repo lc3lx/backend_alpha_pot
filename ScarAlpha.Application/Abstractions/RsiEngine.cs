@@ -52,8 +52,8 @@ public sealed record RsiStrategyOptions(
 /// </summary>
 public static class RsiEntryLevels
 {
-    private static decimal _callMax = 20m;
-    private static decimal _putMin = 80m;
+    private static decimal _callMax = 25m;
+    private static decimal _putMin = 75m;
     private static int _minZoneVisits = 2;
 
     /// <summary>
@@ -81,9 +81,10 @@ public static class RsiEntryLevels
     /// <summary>
     /// Zone visits the backtest must have seen before its success rate means anything.
     ///
-    /// <para>At 20/80 a 200-bar window often contains only one visit, and a single lucky
-    /// visit scores 100% — which would make the backtest filter stop filtering exactly
-    /// when the levels got stricter.</para>
+    /// <para>A single lucky visit scores 100%, which would make the backtest filter stop
+    /// filtering. The tighter the levels, the fewer visits a 200-bar window holds — at
+    /// 20/80 there is often only one — so this floor matters most exactly when the
+    /// success rate looks most convincing.</para>
     /// </summary>
     public static int MinZoneVisits
     {

@@ -5,33 +5,61 @@ using Xunit;
 namespace ScarAlpha.Api.Tests;
 
 /// <summary>
-/// The rule that makes the bot selective: RSI only fades ranges, EMA only rides trends,
-/// and nothing trades against the trend or in a dead market.
+/// Regime routing governs the SMART strategy only: it fades ranges with RSI, rides trends
+/// with EMA, and sits out an unclear or dead market.
+///
+/// Every other strategy is deliberately untouched — RSI runs on its own levels and
+/// backtest, EMA on its own cross, the pattern rule on its own pattern. These tests pin
+/// that isolation, because a filter silently leaking across strategies is exactly the
+/// kind of bug that makes "why didn't it enter?" unanswerable.
 /// </summary>
 public sealed class RegimeRoutingTests
 {
     [Theory]
-    // A range is RSI's home — both directions are legal there.
+    // Every non-smart strategy is left completely alone by the regime, in any market.
+    [InlineData(MarketRegime.Uptrend, "rsi", "Put")]
+    [InlineData(MarketRegime.Downtrend, "rsi", "Call")]
+    [InlineData(MarketRegime.Sideways, "ema", "Call")]
+    [InlineData(MarketRegime.Uptrend, "ema", "Put")]
+    [InlineData(MarketRegime.Unclear, "rsi", "Call")]
+    [InlineData(MarketRegime.Unclear, "ema", "Put")]
+    public void A_pinned_strategy_is_never_filtered_by_the_regime(
+        MarketRegime regime, string engine, string side)
+    {
+        // RSI must depend on its own levels and backtest only; EMA on its own cross only.
+        // Mixing the regime in would mean a strategy no longer does what its name says.
+        var ok = RegimeRouting.IsAllowed(
+            botStrategyId: engine, engineId: engine, side: side,
+            regime: Snapshot(regime), out var code);
+
+        ok.Should().BeTrue();
+        code.Should().BeNull();
+    }
+
+    [Fact]
+    public void The_pattern_strategy_is_also_left_alone()
+    {
+        RegimeRouting.IsAllowed("alt5", "alt5", "Call", Snapshot(MarketRegime.Unclear), out _)
+            .Should().BeTrue();
+    }
+
+    [Theory]
+    // Smart mode is the only one the regime governs.
     [InlineData(MarketRegime.Sideways, "rsi", "Call", true)]
     [InlineData(MarketRegime.Sideways, "rsi", "Put", true)]
-    // Fading a real trend is how mean-reversion bleeds.
-    [InlineData(MarketRegime.Uptrend, "rsi", "Put", false)]
-    [InlineData(MarketRegime.Downtrend, "rsi", "Call", false)]
-    // EMA needs a trend behind the cross.
     [InlineData(MarketRegime.Uptrend, "ema", "Call", true)]
     [InlineData(MarketRegime.Downtrend, "ema", "Put", true)]
-    [InlineData(MarketRegime.Sideways, "ema", "Call", false)]
-    // Never take the wrong side of a trend, whichever engine produced it.
-    [InlineData(MarketRegime.Uptrend, "ema", "Put", false)]
-    [InlineData(MarketRegime.Downtrend, "ema", "Call", false)]
-    // No edge either way.
+    [InlineData(MarketRegime.Uptrend, "ema", "Put", false)]     // counter-trend
+    [InlineData(MarketRegime.Downtrend, "ema", "Call", false)]  // counter-trend
+    [InlineData(MarketRegime.Sideways, "ema", "Call", false)]   // wrong engine for a range
+    [InlineData(MarketRegime.Uptrend, "rsi", "Call", false)]    // wrong engine for a trend
     [InlineData(MarketRegime.Unclear, "rsi", "Call", false)]
     [InlineData(MarketRegime.Unclear, "ema", "Put", false)]
-    public void Engine_is_only_allowed_in_the_regime_it_works_in(
+    public void Smart_mode_allows_only_the_engine_and_side_the_regime_calls_for(
         MarketRegime regime, string engine, string side, bool allowed)
     {
         var ok = RegimeRouting.IsAllowed(
-            botStrategyId: engine, engineId: engine, side: side,
+            botStrategyId: "smart", engineId: engine, side: side,
             regime: Snapshot(regime), out var code);
 
         ok.Should().Be(allowed);
@@ -94,7 +122,7 @@ public sealed class RegimeRoutingTests
             VolumeOk = false,
             RelativeVolume = 0.2m,
         };
-        RegimeRouting.IsAllowed("rsi", "rsi", "Call", thin, out var code).Should().BeFalse();
+        RegimeRouting.IsAllowed("smart", "rsi", "Call", thin, out var code).Should().BeFalse();
         code.Should().Be(RegimeRouting.RejectLowVolume);
 
         // Binolla usually sends no volume at all — that must not block anything.
@@ -104,13 +132,13 @@ public sealed class RegimeRoutingTests
             VolumeOk = true,
             RelativeVolume = null,
         };
-        RegimeRouting.IsAllowed("rsi", "rsi", "Call", noVolume, out _).Should().BeTrue();
+        RegimeRouting.IsAllowed("smart", "rsi", "Call", noVolume, out _).Should().BeTrue();
     }
 
     [Fact]
     public void No_regime_measured_leaves_behaviour_untouched()
     {
-        RegimeRouting.IsAllowed("rsi", "rsi", "Put", regime: null, out var code).Should().BeTrue();
+        RegimeRouting.IsAllowed("smart", "rsi", "Put", regime: null, out var code).Should().BeTrue();
         code.Should().BeNull();
     }
 
@@ -124,13 +152,17 @@ public sealed class RegimeRoutingTests
             var against = Snapshot(MarketRegime.Uptrend);   // counter-trend
 
             StrategyGate.RegimeEnabled = false;
-            StrategyGate.TryValidateForTrade(signal, signal.CandleTime, "ema", against, out _)
+            StrategyGate.TryValidateForTrade(signal, signal.CandleTime, "smart", against, out _)
                 .Should().BeTrue();
 
             StrategyGate.RegimeEnabled = true;
-            StrategyGate.TryValidateForTrade(signal, signal.CandleTime, "ema", against, out var code)
+            StrategyGate.TryValidateForTrade(signal, signal.CandleTime, "smart", against, out var code)
                 .Should().BeFalse();
             code.Should().Be(RegimeRouting.RejectCounterTrend);
+
+            // A bot pinned to EMA is untouched even with the regime switch on.
+            StrategyGate.TryValidateForTrade(signal, signal.CandleTime, "ema", against, out _)
+                .Should().BeTrue();
         }
         finally
         {

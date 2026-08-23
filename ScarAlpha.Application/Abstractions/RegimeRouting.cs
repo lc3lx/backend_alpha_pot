@@ -7,9 +7,9 @@ namespace ScarAlpha.Application.Abstractions;
 /// cross only pays with the trend behind it. Running either in the wrong regime is the
 /// main way this bot loses.</para>
 ///
-/// <para>Regime never silently swaps engines under a user who picked one. A bot set to
-/// <c>rsi</c> keeps running RSI; the regime just refuses to let it trade where RSI does
-/// not work. Only <see cref="SmartStrategyId"/> hands the choice to the regime.</para>
+/// <para>This applies to <see cref="SmartStrategyId"/> ONLY. A bot set to <c>rsi</c>,
+/// <c>ema</c> or the pattern rule is left completely alone — each runs its own rules and
+/// nothing else, so the strategies never bleed into one another.</para>
 /// </summary>
 public static class RegimeRouting
 {
@@ -55,7 +55,15 @@ public static class RegimeRouting
     {
         rejectCode = null;
 
-        // No regime measured (feature off, or higher-timeframe entry) — behave as before.
+        // Regime governs the SMART strategy only. Every other strategy runs on its own
+        // rules and nothing else: RSI is its entry levels plus the zone backtest, EMA is
+        // its cross plus its RSI band, the pattern rule is its pattern. Layering an extra
+        // filter over them would mean a strategy no longer does what its name says, and
+        // "why didn't it enter?" would stop having one answer.
+        if (!IsSmart(botStrategyId))
+            return true;
+
+        // No regime measured (feature off, or higher-timeframe entry) — nothing to apply.
         if (regime is null)
             return true;
 
@@ -74,37 +82,14 @@ public static class RegimeRouting
             return false;
         }
 
-        var isEmaEngine = IsEma(engineId);
-
-        if (IsSmart(botStrategyId))
+        // The regime chose the engine, so a mismatch means the market moved between
+        // producing and validating the signal — do not trade on stale routing.
+        var expected = EngineFor(regime.Regime);
+        var actual = IsEma(engineId) ? EmaStrategyId : RsiStrategyId;
+        if (expected is null || !string.Equals(expected, actual, StringComparison.OrdinalIgnoreCase))
         {
-            // The regime chose the engine, so a mismatch means the market moved between
-            // producing and validating the signal — do not trade on stale routing.
-            var expected = EngineFor(regime.Regime);
-            if (expected is null || !string.Equals(expected, isEmaEngine ? EmaStrategyId : RsiStrategyId,
-                    StringComparison.OrdinalIgnoreCase))
-            {
-                rejectCode = RejectWrongRegime;
-                return false;
-            }
-        }
-        else if (isEmaEngine)
-        {
-            // EMA is a trend strategy: a range gives its crosses no follow-through.
-            if (!regime.IsTrending)
-            {
-                rejectCode = RejectWrongRegime;
-                return false;
-            }
-        }
-        else
-        {
-            // RSI is mean-reversion: fading a real trend is how it bleeds.
-            if (regime.Regime != MarketRegime.Sideways)
-            {
-                rejectCode = RejectWrongRegime;
-                return false;
-            }
+            rejectCode = RejectWrongRegime;
+            return false;
         }
 
         // Direction must agree with the trend. In a range both sides are legal.

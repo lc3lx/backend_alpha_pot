@@ -539,11 +539,11 @@ public sealed class Phase5RsiTests
         var closes = new List<decimal> { 100m };
         for (var visit = 0; visit < 2; visit++)
         {
-            for (var i = 0; i < 3; i++) closes.Add(closes[^1] - 6m);   // dip through the level
-            closes.Add(closes[^1] + 4m);                              // bounce out, above the touch
+            for (var i = 0; i < 3; i++) closes.Add(closes[^1] - 5m);   // dip through the level
+            closes.Add(closes[^1] + 5m);                              // bounce out, above the touch
         }
 
-        for (var i = 0; i < 6; i++) closes.Add(closes[^1] - 8m);       // close back inside
+        for (var i = 0; i < 5; i++) closes.Add(closes[^1] - 6m);       // close back inside
         return WithWarmup(closes);
     }
 
@@ -556,11 +556,11 @@ public sealed class Phase5RsiTests
         var closes = new List<decimal> { 100m };
         for (var visit = 0; visit < 2; visit++)
         {
-            for (var i = 0; i < 3; i++) closes.Add(closes[^1] + 6m);   // push through the level
-            closes.Add(closes[^1] - 4m);                              // drop out, below the touch
+            for (var i = 0; i < 3; i++) closes.Add(closes[^1] + 5m);   // push through the level
+            closes.Add(closes[^1] - 5m);                              // drop out, below the touch
         }
 
-        for (var i = 0; i < 6; i++) closes.Add(closes[^1] + 8m);       // close back inside
+        for (var i = 0; i < 5; i++) closes.Add(closes[^1] + 6m);       // close back inside
         return WithWarmup(closes);
     }
 
