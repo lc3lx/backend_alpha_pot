@@ -134,7 +134,7 @@ load_env() {
   local ip
   ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
   ip="${ip:-127.0.0.1}"
-  export CORS_ORIGINS="${CORS_ORIGINS:-http://${ip}:4173,http://127.0.0.1:4173,http://localhost:4173}"
+  export CORS_ORIGINS="${CORS_ORIGINS:-http://${ip}:4173,http://127.0.0.1:4173,http://localhost:4173,http://${ip}:4175,http://127.0.0.1:4175,http://localhost:4175,http://${ip}:5175,http://127.0.0.1:5175,http://localhost:5175}"
   export ADMIN_TELEGRAM_USER_IDS="${ADMIN_TELEGRAM_USER_IDS:-}"
   export DATABASE_CONNECTION_STRING="${DATABASE_CONNECTION_STRING:-}"
   export BINOLLA_AUTH_PROXY="${BINOLLA_AUTH_PROXY:-}"
