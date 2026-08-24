@@ -77,6 +77,9 @@ public static class Program
             if (args.Any(a => a.Equals("--rsi", StringComparison.OrdinalIgnoreCase)))
                 await ReportRsiParityAsync(session, symbol);
 
+            if (args.Any(a => a.Equals("--candles", StringComparison.OrdinalIgnoreCase)))
+                await DumpCandlesAsync(session, symbol);
+
             if (placeTrade)
             {
                 Console.WriteLine($"Placing Demo trade on {symbol} amount=1 duration=60...");
@@ -152,6 +155,45 @@ public static class Program
         Console.WriteLine(trend.Count >= needed
             ? $"  EMA200(15m)        : {Indicators.Ema(trend.Select(c => c.Close).ToList(), 200):F5}  -> trend filter USABLE"
             : "  -> NOT enough 15m history: set Strategy:EmaUseTrendFilter=false or the EMA strategy will skip every cross.");
+    }
+
+    /// <summary>
+    /// Prints the last closed candles exactly as the bot sees them, with the running RSI.
+    ///
+    /// <para>This is the settling check: put it side by side with the platform chart. If
+    /// every row matches, the bot and the chart are reading the same market and any
+    /// remaining disagreement is an indicator setting, not a data bug. If a row differs,
+    /// that row names the exact minute and field to chase — no more guessing.</para>
+    /// </summary>
+    private static async Task DumpCandlesAsync(BinollaSession session, string symbol, int count = 15)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var bars = await LoadClosedAsync(session, symbol, 60, now);
+        if (bars.Count == 0)
+        {
+            Console.WriteLine("No closed candles.");
+            return;
+        }
+
+        var closes = bars.Select(c => c.Close).ToList();
+        var rsi = Indicators.RsiSeries(closes, 14);
+
+        Console.WriteLine();
+        Console.WriteLine($"=== last {count} CLOSED 1m candles for {symbol} (UTC) ===");
+        Console.WriteLine("  time         open      high      low       close     RSI14");
+        Console.WriteLine("  " + new string('-', 62));
+
+        var from = Math.Max(0, bars.Count - count);
+        for (var i = from; i < bars.Count; i++)
+        {
+            var b = bars[i];
+            static string F(decimal? v) => v is null ? "    -   " : v.Value.ToString("F5");
+            Console.WriteLine(
+                $"  {b.Timestamp:HH:mm}  {F(b.Open),9} {F(b.High),9} {F(b.Low),9} {F(b.Close),9}  {rsi[i],7:F2}");
+        }
+
+        Console.WriteLine();
+        Console.WriteLine("  Compare row by row with the chart. A mismatch names the exact minute to chase.");
     }
 
     /// <summary>Fetches one timeframe and reduces it to the gap-free closed series the bot uses.</summary>
