@@ -158,8 +158,20 @@ public sealed class EmaRsiStrategyTests
             .Select((c, i) => new RsiCandle(start.AddMinutes(i), c, null))
             .ToList();
 
-        var signal = await service.GetSignalAsync(
-            UserId, Asset, candles, TrendUp(), NoTrend with { UseTrendFilter = true }, Now.AddSeconds(30));
+        // 30s in: the cross bar is still forming, so it cannot complete the cross.
+        var previous = RsiEntryLevels.SetupTtlSeconds;
+        RsiEntryLevels.SetupTtlSeconds = 5;
+        StrategySignal signal;
+        try
+        {
+            signal = await service.GetSignalAsync(
+                UserId, Asset, candles, TrendUp(), NoTrend with { UseTrendFilter = true },
+                Now.AddSeconds(30));
+        }
+        finally
+        {
+            RsiEntryLevels.SetupTtlSeconds = previous;
+        }
 
         // The cross bar has not closed, so the closed series ends one bar earlier — no cross.
         signal.Signal.Should().Be("None");
@@ -173,11 +185,14 @@ public sealed class EmaRsiStrategyTests
 
         (await service.GetSignalAsync(UserId, Asset, candles, TrendUp(), EmaRsiOptions.Default, Now))
             .Signal.Should().Be("Call");
-        (await service.GetSignalAsync(UserId, Asset, candles, TrendUp(), EmaRsiOptions.Default, Now.AddSeconds(4)))
+        (await service.GetSignalAsync(
+                UserId, Asset, candles, TrendUp(), EmaRsiOptions.Default,
+                Now.AddSeconds(RsiEntryLevels.SetupTtlSeconds - 1)))
             .Signal.Should().Be("Call");
 
         var expired = await service.GetSignalAsync(
-            UserId, Asset, candles, TrendUp(), EmaRsiOptions.Default, Now.AddSeconds(6));
+            UserId, Asset, candles, TrendUp(), EmaRsiOptions.Default,
+            Now.AddSeconds(RsiEntryLevels.SetupTtlSeconds + 1));
         expired.Signal.Should().Be("None");
         expired.AutomationError.Should().Be("SETUP_EXPIRED");
     }

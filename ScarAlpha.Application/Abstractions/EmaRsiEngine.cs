@@ -42,10 +42,17 @@ public sealed record EmaRsiOptions(
     /// <summary>Pine: htfTF — trend timeframe, default 15m.</summary>
     int TrendTimeframeSeconds = 900,
     int TrendEmaLength = 200,
-    /// <summary>Seconds after the bar closes in which the entry is still valid.</summary>
-    int MaxEntryLagSeconds = 5)
+    /// <summary>
+    /// Seconds after the bar closes in which the entry is still valid.
+    /// Zero means "use the shared <see cref="RsiEntryLevels.SetupTtlSeconds"/>".
+    /// </summary>
+    int MaxEntryLagSeconds = 0)
 {
     public static EmaRsiOptions Default => new();
+
+    /// <summary>The window actually applied — the shared one unless overridden.</summary>
+    public int EffectiveEntryLagSeconds =>
+        MaxEntryLagSeconds > 0 ? MaxEntryLagSeconds : RsiEntryLevels.SetupTtlSeconds;
 
     /// <summary>Maps bot trade duration (180/240/300) to Pine's tradeDurationBars.</summary>
     public static EmaRsiOptions FromBotDurationSeconds(int durationSeconds)

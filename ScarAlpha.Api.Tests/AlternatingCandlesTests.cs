@@ -121,9 +121,11 @@ public sealed class AlternatingCandlesTests
         var bars = ClosedBars("UDUDU");
 
         (await service.GetSignalAsync(UserId, Asset, bars, Options, Now)).Signal.Should().Be("Call");
-        (await service.GetSignalAsync(UserId, Asset, bars, Options, Now.AddSeconds(4))).Signal.Should().Be("Call");
+        (await service.GetSignalAsync(
+            UserId, Asset, bars, Options, Now.AddSeconds(RsiEntryLevels.SetupTtlSeconds - 1))).Signal.Should().Be("Call");
 
-        var expired = await service.GetSignalAsync(UserId, Asset, bars, Options, Now.AddSeconds(6));
+        var expired = await service.GetSignalAsync(
+            UserId, Asset, bars, Options, Now.AddSeconds(RsiEntryLevels.SetupTtlSeconds + 1));
         expired.Signal.Should().Be("None");
         expired.AutomationError.Should().Be("SETUP_EXPIRED");
     }

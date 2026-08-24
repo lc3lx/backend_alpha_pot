@@ -53,7 +53,7 @@ public sealed class AlternatingSignalService : IAlternatingSignalService
             return Task.FromResult(Build(asset, "None", eval, closeTime, timeframe, options, eval.SkipReason));
         }
 
-        if (secondsSinceClose < 0 || secondsSinceClose > options.MaxEntryLagSeconds)
+        if (secondsSinceClose < 0 || secondsSinceClose > options.EffectiveEntryLagSeconds)
             return Task.FromResult(Build(asset, "None", eval, closeTime, timeframe, options, "SETUP_EXPIRED"));
 
         var watch = _setups.AddOrUpdate(
@@ -64,7 +64,7 @@ public sealed class AlternatingSignalService : IAlternatingSignalService
                 : new SetupWatch(eval.Signal, currentCandle.Timestamp, closeTime, Consumed: false));
 
         var ageSeconds = (now - watch.CloseTime).TotalSeconds;
-        var fresh = !watch.Consumed && ageSeconds <= options.MaxEntryLagSeconds;
+        var fresh = !watch.Consumed && ageSeconds <= options.EffectiveEntryLagSeconds;
         if (!fresh)
         {
             return Task.FromResult(Build(
@@ -131,7 +131,7 @@ public sealed class AlternatingSignalService : IAlternatingSignalService
             throw new ApiException(ApiErrorCodes.ValidationError, "Pattern length must be between 2 and 10 candles.");
         if (options.ExpiryCandles is < 1 or > 3)
             throw new ApiException(ApiErrorCodes.ValidationError, "Expiry must be between 1 and 3 candles.");
-        if (options.MaxEntryLagSeconds is < 1 or > 120)
+        if (options.MaxEntryLagSeconds is < 0 or > 120)
             throw new ApiException(ApiErrorCodes.ValidationError, "Max entry lag must be between 1 and 120 seconds.");
     }
 }

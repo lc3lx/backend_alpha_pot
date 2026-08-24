@@ -22,8 +22,12 @@ public sealed record RsiStrategyOptions(
     /// Entry uses closed RSI only (not the forming bar). Default is
     /// <see cref="RsiEntryLevels.SetupTtlSeconds"/>.
     /// </summary>
-    int MaxEntryLagSeconds = 5)
+    int MaxEntryLagSeconds = 0)
 {
+    /// <summary>The window actually applied — the shared one unless overridden.</summary>
+    public int EffectiveEntryLagSeconds =>
+        MaxEntryLagSeconds > 0 ? MaxEntryLagSeconds : RsiEntryLevels.SetupTtlSeconds;
+
     public static RsiStrategyOptions Default60Seconds =>
         new(
             Period: 14,
@@ -95,8 +99,26 @@ public static class RsiEntryLevels
     }
 
     public const decimal MinSuccessRate = 75m;
-    /// <summary>Enter in the first seconds after the extreme candle closes. Then wait for a new closed touch.</summary>
-    public const int SetupTtlSeconds = 5;
+
+    private static int _setupTtlSeconds = 30;
+
+    /// <summary>
+    /// How long after the candle closes an entry is still allowed
+    /// (<c>Strategy:SetupTtlSeconds</c>).
+    ///
+    /// <para>This was 5 seconds, which measured out far too tight: a scan cycle over
+    /// several users and ~18 pairs takes seconds and drifts off the minute boundary, so
+    /// valid setups were routinely evaluated 15-20s after the close and thrown away. The
+    /// setup itself is still good — the closed bar does not change — so the window only
+    /// needs to be short enough that price has not run away.</para>
+    /// </summary>
+    public static int SetupTtlSeconds
+    {
+        get => _setupTtlSeconds;
+        set => _setupTtlSeconds = value is >= 1 and <= 120
+            ? value
+            : throw new ArgumentOutOfRangeException(nameof(value), "Setup TTL must be between 1 and 120 seconds.");
+    }
 
     /// <summary>Call: candle closed at/below the entry level.</summary>
     public static bool IsCallRsi(decimal rsi) => rsi <= CallMax;

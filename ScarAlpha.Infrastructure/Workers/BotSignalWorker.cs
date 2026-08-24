@@ -20,6 +20,8 @@ public sealed class BotSignalWorker : IHostedService
 {
     /// <summary>Cap concurrent Binolla history/quote work so the WS is not flooded.</summary>
     private const int ScanParallelism = 8;
+    /// <summary>How many users are scanned at once, so none is left waiting past the bar close.</summary>
+    private const int BotParallelism = 8;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IBotRuntimeService _botRuntime;
     private readonly ILogger<BotSignalWorker> _logger;
@@ -89,12 +91,18 @@ public sealed class BotSignalWorker : IHostedService
             .ToList();
         if (running.Count == 0) return;
 
-        foreach (var bot in running)
+        // Bots run CONCURRENTLY, not one after another. Sequentially, each user's scan
+        // (~1s for ~18 pairs) pushed the next user further past the bar close, so later
+        // users were evaluated 15-20s late and every setup expired. Market data is shared
+        // through MarketAnalysisCache, so this adds almost no broker traffic.
+        await Parallel.ForEachAsync(
+            running,
+            new ParallelOptions { MaxDegreeOfParallelism = BotParallelism, CancellationToken = ct },
+            async (bot, token) =>
         {
-            ct.ThrowIfCancellationRequested();
             try
             {
-                await ProcessBotAsync(bot, ct).ConfigureAwait(false);
+                await ProcessBotAsync(bot, token).ConfigureAwait(false);
             }
             catch (ObjectDisposedException ex)
             {
@@ -111,7 +119,7 @@ public sealed class BotSignalWorker : IHostedService
             {
                 _logger.LogWarning(ex, "BotSignalWorker failed for user {UserId}", bot.UserId);
             }
-        }
+        }).ConfigureAwait(false);
     }
 
     private async Task ProcessBotAsync(BotRuntimeConfig bot, CancellationToken ct)

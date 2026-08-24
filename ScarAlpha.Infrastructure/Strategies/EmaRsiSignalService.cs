@@ -59,7 +59,7 @@ public sealed class EmaRsiSignalService : IEmaRsiSignalService
         }
 
         // The cross bar has closed but the entry window already passed.
-        if (secondsSinceClose < 0 || secondsSinceClose > options.MaxEntryLagSeconds)
+        if (secondsSinceClose < 0 || secondsSinceClose > options.EffectiveEntryLagSeconds)
         {
             return Task.FromResult(Build(asset, "None", eval, closeTime, timeframe, options, "SETUP_EXPIRED"));
         }
@@ -72,7 +72,7 @@ public sealed class EmaRsiSignalService : IEmaRsiSignalService
                 : new SetupWatch(eval.Signal, currentCandle.Timestamp, closeTime, Consumed: false));
 
         var ageSeconds = (now - watch.CloseTime).TotalSeconds;
-        var fresh = !watch.Consumed && ageSeconds <= options.MaxEntryLagSeconds;
+        var fresh = !watch.Consumed && ageSeconds <= options.EffectiveEntryLagSeconds;
         if (!fresh)
         {
             return Task.FromResult(Build(
@@ -144,7 +144,7 @@ public sealed class EmaRsiSignalService : IEmaRsiSignalService
             throw new ApiException(ApiErrorCodes.ValidationError, "RSI entry bounds must be between 0 and 100.");
         if (options.ExpiryCandles is < 3 or > 5)
             throw new ApiException(ApiErrorCodes.ValidationError, "Expiry must be 3, 4, or 5 candles.");
-        if (options.MaxEntryLagSeconds is < 1 or > 120)
+        if (options.MaxEntryLagSeconds is < 0 or > 120)
             throw new ApiException(ApiErrorCodes.ValidationError, "Max entry lag must be between 1 and 120 seconds.");
     }
 }

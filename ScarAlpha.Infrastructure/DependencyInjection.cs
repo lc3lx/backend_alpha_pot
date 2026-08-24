@@ -100,6 +100,8 @@ public static class DependencyInjection
         if (putMin is decimal pm) RsiEntryLevels.PutMin = pm;
         var minVisits = configuration.GetValue<int?>("Strategy:MinZoneVisits");
         if (minVisits is int mv) RsiEntryLevels.MinZoneVisits = mv;
+        var ttl = configuration.GetValue<int?>("Strategy:SetupTtlSeconds");
+        if (ttl is int t2) RsiEntryLevels.SetupTtlSeconds = t2;
 
         services.AddSingleton<IRsiSignalService, RsiSignalService>();
         services.AddSingleton<IEmaRsiSignalService, EmaRsiSignalService>();

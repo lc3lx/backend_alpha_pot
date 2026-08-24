@@ -31,10 +31,17 @@ public sealed record AlternatingOptions(
     int TimeframeSeconds = 300,
     /// <summary>The trade lasts exactly one candle — the "sixth".</summary>
     int ExpiryCandles = 1,
-    /// <summary>Seconds after the candle closes in which the entry is still valid.</summary>
-    int MaxEntryLagSeconds = 5)
+    /// <summary>
+    /// Seconds after the candle closes in which the entry is still valid.
+    /// Zero means "use the shared <see cref="RsiEntryLevels.SetupTtlSeconds"/>".
+    /// </summary>
+    int MaxEntryLagSeconds = 0)
 {
     public static AlternatingOptions Default => new();
+
+    /// <summary>The window actually applied — the shared one unless overridden.</summary>
+    public int EffectiveEntryLagSeconds =>
+        MaxEntryLagSeconds > 0 ? MaxEntryLagSeconds : RsiEntryLevels.SetupTtlSeconds;
 
     /// <summary>Contract duration in seconds: one candle of this timeframe.</summary>
     public int DurationSeconds => ExpiryCandles * TimeframeSeconds;

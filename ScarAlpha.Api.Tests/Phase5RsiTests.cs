@@ -157,7 +157,9 @@ public sealed class Phase5RsiTests
         var closes = OversoldWithRespectedBounce();
         closes.Add(110m);
         var candles = CreateCandles(closes, openLastIndex: closes.Count - 1);
-        // Mid-minute: any prior closed extreme is outside the 5s post-close window.
+        // Well past the entry window, so any prior closed extreme has expired.
+        // 30s in: the last bar is still forming, and the previous close is past the window.
+        using var _ = PinnedEntryWindow(5);
         var signal = await service.GetSignalAsync(UserId, Asset, candles, options, Now.AddSeconds(30));
 
         signal.Signal.Should().Be("None");
@@ -174,6 +176,7 @@ public sealed class Phase5RsiTests
         closes.Add(closes[^1] - 2m);
         var candles = CreateCandles(closes, openLastIndex: closes.Count - 1);
 
+        using var _ = PinnedEntryWindow(5);
         var signal = await service.GetSignalAsync(UserId, Asset, candles, options, Now.AddSeconds(30));
 
         signal.Signal.Should().Be("None");
@@ -242,6 +245,7 @@ public sealed class Phase5RsiTests
             return new RsiCandle(ts, close, EndTimestamp: ts.AddSeconds(8));
         }).ToList();
 
+        using var _ = PinnedEntryWindow(5);
         var signal = await service.GetSignalAsync(UserId, Asset, candles, options, now);
 
         signal.Signal.Should().Be("None");
@@ -358,7 +362,7 @@ public sealed class Phase5RsiTests
     }
 
     [Fact]
-    public async Task Setup_expires_after_5_seconds_and_does_not_reenter_same_close()
+    public async Task Setup_expires_after_the_entry_window_and_does_not_reenter_same_close()
     {
         var service = new RsiSignalService(new RsiCalculator());
         var options = RsiStrategyOptions.Default60Seconds;
@@ -367,15 +371,18 @@ public sealed class Phase5RsiTests
         var first = await service.GetSignalAsync(UserId, Asset, candles, options, Now);
         first.Signal.Should().Be("Call");
 
-        var stillInside = await service.GetSignalAsync(UserId, Asset, candles, options, Now.AddSeconds(4));
+        var stillInside = await service.GetSignalAsync(
+            UserId, Asset, candles, options, Now.AddSeconds(RsiEntryLevels.SetupTtlSeconds - 1));
         stillInside.Signal.Should().Be("Call");
 
-        var expired = await service.GetSignalAsync(UserId, Asset, candles, options, Now.AddSeconds(6));
+        var expired = await service.GetSignalAsync(
+            UserId, Asset, candles, options, Now.AddSeconds(RsiEntryLevels.SetupTtlSeconds + 1));
         expired.Signal.Should().Be("None");
         expired.AutomationError.Should().Be("SETUP_EXPIRED");
         expired.Backtest!.Passed.Should().BeTrue();
 
-        var stillExpired = await service.GetSignalAsync(UserId, Asset, candles, options, Now.AddSeconds(20));
+        var stillExpired = await service.GetSignalAsync(
+            UserId, Asset, candles, options, Now.AddSeconds(RsiEntryLevels.SetupTtlSeconds + 15));
         stillExpired.Signal.Should().Be("None");
         stillExpired.AutomationError.Should().Be("SETUP_EXPIRED");
     }
@@ -481,7 +488,8 @@ public sealed class Phase5RsiTests
         RsiEntryLevels.TryValidateForTrade(weakBt, Now, out var btCode).Should().BeFalse();
         btCode.Should().Be("BACKTEST_NOT_PASSED");
 
-        RsiEntryLevels.TryValidateForTrade(callOk, Now.AddSeconds(6), out var expCode).Should().BeFalse();
+        RsiEntryLevels.TryValidateForTrade(
+            callOk, Now.AddSeconds(RsiEntryLevels.SetupTtlSeconds + 1), out var expCode).Should().BeFalse();
         expCode.Should().Be("SETUP_EXPIRED");
 
         var putOk = new StrategySignal("rsi", Asset, "Put", 80m, Now, "60", okBacktest, LiveRsi: 50m);
@@ -501,6 +509,24 @@ public sealed class Phase5RsiTests
         var act = () => service.GetSignalAsync(UserId, Asset, candles, options, Now);
         var error = await act.Should().ThrowAsync<ApiException>();
         error.Which.Code.Should().Be(ApiErrorCodes.ValidationError);
+    }
+
+    /// <summary>
+    /// Pins the entry window for one test and restores it afterwards, so tests about the
+    /// FORMING bar do not have to move the clock past a whole minute to beat the window.
+    /// </summary>
+    private static IDisposable PinnedEntryWindow(int seconds)
+    {
+        var previous = RsiEntryLevels.SetupTtlSeconds;
+        RsiEntryLevels.SetupTtlSeconds = seconds;
+        return new Restore(() => RsiEntryLevels.SetupTtlSeconds = previous);
+    }
+
+    private sealed class Restore : IDisposable
+    {
+        private readonly Action _undo;
+        public Restore(Action undo) => _undo = undo;
+        public void Dispose() => _undo();
     }
 
     /// <summary>Bars of neutral history prepended so RSI is past <see cref="IndicatorWarmup"/>.</summary>
