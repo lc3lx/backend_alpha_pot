@@ -60,8 +60,28 @@ public static class Program
             foreach (var a in assets.Take(5))
                 Console.WriteLine($"  {a.Symbol} payout={(a.PayoutPercentage > 0 ? a.PayoutPercentage.ToString() : "n/a")}%");
 
-            var symbol = assets.FirstOrDefault(a => a.Symbol.Contains("EUR", StringComparison.OrdinalIgnoreCase))?.Symbol
+            // --asset AUDUSD_otc pins the pair, so the output can be lined up against a
+            // specific chart instead of whatever pair happened to come first.
+            var requested = ArgValue(args, "--asset");
+            string? symbol;
+            if (!string.IsNullOrWhiteSpace(requested))
+            {
+                symbol = assets.FirstOrDefault(a =>
+                    string.Equals(a.Symbol, requested, StringComparison.OrdinalIgnoreCase))?.Symbol;
+                if (symbol is null)
+                {
+                    Console.WriteLine($"Asset '{requested}' is not open right now. Open FX pairs:");
+                    foreach (var a in assets.Where(a => a.Symbol.Length is >= 6 and <= 12).Take(30))
+                        Console.WriteLine($"  {a.Symbol}");
+                    return 1;
+                }
+            }
+            else
+            {
+                symbol = assets.FirstOrDefault(a => a.Symbol.Contains("EUR", StringComparison.OrdinalIgnoreCase))?.Symbol
                          ?? assets.FirstOrDefault()?.Symbol;
+            }
+
             if (symbol is null)
             {
                 Console.WriteLine("No assets available.");
@@ -108,6 +128,18 @@ public static class Program
         {
             await session.DisconnectAsync();
         }
+    }
+
+    /// <summary>Reads "--name value" from the command line.</summary>
+    private static string? ArgValue(string[] args, string name)
+    {
+        for (var i = 0; i < args.Length - 1; i++)
+        {
+            if (string.Equals(args[i], name, StringComparison.OrdinalIgnoreCase))
+                return args[i + 1];
+        }
+
+        return null;
     }
 
     /// <summary>
