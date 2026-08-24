@@ -120,7 +120,8 @@ public static class MinuteBars
     public static List<CandlestickData> MergeOfficialAndTicks(
         IReadOnlyList<CandlestickData> official,
         IEnumerable<TickData> ticks,
-        int periodSeconds)
+        int periodSeconds,
+        DateTimeOffset now)
     {
         var period = EffectivePeriod(periodSeconds);
         var series = Normalize(official, period);
@@ -130,6 +131,7 @@ public static class MinuteBars
         if (series.Count == 0)
             return fromTicks;
 
+        var nowUnix = now.ToUnixTimeSeconds();
         var lastStart = (long)series[^1].Timestamp;
         foreach (var bar in fromTicks)
         {
@@ -137,7 +139,12 @@ public static class MinuteBars
             if (start < lastStart)
                 continue;
             if (start == lastStart)
-                series[^1] = CombineSameMinute(series[^1], bar, period);
+            {
+                // Once the period has elapsed the broker's own close is final. Letting a
+                // tick close override it is what makes the bot's RSI disagree with the chart.
+                var isClosed = start + period <= nowUnix;
+                series[^1] = CombineSameMinute(series[^1], bar, period, keepOfficialClose: isClosed);
+            }
             else
             {
                 series.Add(bar);
@@ -150,17 +157,30 @@ public static class MinuteBars
         return series;
     }
 
+    /// <summary>
+    /// Folds a live quote into the FORMING bar.
+    ///
+    /// <para>A quote never rewrites a bar whose period has already elapsed: that bar's
+    /// close is settled, and a late-arriving quote would silently move a value the chart
+    /// has already fixed — which shifts RSI by several points on the freshest delta.</para>
+    /// </summary>
     public static List<CandlestickData> ApplyQuote(
         IReadOnlyList<CandlestickData> candles,
         int periodSeconds,
         double quoteTimestamp,
-        double price)
+        double price,
+        DateTimeOffset now)
     {
         var period = EffectivePeriod(periodSeconds);
         var bucket = BucketStartUnix(quoteTimestamp, period);
+        var nowUnix = now.ToUnixTimeSeconds();
         var list = candles.Count == 0
             ? new List<CandlestickData>()
             : Normalize(candles, period);
+
+        // The quote belongs to a period that has already closed — leave it alone.
+        if (bucket + period <= nowUnix)
+            return list;
 
         if (list.Count == 0)
         {
@@ -200,10 +220,19 @@ public static class MinuteBars
         return list;
     }
 
+    /// <summary>
+    /// Official bar plus whatever the ticks saw inside the same period.
+    ///
+    /// <para><paramref name="keepOfficialClose"/> is the important one: for a CLOSED bar
+    /// the broker's close is the settled value the chart draws, so ticks may only widen
+    /// the high/low. For the bar still forming, ticks are newer than the last official
+    /// snapshot and their close wins.</para>
+    /// </summary>
     private static CandlestickData CombineSameMinute(
         CandlestickData official,
         CandlestickData fromTicks,
-        int period)
+        int period,
+        bool keepOfficialClose)
     {
         var start = (long)official.Timestamp;
         return new CandlestickData
@@ -212,7 +241,7 @@ public static class MinuteBars
             Open = official.Open,
             High = Math.Max(official.High, fromTicks.High),
             Low = Math.Min(official.Low, fromTicks.Low),
-            Close = fromTicks.Close,
+            Close = keepOfficialClose ? official.Close : fromTicks.Close,
             Volume = official.Volume ?? fromTicks.Volume,
             EndTimestamp = start + period
         };

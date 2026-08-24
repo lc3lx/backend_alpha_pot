@@ -1116,7 +1116,7 @@ internal sealed class SessionMessageRouter
                 }
             }
 
-            var merged = MinuteBars.MergeOfficialAndTicks(official, history.TickHistory, period);
+            var merged = MinuteBars.MergeOfficialAndTicks(official, history.TickHistory, period, DateTimeOffset.UtcNow);
             history.Candles.AddRange(merged);
 
             var ticksBefore = history.TickHistory.Count;
@@ -1176,7 +1176,7 @@ internal sealed class SessionMessageRouter
 
         lock (history.Candles)
         {
-            var updated = MinuteBars.ApplyQuote(history.Candles, period, timestamp, price);
+            var updated = MinuteBars.ApplyQuote(history.Candles, period, timestamp, price, DateTimeOffset.UtcNow);
             history.Candles.Clear();
             history.Candles.AddRange(updated);
         }
