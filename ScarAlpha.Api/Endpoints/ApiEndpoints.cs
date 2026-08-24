@@ -237,18 +237,24 @@ public static class StrategyEndpoints
             [FromQuery] decimal minimumSuccessRate = 75m,
             [FromQuery] bool autoExecute = false) =>
         {
-            _ = (oversold, overbought);
+            _ = (oversold, overbought, period);
+            var strategyId = botRuntime.Get(currentUser.UserId).StrategyId;
+
+            // The strategy owns its timeframe. The `period` query parameter predates
+            // multi-timeframe strategies and callers still send the old 60s default, so
+            // honouring it would 500 every poll for any strategy that is not 1-minute.
+            var timeframe = StrategyTimeframes.For(strategyId);
+
             var options = new RsiStrategyOptions(
                 Period: rsiLength,
                 Oversold: RsiEntryLevels.CallMax,
                 Overbought: RsiEntryLevels.PutMin,
-                TimeframeSeconds: period,
+                TimeframeSeconds: timeframe,
                 BacktestCandleCount: backtestCandles,
                 ExpiryCandles: expiryCandles,
                 MinimumSuccessRate: minimumSuccessRate);
-            var strategyId = botRuntime.Get(currentUser.UserId).StrategyId;
             return Results.Ok(await svc.GetSignalAsync(
-                asset, period, options, autoExecute, ct, strategyId: strategyId));
+                asset, timeframe, options, autoExecute, ct, strategyId: strategyId));
         });
         return group;
     }

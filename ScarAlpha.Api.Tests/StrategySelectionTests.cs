@@ -108,6 +108,31 @@ public sealed class StrategySelectionTests
         legacy!.StrategyId.Should().Be("rsi");
     }
 
+    [Fact]
+    public void Every_runnable_strategy_has_a_timeframe_the_broker_supports()
+    {
+        // Regression: the signal endpoint used to pass its legacy `period=60` query
+        // default straight through, which threw for any strategy that is not 1-minute
+        // and turned every poll into a 500. Callers must take the timeframe from the
+        // strategy, so every strategy has to declare one the wire accepts.
+        var supported = new[] { 60, 300, 900, 3600 };
+
+        foreach (var strategy in new StrategyRegistry().GetStrategies().Where(s => s.Enabled))
+        {
+            var timeframe = StrategyTimeframes.For(strategy.Id);
+            supported.Should().Contain(timeframe, $"strategy '{strategy.Id}' must run on a supported period");
+        }
+    }
+
+    [Fact]
+    public void The_alternating_strategy_is_the_five_minute_one()
+    {
+        StrategyTimeframes.For("alt5").Should().Be(300);
+        StrategyTimeframes.For("rsi").Should().Be(60);
+        StrategyTimeframes.For("ema").Should().Be(60);
+        StrategyTimeframes.For("smart").Should().Be(60);
+    }
+
     private static (BotControlAppService Control, IBotRuntimeService Runtime) Build()
     {
         var provider = new ServiceCollection().BuildServiceProvider();
