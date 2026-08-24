@@ -139,6 +139,21 @@ public static class Program
         Console.WriteLine($"RSI(14) closed       : {Indicators.Rsi(closes, 14):F2}   <-- compare with the platform");
 
         Console.WriteLine();
+        Console.WriteLine("  RSI by indicator LENGTH — find the one the chart agrees with:");
+        Console.WriteLine("  (a longer length pulls RSI toward 50, so a rising market reads lower)");
+        foreach (var length in new[] { 5, 7, 9, 10, 14, 20, 21, 25, 28 })
+        {
+            if (closes.Count < length + 1) continue;
+            var marker = length == 14 ? "  <- what the bot uses" : "";
+            Console.WriteLine($"    RSI({length,2}) = {Indicators.Rsi(closes, length):F2}{marker}");
+        }
+
+        Console.WriteLine();
+        Console.WriteLine($"  RSI(14) Cutler variant = {CutlerRsi(closes, 14):F2}");
+        Console.WriteLine("  (plain SMA of gains/losses instead of Wilder smoothing — some web");
+        Console.WriteLine("   charts implement it this way, and it can differ by several points)");
+
+        Console.WriteLine();
         Console.WriteLine("  drift by history depth (same last bar, different start):");
         foreach (var depth in new[] { 20, 30, 50, 100, 150, 200, 300 })
         {
@@ -232,6 +247,28 @@ public static class Program
         Console.WriteLine("  Now check what came back:");
         Console.WriteLine("    pm2 logs scaralpha-api | grep unknown_event");
         Console.WriteLine("  or re-run this tool without 2>/dev/null and look for 'unknown_event'.");
+    }
+
+    /// <summary>
+    /// RSI using a plain moving average of gains/losses rather than Wilder smoothing.
+    /// Not what the bot trades on — printed only so a chart that disagrees can be
+    /// identified as using this variant instead of guessing at the cause.
+    /// </summary>
+    private static decimal CutlerRsi(IReadOnlyList<decimal> closes, int length)
+    {
+        if (closes.Count < length + 1) return 0m;
+
+        decimal gains = 0m, losses = 0m;
+        for (var i = closes.Count - length; i < closes.Count; i++)
+        {
+            var delta = closes[i] - closes[i - 1];
+            if (delta > 0) gains += delta;
+            else losses -= delta;
+        }
+
+        if (losses == 0m) return gains == 0m ? 50m : 100m;
+        var rs = (gains / length) / (losses / length);
+        return 100m - 100m / (1m + rs);
     }
 
     /// <summary>Fetches one timeframe and reduces it to the gap-free closed series the bot uses.</summary>
