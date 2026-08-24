@@ -24,14 +24,14 @@ public sealed class Phase5RsiTests
             46.03m, 46.41m, 46.22m, 45.64m
         };
 
-        var rsi = Indicators.Rsi(closes, 14);
+        // RawRsiSeries deliberately: this pins the indicator itself, so a broker
+        // calibration can never quietly move the maths out from under it.
+        var raw = Indicators.RawRsiSeries(closes, 14);
 
-        rsi.Should().NotBeNull();
-        Math.Round(rsi!.Value, 3).Should().Be(57.915m);
+        Math.Round(raw[^1], 3).Should().Be(57.915m);
 
         // The seeding bar is the textbook ~70.5 first value.
-        var seed = Indicators.RsiSeries(closes, 14)[14];
-        Math.Round(seed, 2).Should().Be(70.46m);
+        Math.Round(raw[14], 2).Should().Be(70.46m);
     }
 
     [Fact]
@@ -45,14 +45,14 @@ public sealed class Phase5RsiTests
             .ToList();
         var truncated = full.Skip(full.Count - 20).ToList();
 
-        var fromFull = Indicators.Rsi(full, 14)!.Value;
-        var fromShort = Indicators.Rsi(truncated, 14)!.Value;
+        var fromFull = Indicators.RawRsiSeries(full, 14)[^1];
+        var fromShort = Indicators.RawRsiSeries(truncated, 14)[^1];
 
         Math.Abs(fromFull - fromShort).Should().BeGreaterThan(1m);
 
         // Past the warmup floor the two agree to within a rounding step.
         var warm = full.Skip(full.Count - IndicatorWarmup.ForRsi(14)).ToList();
-        Math.Abs(fromFull - Indicators.Rsi(warm, 14)!.Value).Should().BeLessThan(0.01m);
+        Math.Abs(fromFull - Indicators.RawRsiSeries(warm, 14)[^1]).Should().BeLessThan(0.01m);
     }
 
     [Fact]

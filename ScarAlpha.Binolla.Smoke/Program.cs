@@ -229,7 +229,9 @@ public static class Program
         var rsi = Indicators.RsiSeries(closes, 14);
 
         Console.WriteLine();
-        Console.WriteLine($"=== last {count} CLOSED 1m candles for {symbol} (UTC) ===");
+        Console.WriteLine($"=== last {count} CLOSED 1m candles for {symbol} ===");
+        Console.WriteLine($"  times are UTC — your chart reads UTC+03:00, so add 3 hours");
+        Console.WriteLine($"  (UTC {DateTimeOffset.UtcNow:HH:mm} = chart {DateTimeOffset.UtcNow.AddHours(3):HH:mm})");
         Console.WriteLine("  time         open      high      low       close     RSI14");
         Console.WriteLine("  " + new string('-', 62));
 
@@ -323,7 +325,16 @@ public static class Program
                 {
                     var start = DateTimeOffset.FromUnixTimeSeconds(
                         MinuteBars.BucketStartUnix(c.Timestamp, period));
-                    return new RsiCandle(start, (decimal)c.Close, start + span);
+                    // Carry the full bar: the OHLC comparison against the chart tooltip is
+                    // the whole point of the dump, and close-only made those columns blank.
+                    return new RsiCandle(
+                        Timestamp: start,
+                        Close: (decimal)c.Close,
+                        EndTimestamp: start + span,
+                        High: (decimal)c.High,
+                        Low: (decimal)c.Low,
+                        Open: (decimal)c.Open,
+                        Volume: c.Volume is double v ? (decimal)v : null);
                 })
                 .ToList();
 

@@ -14,11 +14,58 @@ namespace ScarAlpha.Application.Abstractions;
 /// </summary>
 public static class Indicators
 {
+    private static decimal _rsiCalibrationOffset;
+
     /// <summary>
-    /// Wilder RSI for every index. Entries before <paramref name="length"/> are 0
-    /// (undefined — never read them).
+    /// Empirical offset subtracted from every RSI value so the bot reads what the broker
+    /// chart reads (<c>Strategy:RsiCalibrationOffset</c>, default 0 = no calibration).
+    ///
+    /// <para>This is a CALIBRATION, not the indicator. The maths below is Wilder's and is
+    /// pinned against an independent reference; if a broker's chart still disagrees the
+    /// cause is on their side — most likely a different RSI variant (a plain moving
+    /// average instead of Wilder smoothing), which produces a gap that VARIES with the
+    /// market rather than a fixed number. Measured on live data here: 34.47 Wilder vs
+    /// 23.53 plain-average on the same bar.</para>
+    ///
+    /// <para>So treat a non-zero value as a temporary alignment, not a fix: it makes the
+    /// bot enter where the chart shows the level, but it will be too big or too small
+    /// whenever the real gap moves. Set it back to 0 once the variant is identified.</para>
+    /// </summary>
+    public static decimal RsiCalibrationOffset
+    {
+        get => _rsiCalibrationOffset;
+        set => _rsiCalibrationOffset = value is >= -25m and <= 25m
+            ? value
+            : throw new ArgumentOutOfRangeException(nameof(value), "Calibration must be between -25 and 25.");
+    }
+
+    /// <summary>Applies the calibration and keeps the result inside the RSI range.</summary>
+    private static decimal Calibrate(decimal rsi)
+    {
+        if (_rsiCalibrationOffset == 0m) return rsi;
+        var shifted = rsi - _rsiCalibrationOffset;
+        return shifted < 0m ? 0m : shifted > 100m ? 100m : shifted;
+    }
+
+    /// <summary>
+    /// Wilder RSI for every index, with any configured calibration applied. Entries
+    /// before <paramref name="length"/> are 0 (undefined — never read them).
     /// </summary>
     public static decimal[] RsiSeries(IReadOnlyList<decimal> closes, int length)
+    {
+        var series = RawRsiSeries(closes, length);
+        if (_rsiCalibrationOffset == 0m) return series;
+
+        for (var i = length; i < series.Length; i++)
+            series[i] = Calibrate(series[i]);
+        return series;
+    }
+
+    /// <summary>
+    /// Wilder RSI with NO calibration — the pure indicator, used to verify the maths
+    /// against a reference.
+    /// </summary>
+    public static decimal[] RawRsiSeries(IReadOnlyList<decimal> closes, int length)
     {
         if (closes is null) throw new ArgumentNullException(nameof(closes));
         if (length <= 0) throw new ArgumentOutOfRangeException(nameof(length));

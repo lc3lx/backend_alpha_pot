@@ -102,6 +102,8 @@ public static class DependencyInjection
         if (minVisits is int mv) RsiEntryLevels.MinZoneVisits = mv;
         var ttl = configuration.GetValue<int?>("Strategy:SetupTtlSeconds");
         if (ttl is int t2) RsiEntryLevels.SetupTtlSeconds = t2;
+        var calib = configuration.GetValue<decimal?>("Strategy:RsiCalibrationOffset");
+        if (calib is decimal cal) Indicators.RsiCalibrationOffset = cal;
 
         services.AddSingleton<IRsiSignalService, RsiSignalService>();
         services.AddSingleton<IEmaRsiSignalService, EmaRsiSignalService>();
