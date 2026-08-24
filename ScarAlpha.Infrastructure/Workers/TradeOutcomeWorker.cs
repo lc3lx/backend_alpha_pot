@@ -16,6 +16,19 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
     private readonly IBinollaSessionManager _sessions;
     private readonly IBinollaSessionRestorer _sessionRestorer;
     private readonly ILogger<TradeOutcomeWorker> _logger;
+    /// <summary>
+    /// How long past expiry we wait for Binolla to push the close before giving up on
+    /// one attempt. Retries then cover the long tail.
+    /// </summary>
+    private const int OutcomeWaitGraceSeconds = 120;
+
+    /// <summary>
+    /// Extra margin before the sweep steps in. The sweep exists for waiters that were
+    /// LOST (restart, dropped session) — it must therefore always fire AFTER a live
+    /// waiter would have timed out, never while one is still legitimately waiting.
+    /// </summary>
+    private const int SweepMarginSeconds = 60;
+
     private readonly ChannelWorkQueue _queue = new();
     private readonly ConcurrentDictionary<Guid, byte> _inFlight = new();
     private CancellationTokenSource? _cts;
@@ -70,11 +83,35 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
                     if (trade.Status is not (TradeStatus.Running or TradeStatus.Pending))
                         continue;
                     if (string.IsNullOrWhiteSpace(trade.BinollaOrderId))
+                    {
+                        // No order id means nothing can ever settle it. Only recovery used
+                        // to handle these, so they sat open until the next API restart.
+                        var noIdDeadline = trade.CreatedAt.AddSeconds(
+                            (trade.DurationSeconds > 0 ? trade.DurationSeconds : 60)
+                            + OutcomeWaitGraceSeconds + SweepMarginSeconds);
+                        if (now >= noIdDeadline && !TradeStateMachine.IsHardTerminal(trade.Status))
+                        {
+                            await ApplyStatusAsync(
+                                trades,
+                                trade,
+                                trade.Status == TradeStatus.Pending ? TradeStatus.Failed : TradeStatus.Unknown,
+                                null,
+                                "SWEEP_MISSING_ORDER_ID",
+                                ct);
+                        }
+
+                        continue;
+                    }
+
+                    // A waiter is attached right now — leave it alone. Stamping Unknown
+                    // underneath it is what made settled trades show as unsettled.
+                    if (_inFlight.ContainsKey(trade.Id))
                         continue;
 
                     var duration = trade.DurationSeconds > 0 ? trade.DurationSeconds : 60;
                     var expectedEnd = trade.CreatedAt.AddSeconds(duration);
-                    var hardDeadline = expectedEnd.AddSeconds(OpenTradeGate.RunningGraceSeconds);
+                    var hardDeadline = expectedEnd
+                        .AddSeconds(OutcomeWaitGraceSeconds + SweepMarginSeconds);
 
                     if (now >= hardDeadline)
                     {
@@ -299,9 +336,11 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
             createdAt = prepTrade.CreatedAt;
         }
 
-        var waitBudget = TimeSpan.FromSeconds(Math.Clamp(durationSeconds, 5, 3600) + 120);
-        if (waitBudget < TimeSpan.FromMinutes(15))
-            waitBudget = TimeSpan.FromMinutes(15);
+        // Deliberately NOT a flat 15 minutes: that outlived the sweep's deadline, so the
+        // sweep stamped Unknown while this waiter was still running. Retries below cover
+        // a genuinely late push without the two guards racing.
+        var waitBudget = TimeSpan.FromSeconds(
+            Math.Clamp(durationSeconds, 5, 3600) + OutcomeWaitGraceSeconds);
 
         TradeOutcome? outcome = null;
         try

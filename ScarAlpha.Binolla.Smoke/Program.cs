@@ -80,6 +80,9 @@ public static class Program
             if (args.Any(a => a.Equals("--candles", StringComparison.OrdinalIgnoreCase)))
                 await DumpCandlesAsync(session, symbol);
 
+            if (args.Any(a => a.Equals("--probe", StringComparison.OrdinalIgnoreCase)))
+                await ProbeIndicatorFeedAsync(session);
+
             if (placeTrade)
             {
                 Console.WriteLine($"Placing Demo trade on {symbol} amount=1 duration=60...");
@@ -194,6 +197,41 @@ public static class Program
 
         Console.WriteLine();
         Console.WriteLine("  Compare row by row with the chart. A mismatch names the exact minute to chase.");
+    }
+
+    /// <summary>
+    /// Answers one question with data instead of assumption: does Binolla ever send
+    /// indicator VALUES on the socket, so the bot could read RSI instead of computing it?
+    ///
+    /// <para>Sends the commands the web client uses to restore a chart and prints every
+    /// event the router does not already handle. If an <c>s_indicator</c> reply arrives
+    /// carrying numbers per candle, reading RSI off the wire is on the table. If it only
+    /// carries which indicators are switched on (the usual design — the browser computes
+    /// the values), then computing locally is the only option.</para>
+    /// </summary>
+    private static async Task ProbeIndicatorFeedAsync(BinollaSession session)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== probing for a server-side indicator feed ===");
+
+        foreach (var frame in new[]
+                 {
+                     "42[\"indicator/list\"]",
+                     "42[\"drawing/load\"]",
+                     "42[\"settings/list\"]",
+                 })
+        {
+            var sent = await session.SendDiagnosticFrameAsync(frame);
+            Console.WriteLine($"  sent {frame}  -> {(sent ? "ok" : "socket not connected")}");
+        }
+
+        // Replies are asynchronous; give them a moment to land in the log.
+        await Task.Delay(TimeSpan.FromSeconds(5));
+
+        Console.WriteLine();
+        Console.WriteLine("  Now check what came back:");
+        Console.WriteLine("    pm2 logs scaralpha-api | grep unknown_event");
+        Console.WriteLine("  or re-run this tool without 2>/dev/null and look for 'unknown_event'.");
     }
 
     /// <summary>Fetches one timeframe and reduces it to the gap-free closed series the bot uses.</summary>

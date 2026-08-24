@@ -608,6 +608,21 @@ public sealed class BinollaSession : IBinollaClient
         });
     }
 
+    /// <summary>
+    /// Sends one raw frame for protocol probing (e.g. <c>42["indicator/list"]</c>) and
+    /// lets the router log whatever comes back. Diagnostics only — nothing in the
+    /// trading path should depend on it.
+    /// </summary>
+    public async Task<bool> SendDiagnosticFrameAsync(string frame, CancellationToken cancellationToken = default)
+    {
+        var transport = _trading;
+        if (transport is null || !transport.IsConnected)
+            return false;
+
+        await transport.SendAsync(frame, cancellationToken).ConfigureAwait(false);
+        return true;
+    }
+
     public async Task<IReadOnlyList<TradingAsset>> GetTradingAssetsAsync(CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();

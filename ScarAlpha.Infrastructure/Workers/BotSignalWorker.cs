@@ -320,7 +320,8 @@ public sealed class BotSignalWorker : IHostedService
                 dbRace,
                 placedCount,
                 claimed,
-                maxLag = options.MaxEntryLagSeconds,
+                // The window actually enforced, not the raw option (0 means "use the shared one").
+                maxLag = options.EffectiveEntryLagSeconds,
                 lookback = options.BacktestCandleCount,
                 hasBest = best is not null,
                 skipMarketAccess,

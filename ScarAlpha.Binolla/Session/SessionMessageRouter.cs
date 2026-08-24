@@ -712,16 +712,16 @@ internal sealed class SessionMessageRouter
                 break;
             default:
                 // #region agent log
-                if (messageType.Contains("history", StringComparison.OrdinalIgnoreCase) ||
-                    messageType.Contains("quote", StringComparison.OrdinalIgnoreCase) ||
-                    messageType.Contains("candle", StringComparison.OrdinalIgnoreCase))
+                // Every unhandled event, with a content sample. Without the sample there
+                // is no way to answer "does the broker send X?" other than guessing.
+                LoginTrace.Write("H141", "SessionMessageRouter.ProcessEventPayloadAsync", "unknown_event", new
                 {
-                    LoginTrace.Write("H141", "SessionMessageRouter.ProcessEventPayloadAsync", "unknown_market_event", new
-                    {
-                        messageType = messageType.Length > 64 ? messageType[..64] : messageType,
-                        contentLen = content?.Length ?? 0
-                    });
-                }
+                    messageType = messageType.Length > 64 ? messageType[..64] : messageType,
+                    contentLen = content?.Length ?? 0,
+                    prefix = content is null
+                        ? null
+                        : content.Length > 200 ? content[..200] : content
+                });
                 // #endregion
                 break;
         }
