@@ -13,6 +13,9 @@ namespace ScarAlpha.Api.Tests;
 /// </summary>
 public sealed class EmaRsiStrategyTests
 {
+    /// <summary>Start from plain defaults, whatever ran before this class.</summary>
+    public EmaRsiStrategyTests() => StrategyDefaults.Reset();
+
     private static readonly Guid UserId = Guid.Parse("22222222-2222-2222-2222-222222222222");
     private const string Asset = "EURUSD_otc";
     private static readonly DateTimeOffset Now = new(2026, 8, 5, 10, 0, 0, TimeSpan.Zero);

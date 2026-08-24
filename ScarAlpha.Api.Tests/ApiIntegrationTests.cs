@@ -47,6 +47,19 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
                 ["JWT_ISSUER"] = "ScarAlpha",
                 ["JWT_AUDIENCE"] = "ScarAlpha.App",
                 ["BINOLLA_TOKEN_ENCRYPTION_KEY"] = EncryptionKey,
+
+                // Strategy config is process-global static state. Booting the real host
+                // here would otherwise leave production values (a broker calibration, a
+                // widened entry window) applied for every later test in the run, which
+                // reads as an indicator bug rather than leaked configuration.
+                ["Strategy:RsiCalibrationOffset"] = "0",
+                ["Strategy:RsiCallMax"] = "25",
+                ["Strategy:RsiPutMin"] = "75",
+                ["Strategy:MinZoneVisits"] = "1",
+                ["Strategy:SetupTtlSeconds"] = "5",
+                ["Strategy:MinRsiWarmupCandles"] = "150",
+                ["Strategy:Regime:Enabled"] = "false",
+                ["Strategy:EmaUseTrendFilter"] = "true",
                 ["Security:BinollaTokenEncryptionKey"] = EncryptionKey,
                 ["Cors:Origins"] = "http://localhost:5173",
                 ["RateLimiting:Trades:PermitLimit"] = "30",

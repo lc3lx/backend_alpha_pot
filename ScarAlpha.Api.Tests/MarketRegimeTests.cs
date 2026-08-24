@@ -10,6 +10,9 @@ namespace ScarAlpha.Api.Tests;
 /// </summary>
 public sealed class MarketRegimeTests
 {
+    /// <summary>Start from plain defaults, whatever ran before this class.</summary>
+    public MarketRegimeTests() => StrategyDefaults.Reset();
+
     private static readonly DateTimeOffset Start = new(2026, 8, 5, 9, 0, 0, TimeSpan.Zero);
     private static MarketRegimeOptions Options => MarketRegimeOptions.Default;
 

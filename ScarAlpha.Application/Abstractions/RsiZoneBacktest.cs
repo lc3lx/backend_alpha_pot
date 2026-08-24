@@ -80,45 +80,12 @@ public static class RsiZoneBacktest
         return (ToStats(callTotal, callWins, options, lookback), ToStats(putTotal, putWins, options, lookback));
     }
 
-    private static decimal[] BuildRsiSeries(IReadOnlyList<decimal> closes, RsiStrategyOptions options)
-    {
-        var series = new decimal[closes.Count];
-        if (closes.Count < options.Period + 1)
-            return series;
-
-        decimal gainSum = 0m;
-        decimal lossSum = 0m;
-        for (var i = 1; i <= options.Period; i++)
-        {
-            var delta = closes[i] - closes[i - 1];
-            if (delta > 0) gainSum += delta;
-            else lossSum += -delta;
-        }
-
-        var avgGain = gainSum / options.Period;
-        var avgLoss = lossSum / options.Period;
-        series[options.Period] = ToRsi(avgGain, avgLoss);
-
-        for (var i = options.Period + 1; i < closes.Count; i++)
-        {
-            var delta = closes[i] - closes[i - 1];
-            var gain = delta > 0 ? delta : 0m;
-            var loss = delta < 0 ? -delta : 0m;
-            avgGain = (avgGain * (options.Period - 1) + gain) / options.Period;
-            avgLoss = (avgLoss * (options.Period - 1) + loss) / options.Period;
-            series[i] = ToRsi(avgGain, avgLoss);
-        }
-
-        return series;
-    }
-
-    private static decimal ToRsi(decimal avgGain, decimal avgLoss)
-    {
-        if (avgLoss == 0m)
-            return avgGain == 0m ? 50m : 100m;
-        var rs = avgGain / avgLoss;
-        return 100m - (100m / (1m + rs));
-    }
+    /// <summary>
+    /// Same series the signals and the UI use — including calibration, so a zone visit
+    /// here means the same thing as an entry level there.
+    /// </summary>
+    private static decimal[] BuildRsiSeries(IReadOnlyList<decimal> closes, RsiStrategyOptions options) =>
+        Indicators.RsiSeries(closes, options.Period);
 
     private static RsiBacktestStats ToStats(int total, int wins, RsiStrategyOptions options, int lookback)
     {

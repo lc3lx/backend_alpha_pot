@@ -1,5 +1,6 @@
 using FluentAssertions;
 using ScarAlpha.Application.Abstractions;
+using ScarAlpha.Infrastructure.Strategies;
 using Xunit;
 
 namespace ScarAlpha.Api.Tests;
@@ -15,6 +16,9 @@ namespace ScarAlpha.Api.Tests;
 /// </summary>
 public sealed class RsiCalibrationTests
 {
+    /// <summary>Start from plain defaults, whatever ran before this class.</summary>
+    public RsiCalibrationTests() => StrategyDefaults.Reset();
+
     private static IDisposable Pinned(decimal offset)
     {
         var previous = Indicators.RsiCalibrationOffset;
@@ -95,6 +99,59 @@ public sealed class RsiCalibrationTests
         tooSmall.Should().Throw<ArgumentOutOfRangeException>();
 
         Indicators.RsiCalibrationOffset.Should().BeInRange(-25m, 25m);
+    }
+
+    [Fact]
+    public void Every_rsi_path_sees_the_same_calibrated_value()
+    {
+        // There used to be three separate Wilder implementations, and the one feeding
+        // signals ignored the calibration — so the page could show one number while the
+        // entry used another. They must all agree.
+        var closes = Rising(250);
+        var options = RsiStrategyOptions.Default60Seconds;
+
+        using var _ = Pinned(6m);
+
+        var viaIndicators = Indicators.Rsi(closes, options.Period)!.Value;
+        var viaCalculator = new RsiCalculator().CalculateRsi(closes, options);
+
+        viaCalculator.Should().Be(viaIndicators);
+        viaCalculator.Should().Be(Indicators.RawRsiSeries(closes, options.Period)[^1] - 6m);
+    }
+
+    /// <summary>
+    /// The behaviour in one line: with a 6-point calibration and PutMin at 75, a PUT
+    /// needs a TRUE reading of 81, and the page shows 75 when it happens.
+    /// </summary>
+    [Theory]
+    [InlineData(81.08, 75.08, true)]    // true 81 -> shown 75 -> enters
+    [InlineData(79.94, 73.94, false)]   // true 80 -> shown 74 -> does not
+    public void A_put_needs_a_true_reading_of_eighty_one_and_displays_seventy_five(
+        double rawApprox, double shownApprox, bool shouldEnter)
+    {
+        using var _ = Pinned(6m);
+
+        var shown = (decimal)rawApprox - Indicators.RsiCalibrationOffset;
+
+        Math.Round(shown, 2).Should().Be(Math.Round((decimal)shownApprox, 2));
+        RsiEntryLevels.IsPutRsi(shown).Should().Be(shouldEnter);
+    }
+
+    [Fact]
+    public void The_entry_level_moves_by_exactly_the_calibration_for_both_sides()
+    {
+        using var _ = Pinned(6m);
+
+        // PUT at 75 shown  =>  75 + 6 = 81 true.
+        // CALL at 25 shown =>  25 + 6 = 31 true.
+        var putTrue = RsiEntryLevels.PutMin + Indicators.RsiCalibrationOffset;
+        var callTrue = RsiEntryLevels.CallMax + Indicators.RsiCalibrationOffset;
+
+        putTrue.Should().Be(81m);
+        callTrue.Should().Be(31m);
+
+        RsiEntryLevels.IsPutRsi(putTrue - Indicators.RsiCalibrationOffset).Should().BeTrue();
+        RsiEntryLevels.IsCallRsi(callTrue - Indicators.RsiCalibrationOffset).Should().BeTrue();
     }
 
     [Fact]

@@ -8,6 +8,9 @@ namespace ScarAlpha.Api.Tests;
 
 public sealed class Phase5RsiTests
 {
+    /// <summary>Start from plain defaults, whatever ran before this class.</summary>
+    public Phase5RsiTests() => StrategyDefaults.Reset();
+
     private static readonly Guid UserId = Guid.Parse("11111111-1111-1111-1111-111111111111");
     private const string Asset = "EURUSD_otc";
     private static readonly DateTimeOffset Now = new(2026, 8, 5, 10, 0, 0, TimeSpan.Zero);

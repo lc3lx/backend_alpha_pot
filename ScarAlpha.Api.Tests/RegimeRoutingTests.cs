@@ -15,6 +15,9 @@ namespace ScarAlpha.Api.Tests;
 /// </summary>
 public sealed class RegimeRoutingTests
 {
+    /// <summary>Start from plain defaults, whatever ran before this class.</summary>
+    public RegimeRoutingTests() => StrategyDefaults.Reset();
+
     [Theory]
     // Every non-smart strategy is left completely alone by the regime, in any market.
     [InlineData(MarketRegime.Uptrend, "rsi", "Put")]
