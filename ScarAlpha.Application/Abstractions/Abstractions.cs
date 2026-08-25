@@ -33,6 +33,8 @@ public interface IBinollaLinkRepository
         int pageSize,
         CancellationToken ct = default);
     Task UpsertAsync(BinollaLink link, CancellationToken ct = default);
+    /// <summary>Links that have a stored Binolla login email (for web login → Telegram bot account resolution).</summary>
+    Task<IReadOnlyList<BinollaLink>> ListWithStoredBinollaEmailAsync(CancellationToken ct = default);
 }
 
 public interface ITradeRepository

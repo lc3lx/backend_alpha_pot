@@ -155,6 +155,14 @@ public sealed class BinollaLinkRepository : IBinollaLinkRepository
         return (items, total);
     }
 
+    public async Task<IReadOnlyList<BinollaLink>> ListWithStoredBinollaEmailAsync(CancellationToken ct = default)
+    {
+        var items = await _db.BinollaLinks
+            .Where(x => x.EncryptedBinollaEmail != null && x.EncryptedBinollaEmail != "")
+            .ToListAsync(ct);
+        return items;
+    }
+
     public async Task UpsertAsync(BinollaLink link, CancellationToken ct = default)
     {
         var existing = await _db.BinollaLinks.FirstOrDefaultAsync(x => x.UserId == link.UserId, ct);
@@ -166,6 +174,10 @@ public sealed class BinollaLinkRepository : IBinollaLinkRepository
         {
             existing.EncryptedSsid = link.EncryptedSsid;
             existing.EncryptedCookieHeader = link.EncryptedCookieHeader;
+            if (!string.IsNullOrWhiteSpace(link.EncryptedBinollaEmail))
+                existing.EncryptedBinollaEmail = link.EncryptedBinollaEmail;
+            if (!string.IsNullOrWhiteSpace(link.EncryptedBinollaPassword))
+                existing.EncryptedBinollaPassword = link.EncryptedBinollaPassword;
             existing.AccountType = link.AccountType;
             existing.Status = link.Status;
             existing.BinollaAccountIdentifier = link.BinollaAccountIdentifier;

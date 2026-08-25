@@ -14,6 +14,8 @@ namespace ScarAlpha.Application.Services;
 public sealed class BinollaAuthAppService
 {
     private readonly IUserRepository _users;
+    private readonly IBinollaLinkRepository _links;
+    private readonly ISecretProtector _protector;
     private readonly IJwtTokenService _jwt;
     private readonly BinollaAppService _binolla;
     private readonly IConfiguration _configuration;
@@ -21,12 +23,16 @@ public sealed class BinollaAuthAppService
 
     public BinollaAuthAppService(
         IUserRepository users,
+        IBinollaLinkRepository links,
+        ISecretProtector protector,
         IJwtTokenService jwt,
         BinollaAppService binolla,
         IConfiguration configuration,
         ILogger<BinollaAuthAppService> logger)
     {
         _users = users;
+        _links = links;
+        _protector = protector;
         _jwt = jwt;
         _binolla = binolla;
         _configuration = configuration;
@@ -36,13 +42,13 @@ public sealed class BinollaAuthAppService
     public async Task<BinollaAuthResponse> LoginAsync(BinollaCredentialRequest request, CancellationToken ct)
     {
         var email = NormalizeEmail(request.Email);
-        var user = await _users.GetByEmailAsync(email, ct);
+        var user = await ResolveUserForBinollaEmailAsync(email, ct);
+        var provisioned = false;
+
         if (user is null)
         {
-            throw new ApiException(
-                ApiErrorCodes.InvalidCredentials,
-                "No Scar Alpha profile for this Binolla email. Sign up on Binolla first.",
-                401);
+            user = await ProvisionUserForBinollaLoginAsync(email, ct);
+            provisioned = true;
         }
 
         if (user.IsMarketingDemo)
@@ -53,16 +59,20 @@ public sealed class BinollaAuthAppService
                 403);
         }
 
+        await EnsureUserEmailAsync(user, email, ct);
+
         var connect = await _binolla.LoginWithCredentialsForUserAsync(user.Id, request, ct);
         var token = _jwt.CreateToken(user);
-        _logger.LogInformation("Binolla web login user={UserId} email={Email}", user.Id, email);
+        _logger.LogInformation(
+            "Binolla web login user={UserId} email={Email} provisioned={Provisioned} telegram={TelegramId}",
+            user.Id, email, provisioned, user.TelegramUserId);
         return ToAuthResponse(token, user.Id.ToString(), connect);
     }
 
     public async Task<BinollaAuthResponse> SignUpAsync(BinollaCredentialRequest request, CancellationToken ct)
     {
         var email = NormalizeEmail(request.Email);
-        var existing = await _users.GetByEmailAsync(email, ct);
+        var existing = await ResolveUserForBinollaEmailAsync(email, ct);
         if (existing is not null)
         {
             throw new ApiException(
@@ -71,6 +81,59 @@ public sealed class BinollaAuthAppService
                 409);
         }
 
+        var user = await ProvisionUserForBinollaLoginAsync(email, ct);
+
+        var connect = await _binolla.SignUpWithCredentialsForUserAsync(user.Id, request, ct);
+        var token = _jwt.CreateToken(user);
+        return ToAuthResponse(token, user.Id.ToString(), connect);
+    }
+
+    /// <summary>
+    /// Website email match, then stored Binolla email on an existing bot/Telegram link.
+    /// </summary>
+    private async Task<User?> ResolveUserForBinollaEmailAsync(string email, CancellationToken ct)
+    {
+        var byEmail = await _users.GetByEmailAsync(email, ct);
+        if (byEmail is not null)
+            return byEmail;
+
+        return await FindUserByStoredBinollaEmailAsync(email, ct);
+    }
+
+    private async Task<User?> FindUserByStoredBinollaEmailAsync(string email, CancellationToken ct)
+    {
+        var links = await _links.ListWithStoredBinollaEmailAsync(ct);
+        foreach (var link in links)
+        {
+            if (string.IsNullOrWhiteSpace(link.EncryptedBinollaEmail))
+                continue;
+
+            try
+            {
+                var stored = _protector.Decrypt(link.EncryptedBinollaEmail).Trim();
+                if (!string.Equals(stored, email, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var user = await _users.GetByIdAsync(link.UserId, ct);
+                if (user is not null)
+                {
+                    _logger.LogInformation(
+                        "Resolved web login via stored Binolla email user={UserId} telegram={TelegramId}",
+                        user.Id, user.TelegramUserId);
+                    return user;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Skipping corrupt Binolla email blob for link {LinkId}", link.Id);
+            }
+        }
+
+        return null;
+    }
+
+    private async Task<User> ProvisionUserForBinollaLoginAsync(string email, CancellationToken ct)
+    {
         var now = DateTimeOffset.UtcNow;
         var user = new User
         {
@@ -81,11 +144,19 @@ public sealed class BinollaAuthAppService
             UpdatedAt = now
         };
         await _users.AddAsync(user, ct);
-        _logger.LogInformation("Created Binolla web user {UserId} email={Email}", user.Id, email);
+        _logger.LogInformation("Provisioned web user from Binolla login {UserId} email={Email}", user.Id, email);
+        return user;
+    }
 
-        var connect = await _binolla.SignUpWithCredentialsForUserAsync(user.Id, request, ct);
-        var token = _jwt.CreateToken(user);
-        return ToAuthResponse(token, user.Id.ToString(), connect);
+    private async Task EnsureUserEmailAsync(User user, string email, CancellationToken ct)
+    {
+        if (!string.IsNullOrWhiteSpace(user.Email))
+            return;
+
+        user.Email = email;
+        user.UpdatedAt = DateTimeOffset.UtcNow;
+        await _users.UpdateAsync(user, ct);
+        _logger.LogInformation("Backfilled email on user {UserId} from Binolla login", user.Id);
     }
 
     private static BinollaAuthResponse ToAuthResponse(
