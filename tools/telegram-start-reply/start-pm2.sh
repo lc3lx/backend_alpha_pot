@@ -18,7 +18,7 @@ fi
 
 : "${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN in scaralpha.env}"
 export TELEGRAM_BOT_TOKEN
-export MINIAPP_URL="${MINIAPP_URL:-https://www.scaralphaai.com/}"
+export MINIAPP_URL="${MINIAPP_URL:-https://www.scaralphaai.com/app/}"
 export BUTTON_TEXT="${BUTTON_TEXT:-Open Scar Alpha}"
 
 command -v pm2 >/dev/null || { echo "pm2 missing"; exit 1; }

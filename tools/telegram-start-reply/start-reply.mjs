@@ -5,7 +5,7 @@
  *
  * Env:
  *   TELEGRAM_BOT_TOKEN   (required)
- *   MINIAPP_URL          (default https://www.scaralphaai.com/)
+ *   MINIAPP_URL          (default https://www.scaralphaai.com/app/)
  *   BUTTON_TEXT          (default Open Scar Alpha)
  *
  * Run:
@@ -13,7 +13,7 @@
  *   pm2 start start-reply.mjs --name scaralpha-tg-start
  */
 const token = process.env.TELEGRAM_BOT_TOKEN || '';
-const miniAppUrl = (process.env.MINIAPP_URL || 'https://www.scaralphaai.com/').trim();
+const miniAppUrl = (process.env.MINIAPP_URL || 'https://www.scaralphaai.com/app/').trim();
 const buttonText = (process.env.BUTTON_TEXT || 'Open Scar Alpha').trim();
 
 if (!token || token.includes('REPLACE')) {
