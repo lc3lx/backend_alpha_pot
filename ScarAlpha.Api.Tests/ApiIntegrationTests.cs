@@ -53,6 +53,7 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
                 // widened entry window) applied for every later test in the run, which
                 // reads as an indicator bug rather than leaked configuration.
                 ["Strategy:RsiCalibrationOffset"] = "0",
+                ["Strategy:RsiCalibrationOffsetLow"] = "0",
                 ["Strategy:RsiCallMax"] = "25",
                 ["Strategy:RsiPutMin"] = "75",
                 ["Strategy:MinZoneVisits"] = "1",

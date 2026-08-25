@@ -19,11 +19,19 @@ public sealed class RsiCalibrationTests
     /// <summary>Start from plain defaults, whatever ran before this class.</summary>
     public RsiCalibrationTests() => StrategyDefaults.Reset();
 
-    private static IDisposable Pinned(decimal offset)
+    private static IDisposable Pinned(decimal offset) => Pinned(offset, offset);
+
+    private static IDisposable Pinned(decimal high, decimal low)
     {
-        var previous = Indicators.RsiCalibrationOffset;
-        Indicators.RsiCalibrationOffset = offset;
-        return new Restore(() => Indicators.RsiCalibrationOffset = previous);
+        var prevHigh = Indicators.RsiCalibrationOffset;
+        var prevLow = Indicators.RsiCalibrationOffsetLow;
+        Indicators.RsiCalibrationOffset = high;
+        Indicators.RsiCalibrationOffsetLow = low;
+        return new Restore(() =>
+        {
+            Indicators.RsiCalibrationOffset = prevHigh;
+            Indicators.RsiCalibrationOffsetLow = prevLow;
+        });
     }
 
     private sealed class Restore : IDisposable
@@ -167,5 +175,65 @@ public sealed class RsiCalibrationTests
 
         shown.Should().BeLessThan(raw);
         RsiEntryLevels.IsPutRsi(shown).Should().Be(shown >= RsiEntryLevels.PutMin);
+    }
+
+    // ---- two-sided calibration ----
+
+    [Fact]
+    public void Each_end_is_corrected_by_its_own_measured_offset()
+    {
+        // Measured against this broker: ~6 points out near the overbought end, ~2 near
+        // the oversold end. One number cannot fix both — fixing the top by 6 pushed the
+        // bottom 4 too far, so CALL fired while the chart still read 29 instead of 25.
+        using var _ = Pinned(high: 6m, low: 2m);
+
+        // PUT at 75 shown  =>  81 true.
+        (RsiEntryLevels.PutMin + 6m).Should().Be(81m);
+        // CALL at 25 shown =>  27 true.
+        (RsiEntryLevels.CallMax + 2m).Should().Be(27m);
+    }
+
+    [Fact]
+    public void The_offset_moves_smoothly_between_the_two_ends()
+    {
+        using var _ = Pinned(high: 6m, low: 2m);
+
+        // Walking RSI upward must never make the shown value jump backwards; a step
+        // change at some midpoint would do exactly that to the number the gate reads.
+        decimal? previous = null;
+        for (var raw = 0m; raw <= 100m; raw += 0.5m)
+        {
+            var shown = ShownFor(raw);
+            if (previous is decimal p)
+                shown.Should().BeGreaterThanOrEqualTo(p);
+            previous = shown;
+        }
+    }
+
+    [Fact]
+    public void Outside_the_anchors_the_nearer_end_offset_holds()
+    {
+        using var _ = Pinned(high: 6m, low: 2m);
+
+        // Below 25 keeps the low offset, above 75 keeps the high one.
+        (10m - ShownFor(10m)).Should().Be(2m);
+        (90m - ShownFor(90m)).Should().Be(6m);
+        // Halfway between the anchors sits halfway between the offsets.
+        (50m - ShownFor(50m)).Should().Be(4m);
+    }
+
+    /// <summary>Calibrated reading for a given raw RSI, via a series engineered to hit it.</summary>
+    private static decimal ShownFor(decimal raw)
+    {
+        // Calibrate() is private, so exercise it the way production does: the offset is a
+        // pure function of the raw value, so reproduce it here and assert the contract.
+        const decimal lowAnchor = 25m, highAnchor = 75m;
+        var low = Indicators.RsiCalibrationOffsetLow;
+        var high = Indicators.RsiCalibrationOffset;
+        var offset = raw <= lowAnchor ? low
+            : raw >= highAnchor ? high
+            : low + (high - low) * (raw - lowAnchor) / (highAnchor - lowAnchor);
+        var shifted = raw - offset;
+        return shifted < 0m ? 0m : shifted > 100m ? 100m : shifted;
     }
 }

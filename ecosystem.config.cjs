@@ -38,6 +38,9 @@ module.exports = {
       out_file: path.join(__dirname, 'logs', 'pm2-out.log'),
       merge_logs: true,
       time: true,
+      // Cap PM2 log growth (rotate when file exceeds ~20MB; keep last 3)
+      max_size: '20M',
+      retain: 3,
       env: {
         ASPNETCORE_ENVIRONMENT: process.env.ASPNETCORE_ENVIRONMENT || 'Development',
         ASPNETCORE_URLS: process.env.ASPNETCORE_URLS || `http://0.0.0.0:${port}`,
@@ -52,6 +55,8 @@ module.exports = {
         CORS_ORIGINS: process.env.CORS_ORIGINS || '',
         ADMIN_TELEGRAM_USER_IDS: process.env.ADMIN_TELEGRAM_USER_IDS || '',
         BINOLLA_AUTH_PROXY: process.env.BINOLLA_AUTH_PROXY || '',
+        // Debug NDJSON (debug-*.log) — leave unset/0 in production
+        SCARALPHA_AGENT_DEBUG: process.env.SCARALPHA_AGENT_DEBUG || '0',
         DOTNET_ROOT: process.env.DOTNET_ROOT || '',
         PATH: process.env.PATH || '',
       },

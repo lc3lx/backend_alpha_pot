@@ -39,6 +39,46 @@ public static class AuthEndpoints
             return Results.Ok(new { accessToken = result.AccessToken, userId = result.UserId });
         });
 
+        group.MapPost("/binolla-login", async (
+            [FromBody] BinollaCredentialRequest request,
+            BinollaAuthAppService auth,
+            CancellationToken ct) =>
+        {
+            var result = await auth.LoginAsync(request, ct);
+            return Results.Ok(new
+            {
+                accessToken = result.AccessToken,
+                userId = result.UserId,
+                connected = result.Connected,
+                accountType = result.AccountType,
+                access = result.Access,
+                adminApproved = result.AdminApproved,
+                approvalStatus = result.ApprovalStatus,
+                lastConnectedAt = result.LastConnectedAt,
+                balance = result.Balance
+            });
+        }).RequireRateLimiting("connect");
+
+        group.MapPost("/binolla-signup", async (
+            [FromBody] BinollaCredentialRequest request,
+            BinollaAuthAppService auth,
+            CancellationToken ct) =>
+        {
+            var result = await auth.SignUpAsync(request, ct);
+            return Results.Ok(new
+            {
+                accessToken = result.AccessToken,
+                userId = result.UserId,
+                connected = result.Connected,
+                accountType = result.AccountType,
+                access = result.Access,
+                adminApproved = result.AdminApproved,
+                approvalStatus = result.ApprovalStatus,
+                lastConnectedAt = result.LastConnectedAt,
+                balance = result.Balance
+            });
+        }).RequireRateLimiting("connect");
+
         group.MapPost("/demo-login", async (
             [FromBody] EmailAuthRequest request,
             AuthAppService auth,

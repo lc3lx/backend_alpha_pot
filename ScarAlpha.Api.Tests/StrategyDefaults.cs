@@ -16,6 +16,7 @@ internal static class StrategyDefaults
     public static void Reset()
     {
         Indicators.RsiCalibrationOffset = 0m;
+        Indicators.RsiCalibrationOffsetLow = 0m;
         IndicatorWarmup.MinRsiCandles = IndicatorWarmup.DefaultMinRsiCandles;
         RsiEntryLevels.CallMax = 25m;
         RsiEntryLevels.PutMin = 75m;

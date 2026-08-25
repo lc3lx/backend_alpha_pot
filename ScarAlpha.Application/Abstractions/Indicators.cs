@@ -15,35 +15,63 @@ namespace ScarAlpha.Application.Abstractions;
 public static class Indicators
 {
     private static decimal _rsiCalibrationOffset;
+    private static decimal? _rsiCalibrationOffsetLow;
+
+    /// <summary>Calibration anchors: the offsets are measured near the entry levels.</summary>
+    private const decimal LowAnchor = 25m;
+    private const decimal HighAnchor = 75m;
 
     /// <summary>
-    /// Empirical offset subtracted from every RSI value so the bot reads what the broker
-    /// chart reads (<c>Strategy:RsiCalibrationOffset</c>, default 0 = no calibration).
-    ///
-    /// <para>This is a CALIBRATION, not the indicator. The maths below is Wilder's and is
-    /// pinned against an independent reference; if a broker's chart still disagrees the
-    /// cause is on their side — most likely a different RSI variant (a plain moving
-    /// average instead of Wilder smoothing), which produces a gap that VARIES with the
-    /// market rather than a fixed number. Measured on live data here: 34.47 Wilder vs
-    /// 23.53 plain-average on the same bar.</para>
-    ///
-    /// <para>So treat a non-zero value as a temporary alignment, not a fix: it makes the
-    /// bot enter where the chart shows the level, but it will be too big or too small
-    /// whenever the real gap moves. Set it back to 0 once the variant is identified.</para>
+    /// Offset subtracted from RSI near the OVERBOUGHT end so the bot reads what the
+    /// broker chart reads (<c>Strategy:RsiCalibrationOffset</c>, default 0 = none).
     /// </summary>
     public static decimal RsiCalibrationOffset
     {
         get => _rsiCalibrationOffset;
-        set => _rsiCalibrationOffset = value is >= -25m and <= 25m
-            ? value
-            : throw new ArgumentOutOfRangeException(nameof(value), "Calibration must be between -25 and 25.");
+        set => _rsiCalibrationOffset = Validated(value);
     }
 
-    /// <summary>Applies the calibration and keeps the result inside the RSI range.</summary>
+    /// <summary>
+    /// Offset near the OVERSOLD end (<c>Strategy:RsiCalibrationOffsetLow</c>).
+    /// Defaults to the overbought offset when unset.
+    ///
+    /// <para>Two numbers because the gap is NOT constant. Measured against this broker:
+    /// ~6 points near RSI 66, but only ~2 points near RSI 30. A single offset that fixes
+    /// the top over-corrects the bottom by 4 — which made CALL fire when the chart still
+    /// read 29 instead of 25.</para>
+    /// </summary>
+    public static decimal RsiCalibrationOffsetLow
+    {
+        get => _rsiCalibrationOffsetLow ?? _rsiCalibrationOffset;
+        set => _rsiCalibrationOffsetLow = Validated(value);
+    }
+
+    private static decimal Validated(decimal value) =>
+        value is >= -25m and <= 25m
+            ? value
+            : throw new ArgumentOutOfRangeException(nameof(value), "Calibration must be between -25 and 25.");
+
+    /// <summary>
+    /// Applies the calibration and keeps the result inside the RSI range.
+    ///
+    /// <para>The offset is interpolated between the two anchors rather than switched at
+    /// a threshold: a step would make the reading jump as RSI crossed the midpoint, and
+    /// a jump in the number the entry gate reads is far worse than a small
+    /// interpolation error.</para>
+    /// </summary>
     private static decimal Calibrate(decimal rsi)
     {
-        if (_rsiCalibrationOffset == 0m) return rsi;
-        var shifted = rsi - _rsiCalibrationOffset;
+        var low = RsiCalibrationOffsetLow;
+        var high = _rsiCalibrationOffset;
+        if (low == 0m && high == 0m) return rsi;
+
+        decimal offset;
+        if (low == high) offset = high;
+        else if (rsi <= LowAnchor) offset = low;
+        else if (rsi >= HighAnchor) offset = high;
+        else offset = low + (high - low) * (rsi - LowAnchor) / (HighAnchor - LowAnchor);
+
+        var shifted = rsi - offset;
         return shifted < 0m ? 0m : shifted > 100m ? 100m : shifted;
     }
 
@@ -54,7 +82,8 @@ public static class Indicators
     public static decimal[] RsiSeries(IReadOnlyList<decimal> closes, int length)
     {
         var series = RawRsiSeries(closes, length);
-        if (_rsiCalibrationOffset == 0m) return series;
+        // Both sides checked: one offset alone being zero must not skip the other.
+        if (_rsiCalibrationOffset == 0m && RsiCalibrationOffsetLow == 0m) return series;
 
         for (var i = length; i < series.Length; i++)
             series[i] = Calibrate(series[i]);

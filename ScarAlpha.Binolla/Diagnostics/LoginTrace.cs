@@ -2,13 +2,25 @@ using System.Text.Json;
 
 namespace ScarAlpha.Binolla.Diagnostics;
 
-/// <summary>Minimal NDJSON breadcrumbs for Binolla login/WS auth. Never logs secrets.</summary>
+/// <summary>
+/// Optional NDJSON breadcrumbs for Binolla login/WS auth. Never logs secrets.
+/// Disabled by default — set SCARALPHA_AGENT_DEBUG=1 to enable file + console crumbs.
+/// </summary>
 public static class LoginTrace
 {
     private const string SessionId = "660ec2";
 
+    private static readonly bool Enabled =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SCARALPHA_AGENT_DEBUG"),
+            "1",
+            StringComparison.Ordinal);
+
     public static void Write(string hypothesisId, string location, string message, object? data = null)
     {
+        if (!Enabled)
+            return;
+
         try
         {
             var line = JsonSerializer.Serialize(new Dictionary<string, object?>
@@ -37,8 +49,6 @@ public static class LoginTrace
                 }
             }
 
-            // #region agent log
-            // Mirror critical crumbs to stdout so PM2 out log captures them without scp'ing NDJSON.
             try
             {
                 var dataJson = data is null ? "{}" : JsonSerializer.Serialize(data);
@@ -50,7 +60,6 @@ public static class LoginTrace
             {
                 // ignore
             }
-            // #endregion
         }
         catch
         {

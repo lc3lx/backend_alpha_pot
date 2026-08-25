@@ -17,6 +17,18 @@ public sealed record UpdateProfileRequest(string? FullName, string? Country, str
 
 public sealed record AuthSessionResponse(string AccessToken, string UserId);
 
+/// <summary>Public Binolla login/signup — issues JWT and connects Binolla in one step.</summary>
+public sealed record BinollaAuthResponse(
+    string AccessToken,
+    string UserId,
+    bool Connected,
+    string AccountType,
+    string Access,
+    bool AdminApproved,
+    string ApprovalStatus,
+    DateTimeOffset? LastConnectedAt,
+    decimal? Balance);
+
 public sealed record MeResponse(
     string UserId,
     long? TelegramUserId,

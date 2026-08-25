@@ -65,6 +65,7 @@ public static class DependencyInjection
         services.AddScoped<IMarketingDemoService, MarketingDemoService>();
 
         services.AddScoped<AuthAppService>();
+        services.AddScoped<BinollaAuthAppService>();
         services.AddScoped<MeAppService>();
         services.AddScoped<AccountAppService>();
         services.AddScoped<StrategyAppService>();
@@ -104,6 +105,8 @@ public static class DependencyInjection
         if (ttl is int t2) RsiEntryLevels.SetupTtlSeconds = t2;
         var calib = configuration.GetValue<decimal?>("Strategy:RsiCalibrationOffset");
         if (calib is decimal cal) Indicators.RsiCalibrationOffset = cal;
+        var calibLow = configuration.GetValue<decimal?>("Strategy:RsiCalibrationOffsetLow");
+        if (calibLow is decimal calLo) Indicators.RsiCalibrationOffsetLow = calLo;
 
         services.AddSingleton<IRsiSignalService, RsiSignalService>();
         services.AddSingleton<IEmaRsiSignalService, EmaRsiSignalService>();

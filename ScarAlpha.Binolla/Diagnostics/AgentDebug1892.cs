@@ -4,12 +4,21 @@ using System.Text.Json;
 
 namespace ScarAlpha.Binolla.Diagnostics;
 
-/// <summary>Debug-mode NDJSON for session 1892a4. Never logs secrets.</summary>
+/// <summary>
+/// Optional debug NDJSON for session 1892a4. Never logs secrets.
+/// Disabled by default — set SCARALPHA_AGENT_DEBUG=1 to enable.
+/// </summary>
 public static class AgentDebug1892
 {
     private const string SessionId = "1892a4";
     private const string IngestUrl = "http://127.0.0.1:7892/ingest/aea6d51e-f3e9-4c7e-b6b4-db55c4306e97";
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromMilliseconds(400) };
+
+    private static readonly bool Enabled =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SCARALPHA_AGENT_DEBUG"),
+            "1",
+            StringComparison.Ordinal);
 
     public static void Write(
         string hypothesisId,
@@ -18,7 +27,9 @@ public static class AgentDebug1892
         object? data = null,
         string runId = "entry-lag")
     {
-        // #region agent log
+        if (!Enabled)
+            return;
+
         try
         {
             var payload = new Dictionary<string, object?>
@@ -79,7 +90,6 @@ public static class AgentDebug1892
         {
             // never break trading
         }
-        // #endregion
     }
 
     private static IEnumerable<string> CandidatePaths()

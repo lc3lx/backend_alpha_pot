@@ -47,14 +47,24 @@ public sealed class BinollaAppService
 
     public async Task<BinollaConnectResponse> LoginWithCredentialsAsync(
         BinollaCredentialRequest request,
+        CancellationToken ct) =>
+        await LoginWithCredentialsForUserAsync(_currentUser.UserId, request, ct);
+
+    public async Task<BinollaConnectResponse> SignUpWithCredentialsAsync(
+        BinollaCredentialRequest request,
+        CancellationToken ct) =>
+        await SignUpWithCredentialsForUserAsync(_currentUser.UserId, request, ct);
+
+    public async Task<BinollaConnectResponse> LoginWithCredentialsForUserAsync(
+        Guid userId,
+        BinollaCredentialRequest request,
         CancellationToken ct)
     {
-        await EnsureNotMarketingDemoAsync(ct);
+        await EnsureNotMarketingDemoAsync(userId, ct);
         if (request is null)
             throw new ApiException(ApiErrorCodes.ValidationError, "Request body is required.");
         ValidateCredentialRequest(request);
 
-        // Independent of RequestAborted — Telegram/WebView often cancels ~20–25s.
         using var workCts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
         var workCt = workCts.Token;
 
@@ -70,104 +80,22 @@ public sealed class BinollaAppService
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Binolla credential login failed for user {UserId}", _currentUser.UserId);
+            _logger.LogWarning(ex, "Binolla credential login failed for user {UserId}", userId);
             throw new ApiException(
                 ApiErrorCodes.BinollaLoginFailed,
                 "Unable to log into Binolla with the provided credentials.",
                 400);
         }
 
-        var captureMs = sw.ElapsedMilliseconds;
-        // #region agent log
-        ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H100", "BinollaAppService.LoginWithCredentialsAsync", "capture_ok", new
-        {
-            captureMs,
-            hasCookies = !string.IsNullOrWhiteSpace(captured.CookieHeader),
-            cookieLen = captured.CookieHeader?.Length ?? 0,
-            ssidLen = captured.SsidFrame?.Length ?? 0
-        });
-        // #endregion
-
-        // Password is never stored — only the resulting SSID is encrypted via ConnectAsync.
-        // Capture is expensive; WS auth can flake — retry connect with the same token/cookies.
-        const int maxConnectAttempts = 3;
-        Exception? lastConnectError = null;
-        for (var attempt = 1; attempt <= maxConnectAttempts; attempt++)
-        {
-            try
-            {
-                var result = await ConnectAsync(
-                    new BinollaConnectRequest(captured.SsidFrame, request.AccountType),
-                    workCt,
-                    captured.CookieHeader);
-                await PersistBinollaCredentialsAsync(request.Email, request.Password, workCt);
-                // #region agent log
-                ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H100", "BinollaAppService.LoginWithCredentialsAsync", "login_ok", new
-                {
-                    captureMs,
-                    totalMs = sw.ElapsedMilliseconds,
-                    attempt
-                });
-                // #endregion
-                return result;
-            }
-            catch (Exception ex) when (
-                attempt < maxConnectAttempts &&
-                (ex is ApiException api &&
-                 (api.Code is ApiErrorCodes.BinollaConnectionFailed
-                     or ApiErrorCodes.BinollaSessionExpired
-                     or ApiErrorCodes.BinollaNotConnected)))
-            {
-                lastConnectError = ex;
-                // #region agent log
-                ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H101", "BinollaAppService.LoginWithCredentialsAsync", "connect_retry", new
-                {
-                    captureMs,
-                    attempt,
-                    type = ex.GetType().Name,
-                    code = (ex as ApiException)?.Code,
-                    message = ex.Message.Length > 120 ? ex.Message[..120] : ex.Message
-                });
-                // #endregion
-                try { await _sessions.RemoveAsync(_currentUser.UserId.ToString(), workCt); } catch { /* ignore */ }
-                await Task.Delay(TimeSpan.FromMilliseconds(400 * attempt), workCt);
-            }
-            catch (Exception ex)
-            {
-                // #region agent log
-                ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H101", "BinollaAppService.LoginWithCredentialsAsync", "connect_after_capture_failed", new
-                {
-                    captureMs,
-                    totalMs = sw.ElapsedMilliseconds,
-                    attempt,
-                    type = ex.GetType().Name,
-                    code = (ex as ApiException)?.Code,
-                    message = ex.Message.Length > 140 ? ex.Message[..140] : ex.Message
-                });
-                // #endregion
-                throw;
-            }
-        }
-
-        // #region agent log
-        ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H101", "BinollaAppService.LoginWithCredentialsAsync", "connect_after_capture_failed", new
-        {
-            captureMs,
-            totalMs = sw.ElapsedMilliseconds,
-            attempt = maxConnectAttempts,
-            type = lastConnectError?.GetType().Name,
-            message = lastConnectError?.Message is { Length: > 140 } m ? m[..140] : lastConnectError?.Message
-        });
-        // #endregion
-        if (lastConnectError is not null) throw lastConnectError;
-        throw new ApiException(ApiErrorCodes.BinollaConnectionFailed, "Unable to connect to Binolla.", 502);
+        return await CompleteCredentialConnectForUserAsync(userId, captured, request, sw, workCt);
     }
 
-    public async Task<BinollaConnectResponse> SignUpWithCredentialsAsync(
+    public async Task<BinollaConnectResponse> SignUpWithCredentialsForUserAsync(
+        Guid userId,
         BinollaCredentialRequest request,
         CancellationToken ct)
     {
-        await EnsureNotMarketingDemoAsync(ct);
+        await EnsureNotMarketingDemoAsync(userId, ct);
         if (request is null)
             throw new ApiException(ApiErrorCodes.ValidationError, "Request body is required.");
         ValidateCredentialRequest(request);
@@ -183,7 +111,7 @@ public sealed class BinollaAppService
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Binolla credential signup failed for user {UserId}", _currentUser.UserId);
+            _logger.LogWarning(ex, "Binolla credential signup failed for user {UserId}", userId);
             throw new ApiException(
                 ApiErrorCodes.BinollaLoginFailed,
                 "Unable to register on Binolla with the provided credentials.",
@@ -191,11 +119,94 @@ public sealed class BinollaAppService
         }
 
         var connected = await ConnectAsync(
+            userId,
             new BinollaConnectRequest(captured.SsidFrame, request.AccountType),
             ct,
             captured.CookieHeader);
-        await PersistBinollaCredentialsAsync(request.Email, request.Password, ct);
+        await PersistBinollaCredentialsAsync(userId, request.Email, request.Password, ct);
         return connected;
+    }
+
+    private async Task<BinollaConnectResponse> CompleteCredentialConnectForUserAsync(
+        Guid userId,
+        BinollaCapturedSession captured,
+        BinollaCredentialRequest request,
+        System.Diagnostics.Stopwatch sw,
+        CancellationToken workCt)
+    {
+        var captureMs = sw.ElapsedMilliseconds;
+        ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H100", "BinollaAppService.LoginWithCredentialsAsync", "capture_ok", new
+        {
+            captureMs,
+            hasCookies = !string.IsNullOrWhiteSpace(captured.CookieHeader),
+            cookieLen = captured.CookieHeader?.Length ?? 0,
+            ssidLen = captured.SsidFrame?.Length ?? 0
+        });
+
+        const int maxConnectAttempts = 3;
+        Exception? lastConnectError = null;
+        for (var attempt = 1; attempt <= maxConnectAttempts; attempt++)
+        {
+            try
+            {
+                var result = await ConnectAsync(
+                    userId,
+                    new BinollaConnectRequest(captured.SsidFrame, request.AccountType),
+                    workCt,
+                    captured.CookieHeader);
+                await PersistBinollaCredentialsAsync(userId, request.Email, request.Password, workCt);
+                ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H100", "BinollaAppService.LoginWithCredentialsAsync", "login_ok", new
+                {
+                    captureMs,
+                    totalMs = sw.ElapsedMilliseconds,
+                    attempt
+                });
+                return result;
+            }
+            catch (Exception ex) when (
+                attempt < maxConnectAttempts &&
+                (ex is ApiException api &&
+                 (api.Code is ApiErrorCodes.BinollaConnectionFailed
+                     or ApiErrorCodes.BinollaSessionExpired
+                     or ApiErrorCodes.BinollaNotConnected)))
+            {
+                lastConnectError = ex;
+                ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H101", "BinollaAppService.LoginWithCredentialsAsync", "connect_retry", new
+                {
+                    captureMs,
+                    attempt,
+                    type = ex.GetType().Name,
+                    code = (ex as ApiException)?.Code,
+                    message = ex.Message.Length > 120 ? ex.Message[..120] : ex.Message
+                });
+                try { await _sessions.RemoveAsync(userId.ToString(), workCt); } catch { /* ignore */ }
+                await Task.Delay(TimeSpan.FromMilliseconds(400 * attempt), workCt);
+            }
+            catch (Exception ex)
+            {
+                ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H101", "BinollaAppService.LoginWithCredentialsAsync", "connect_after_capture_failed", new
+                {
+                    captureMs,
+                    totalMs = sw.ElapsedMilliseconds,
+                    attempt,
+                    type = ex.GetType().Name,
+                    code = (ex as ApiException)?.Code,
+                    message = ex.Message.Length > 140 ? ex.Message[..140] : ex.Message
+                });
+                throw;
+            }
+        }
+
+        ScarAlpha.Binolla.Diagnostics.LoginTrace.Write("H101", "BinollaAppService.LoginWithCredentialsAsync", "connect_after_capture_failed", new
+        {
+            captureMs,
+            totalMs = sw.ElapsedMilliseconds,
+            attempt = maxConnectAttempts,
+            type = lastConnectError?.GetType().Name,
+            message = lastConnectError?.Message is { Length: > 140 } m ? m[..140] : lastConnectError?.Message
+        });
+        if (lastConnectError is not null) throw lastConnectError;
+        throw new ApiException(ApiErrorCodes.BinollaConnectionFailed, "Unable to connect to Binolla.", 502);
     }
 
     private static void ValidateCredentialRequest(BinollaCredentialRequest request)
@@ -208,12 +219,19 @@ public sealed class BinollaAppService
             throw new ApiException(ApiErrorCodes.ValidationError, "Credentials exceed allowed length.");
     }
 
+    public Task<BinollaConnectResponse> ConnectAsync(
+        BinollaConnectRequest request,
+        CancellationToken ct,
+        string? cookieHeader = null) =>
+        ConnectAsync(_currentUser.UserId, request, ct, cookieHeader);
+
     public async Task<BinollaConnectResponse> ConnectAsync(
+        Guid userId,
         BinollaConnectRequest request,
         CancellationToken ct,
         string? cookieHeader = null)
     {
-        await EnsureNotMarketingDemoAsync(ct);
+        await EnsureNotMarketingDemoAsync(userId, ct);
         if (string.IsNullOrWhiteSpace(request.Ssid))
             throw new ApiException(ApiErrorCodes.ValidationError, "ssid is required.");
 
@@ -221,7 +239,6 @@ public sealed class BinollaAppService
         if (accountType == DomainAccount.Real)
             throw new ApiException(ApiErrorCodes.RealTradingDisabled, "Real trading is disabled in this phase.", 403);
 
-        var userId = _currentUser.UserId;
         var encrypted = _protector.Encrypt(request.Ssid.Trim());
 
         try
@@ -590,9 +607,9 @@ public sealed class BinollaAppService
             ct);
     }
 
-    private async Task PersistBinollaCredentialsAsync(string email, string password, CancellationToken ct)
+    private async Task PersistBinollaCredentialsAsync(Guid userId, string email, string password, CancellationToken ct)
     {
-        var link = await _links.GetByUserIdAsync(_currentUser.UserId, ct);
+        var link = await _links.GetByUserIdAsync(userId, ct);
         if (link is null) return;
         try
         {
@@ -603,13 +620,16 @@ public sealed class BinollaAppService
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to persist Binolla credentials for user {UserId}", _currentUser.UserId);
+            _logger.LogWarning(ex, "Failed to persist Binolla credentials for user {UserId}", userId);
         }
     }
 
-    private async Task EnsureNotMarketingDemoAsync(CancellationToken ct)
+    private Task EnsureNotMarketingDemoAsync(CancellationToken ct) =>
+        EnsureNotMarketingDemoAsync(_currentUser.UserId, ct);
+
+    private async Task EnsureNotMarketingDemoAsync(Guid userId, CancellationToken ct)
     {
-        if (await _demo.IsMarketingDemoAsync(_currentUser.UserId, ct))
+        if (await _demo.IsMarketingDemoAsync(userId, ct))
         {
             throw new ApiException(
                 ApiErrorCodes.Forbidden,
