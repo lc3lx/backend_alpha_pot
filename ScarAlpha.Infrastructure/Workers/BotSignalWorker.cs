@@ -49,6 +49,12 @@ public sealed class BotSignalWorker : IHostedService
     /// </summary>
     private const int FanOutParallelism = 16;
 
+    /// <summary>
+    /// How many users may be tried as the scan's data source before the bar is given up
+    /// on. Bounded because each attempt is a full pass over every pair.
+    /// </summary>
+    private const int MaxScanCandidates = 3;
+
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IBotRuntimeService _botRuntime;
     private readonly CohortSignalCache _decisions;
@@ -354,9 +360,48 @@ public sealed class BotSignalWorker : IHostedService
 
         // Deterministic order so an equal-ranked tie always resolves the same way.
         var ordered = assets.OrderBy(a => a, StringComparer.OrdinalIgnoreCase).ToList();
-        var scanUserId = eligible[0].UserId;
         var timeframe = StrategyTimeframes.For(cohort.StrategyId);
 
+        // The scan borrows one user's socket. "Connected" is only a proxy for "serving
+        // usable market data" — a session can be up and still return nothing — and a
+        // cohort must not go blind for a whole bar because the first user in the list is
+        // the degraded one. So fall through to the next user when a scan reaches no pair.
+        foreach (var scanUser in eligible.Take(MaxScanCandidates))
+        {
+            var attempt = await ScanAsAsync(cohort, scanUser.UserId, ordered, options, timeframe, barTime, ct)
+                .ConfigureAwait(false);
+            if (attempt.AssetsScanned > 0) return attempt;
+
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                "H-MISS",
+                "BotSignalWorker.ScanCohortAsync",
+                "scan_source_blind",
+                new
+                {
+                    cohort = cohort.ToString(),
+                    userId = scanUser.UserId.ToString("N")[..8],
+                    assets = ordered.Count
+                },
+                runId: "missed-entry");
+            // #endregion
+        }
+
+        // Every candidate source came back blind — report a failed scan so it is retried
+        // rather than cached as "no trades this bar".
+        return new CohortDecision(cohort, barTime, Array.Empty<CohortCandidate>(), AssetsScanned: 0);
+    }
+
+    /// <summary>Runs one full pass over the cohort's pairs using a single user's session.</summary>
+    private async Task<CohortDecision> ScanAsAsync(
+        SignalCohort cohort,
+        Guid scanUserId,
+        IReadOnlyList<string> ordered,
+        RsiStrategyOptions options,
+        int timeframe,
+        DateTimeOffset barTime,
+        CancellationToken ct)
+    {
         var bag = new ConcurrentBag<CohortCandidate>();
         var scanned = 0;
 
@@ -422,8 +467,7 @@ public sealed class BotSignalWorker : IHostedService
         if (OpenTradeGate.IsUserHeld(userId) || ct.IsCancellationRequested)
             return false;
 
-        var selected = new HashSet<string>(bot.ResolvedAssets, StringComparer.OrdinalIgnoreCase);
-        var pick = decision.Candidates.FirstOrDefault(c => selected.Contains(c.Asset));
+        var pick = SelectForBot(bot.ResolvedAssets, decision);
         if (pick is null) return false;
 
         // Re-checked here rather than at scan time: the decision is shared, but its TTL
@@ -509,6 +553,28 @@ public sealed class BotSignalWorker : IHostedService
         }
 
         return blockers.Count > 0;
+    }
+
+    /// <summary>
+    /// The candidate this bot takes from the cohort's shared list: the best-ranked one
+    /// the user actually follows.
+    ///
+    /// <para>This is deliberately a pure function of (user's pairs, shared decision) —
+    /// no clock, no session, no per-call state. That is what makes the fan-out
+    /// deterministic: ten bots with the same pair list are guaranteed to pick the same
+    /// entry, because there is nothing left for them to disagree about.</para>
+    /// </summary>
+    internal static CohortCandidate? SelectForBot(
+        IReadOnlyList<string> selectedAssets,
+        CohortDecision decision)
+    {
+        if (decision.Candidates.Count == 0) return null;
+
+        // An empty selection means the bot follows whatever the cohort scanned.
+        if (selectedAssets.Count == 0) return decision.Candidates[0];
+
+        var selected = new HashSet<string>(selectedAssets, StringComparer.OrdinalIgnoreCase);
+        return decision.Candidates.FirstOrDefault(c => selected.Contains(c.Asset));
     }
 
     private static bool IsLiveSetup(StrategySignal signal, string? botStrategyId = null) =>

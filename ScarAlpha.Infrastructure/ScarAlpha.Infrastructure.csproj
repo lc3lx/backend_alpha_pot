@@ -29,4 +29,9 @@
     <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.2.1" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- The bot fan-out selection is internal but must be provable by test. -->
+    <InternalsVisibleTo Include="ScarAlpha.Api.Tests" />
+  </ItemGroup>
+
 </Project>
