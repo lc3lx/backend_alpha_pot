@@ -13,8 +13,21 @@ namespace ScarAlpha.Infrastructure.Workers;
 
 /// <summary>
 /// Keeps bots analyzing/trading while the Mini App is closed.
-/// Each tick scans every selected FX pair in one pass (RSI + zone backtest),
-/// then places at most one trade on the best live setup.
+///
+/// <para><b>Central decision, parallel fan-out.</b> Bots that run the same strategy for
+/// the same trade duration form a <see cref="SignalCohort"/>. Each cohort is scanned
+/// ONCE per closed bar — one pass over the union of that cohort's pairs — and the ranked
+/// result is handed to every user in the cohort at the same instant, in parallel.</para>
+///
+/// <para>This replaced a per-user scan loop. There, the market moved between the first
+/// user's scan and the last one's: a setup that was live for user #1 had aged past its
+/// TTL by the time user #7 was reached, so one account traded and another did not.
+/// Scanning is now O(cohorts x pairs) per bar instead of O(users x pairs) per second,
+/// which is what makes 100 concurrent users behave identically — and affordably.</para>
+///
+/// <para>Per-user state is still per-user: open-trade holds, daily limits, stake size and
+/// pair selection are applied during fan-out. A user is skipped only for a reason of
+/// their own, never because of when their turn came round.</para>
 /// </summary>
 public sealed class BotSignalWorker : IHostedService
 {
@@ -23,10 +36,22 @@ public sealed class BotSignalWorker : IHostedService
     /// thrash the socket so only the last pair gets candles — looks like "bot only analyzes one pair".
     /// </summary>
     private const int ScanParallelism = 1;
-    /// <summary>How many users are scanned at once, so none is left waiting past the bar close.</summary>
-    private const int BotParallelism = 4;
+
+    /// <summary>
+    /// Cohorts are independent decisions, so they scan concurrently. Kept small because
+    /// each one still drives a Binolla socket underneath.
+    /// </summary>
+    private const int CohortParallelism = 2;
+
+    /// <summary>
+    /// How many users are handed the decision at once. This is pure per-user bookkeeping
+    /// plus one order placement, so it can be far wider than the scan.
+    /// </summary>
+    private const int FanOutParallelism = 16;
+
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IBotRuntimeService _botRuntime;
+    private readonly CohortSignalCache _decisions;
     private readonly ILogger<BotSignalWorker> _logger;
     private CancellationTokenSource? _cts;
     private Task? _loop;
@@ -34,10 +59,12 @@ public sealed class BotSignalWorker : IHostedService
     public BotSignalWorker(
         IServiceScopeFactory scopeFactory,
         IBotRuntimeService botRuntime,
+        CohortSignalCache decisions,
         ILogger<BotSignalWorker> logger)
     {
         _scopeFactory = scopeFactory;
         _botRuntime = botRuntime;
+        _decisions = decisions;
         _logger = logger;
     }
 
@@ -87,6 +114,9 @@ public sealed class BotSignalWorker : IHostedService
 
     private static int SecondsIntoMinute() => DateTimeOffset.UtcNow.Second;
 
+    /// <summary>What a single user's own state says about taking this bar's decision.</summary>
+    private sealed record BotReadiness(bool Eligible, bool SkipMarketAccess);
+
     private async Task TickAsync(CancellationToken ct)
     {
         var running = _botRuntime.ListKnown()
@@ -94,40 +124,143 @@ public sealed class BotSignalWorker : IHostedService
             .ToList();
         if (running.Count == 0) return;
 
-        // Bots run CONCURRENTLY, not one after another. Sequentially, each user's scan
-        // (~1s for ~18 pairs) pushed the next user further past the bar close, so later
-        // users were evaluated 15-20s late and every setup expired. Market data is shared
-        // through MarketAnalysisCache, so this adds almost no broker traffic.
+        var cohorts = running
+            .GroupBy(b => SignalCohort.For(b.StrategyId, b.DurationSeconds))
+            .ToList();
+
         await Parallel.ForEachAsync(
-            running,
-            new ParallelOptions { MaxDegreeOfParallelism = BotParallelism, CancellationToken = ct },
-            async (bot, token) =>
+            cohorts,
+            new ParallelOptions { MaxDegreeOfParallelism = CohortParallelism, CancellationToken = ct },
+            async (group, token) =>
+            {
+                try
+                {
+                    await ProcessCohortAsync(group.Key, group.ToList(), token).ConfigureAwait(false);
+                }
+                catch (ObjectDisposedException ex)
+                {
+                    // #region agent log
+                    ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                        "H-DISPOSE",
+                        "BotSignalWorker.TickAsync",
+                        "tick_provider_disposed",
+                        new { cohort = group.Key.ToString(), err = ex.ObjectName ?? "unknown" },
+                        runId: "missed-entry");
+                    // #endregion
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "BotSignalWorker failed for cohort {Cohort}", group.Key);
+                }
+            }).ConfigureAwait(false);
+
+        var evictAt = DateTimeOffset.UtcNow;
+        foreach (var timeframe in cohorts
+                     .Select(g => StrategyTimeframes.For(g.Key.StrategyId))
+                     .Distinct())
         {
-            try
-            {
-                await ProcessBotAsync(bot, token).ConfigureAwait(false);
-            }
-            catch (ObjectDisposedException ex)
-            {
-                // #region agent log
-                ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-                    "H-DISPOSE",
-                    "BotSignalWorker.TickAsync",
-                    "tick_provider_disposed",
-                    new { userId = bot.UserId.ToString("N")[..8], err = ex.ObjectName ?? "unknown" },
-                    runId: "missed-entry");
-                // #endregion
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "BotSignalWorker failed for user {UserId}", bot.UserId);
-            }
-        }).ConfigureAwait(false);
+            _decisions.Evict(evictAt, timeframe);
+        }
     }
 
-    private async Task ProcessBotAsync(BotRuntimeConfig bot, CancellationToken ct)
+    private async Task ProcessCohortAsync(
+        SignalCohort cohort,
+        IReadOnlyList<BotRuntimeConfig> bots,
+        CancellationToken ct)
     {
-        var skipMarketAccess = true;
+        var timeframe = StrategyTimeframes.For(cohort.StrategyId);
+        var options = RsiStrategyOptions.FromBotDurationSeconds(cohort.DurationSeconds);
+
+        // This loop ticks every second, but the decision only changes once per bar. When
+        // this bar has already been decided with nothing to trade there is nothing left
+        // for any user to do, so bail out before touching the database — otherwise 100
+        // bots cost 200 trade queries a second for the ~59 seconds the answer cannot change.
+        var settled = _decisions.TryGet(cohort, timeframe, DateTimeOffset.UtcNow);
+        if (settled is { Candidates.Count: 0 }) return;
+
+        // Establishing readiness first serves two purposes: it heals dropped Binolla
+        // sessions, and it tells us which user may act as the scan's data source. Running
+        // the scan as a user who already has a trade open would soft-none every pair.
+        var readiness = new ConcurrentDictionary<Guid, BotReadiness>();
+        await Parallel.ForEachAsync(
+            bots,
+            new ParallelOptions { MaxDegreeOfParallelism = FanOutParallelism, CancellationToken = ct },
+            async (bot, token) =>
+            {
+                readiness[bot.UserId] = await PrepareBotAsync(bot, token).ConfigureAwait(false);
+            }).ConfigureAwait(false);
+
+        var eligible = bots
+            .Where(b => readiness.TryGetValue(b.UserId, out var r) && r.Eligible)
+            .ToList();
+        if (eligible.Count == 0) return;
+
+        var scanStarted = DateTimeOffset.UtcNow;
+        var secIntoMin = SecondsIntoMinute();
+
+        // THE central step: one decision per cohort per bar, however many users are in it.
+        var decision = await _decisions.GetOrAddAsync(
+            cohort,
+            timeframe,
+            DateTimeOffset.UtcNow,
+            (barTime, token) => ScanCohortAsync(cohort, eligible, options, barTime, token),
+            ct).ConfigureAwait(false);
+
+        if (decision is null || decision.Candidates.Count == 0) return;
+
+        var scanMs = (DateTimeOffset.UtcNow - scanStarted).TotalMilliseconds;
+        var placed = 0;
+
+        // Fan out WIDE and all at once: every eligible user acts on the same list at the
+        // same moment, so nobody's entry ages out waiting for their turn.
+        await Parallel.ForEachAsync(
+            eligible,
+            new ParallelOptions { MaxDegreeOfParallelism = FanOutParallelism, CancellationToken = ct },
+            async (bot, token) =>
+            {
+                try
+                {
+                    if (await ExecuteForBotAsync(bot, decision, options, token).ConfigureAwait(false))
+                        Interlocked.Increment(ref placed);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "BotSignalWorker execute failed for user {UserId}", bot.UserId);
+                }
+            }).ConfigureAwait(false);
+
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+            "H-MISS",
+            "BotSignalWorker.ProcessCohortAsync",
+            "cohort_tick",
+            new
+            {
+                cohort = cohort.ToString(),
+                bots = bots.Count,
+                eligible = eligible.Count,
+                scanned = decision.AssetsScanned,
+                candidates = decision.Candidates.Count,
+                bestAsset = decision.Candidates[0].Asset,
+                bestSignal = decision.Candidates[0].Signal.Signal,
+                placed,
+                scanMs = Math.Round(scanMs, 0),
+                secIntoMin,
+                barTime = decision.ClosedBarTime.ToUnixTimeSeconds(),
+                maxLag = options.EffectiveEntryLagSeconds,
+                central = true
+            },
+            runId: "missed-entry");
+        // #endregion
+    }
+
+    /// <summary>
+    /// Heals the user's Binolla session and reports whether their own state allows a
+    /// trade on this bar. Never throws — a user who cannot be prepared is simply not
+    /// eligible this tick.
+    /// </summary>
+    private async Task<BotReadiness> PrepareBotAsync(BotRuntimeConfig bot, CancellationToken ct)
+    {
         try
         {
             await using var scope = _scopeFactory.CreateAsyncScope();
@@ -163,18 +296,19 @@ public sealed class BotSignalWorker : IHostedService
                 // #region agent log
                 ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
                     "H-STUCK1",
-                    "BotSignalWorker.ProcessBotAsync",
+                    "BotSignalWorker.PrepareBotAsync",
                     "worker_skip_blocking_open",
                     new { userId = bot.UserId.ToString("N")[..8] },
                     runId: "stuck-running");
                 // #endregion
-                return;
+                return new BotReadiness(Eligible: false, SkipMarketAccess: true);
             }
 
             using (AmbientUserContext.Use(bot.UserId))
             {
                 var demo = scope.ServiceProvider.GetRequiredService<IMarketingDemoService>();
-                skipMarketAccess = !await demo.IsMarketingDemoAsync(bot.UserId, ct).ConfigureAwait(false);
+                var isDemo = await demo.IsMarketingDemoAsync(bot.UserId, ct).ConfigureAwait(false);
+                return new BotReadiness(Eligible: true, SkipMarketAccess: !isDemo);
             }
         }
         catch (ObjectDisposedException ex)
@@ -182,62 +316,76 @@ public sealed class BotSignalWorker : IHostedService
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
                 "H-DISPOSE",
-                "BotSignalWorker.ProcessBotAsync",
+                "BotSignalWorker.PrepareBotAsync",
                 "root_provider_disposed",
                 new { userId = bot.UserId.ToString("N")[..8], err = ex.ObjectName ?? "unknown" },
                 runId: "missed-entry");
             // #endregion
-            return;
+            return new BotReadiness(Eligible: false, SkipMarketAccess: true);
         }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "BotSignalWorker prepare failed for user {UserId}", bot.UserId);
+            return new BotReadiness(Eligible: false, SkipMarketAccess: true);
+        }
+    }
 
-        var options = RsiStrategyOptions.FromBotDurationSeconds(bot.DurationSeconds);
-        // One pass over every selected FX pair — no rotating batches.
-        var allAssets = FxCurrencyAssets.FilterSymbols(bot.ResolvedAssets);
-        if (allAssets.Count == 0)
-            return;
+    /// <summary>
+    /// Scans the cohort's pairs once and ranks every live setup. Market data comes from
+    /// <c>MarketAnalysisCache</c>, so which eligible user's session drives the socket
+    /// changes nothing about the result — it only needs to be a session that is up.
+    /// </summary>
+    private async Task<CohortDecision?> ScanCohortAsync(
+        SignalCohort cohort,
+        IReadOnlyList<BotRuntimeConfig> eligible,
+        RsiStrategyOptions options,
+        DateTimeOffset barTime,
+        CancellationToken ct)
+    {
+        // Union, not intersection: a pair any member follows is worth analysing, and each
+        // user filters the ranked list down to their own selection during fan-out.
+        var assets = FxCurrencyAssets.FilterSymbols(
+            eligible.SelectMany(b => b.ResolvedAssets)
+                .Select(a => a.Trim())
+                .Where(a => a.Length > 0)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList());
+        if (assets.Count == 0) return null;
 
-        var bag = new ConcurrentBag<(string Asset, StrategySignal Signal)>();
-        var staleHits = 0;
-        var softNone = 0;
-        var dbRace = 0;
-        var placedCount = 0;
-        var userId = bot.UserId;
-        var scanStarted = DateTimeOffset.UtcNow;
-        var secIntoMin = SecondsIntoMinute();
+        // Deterministic order so an equal-ranked tie always resolves the same way.
+        var ordered = assets.OrderBy(a => a, StringComparer.OrdinalIgnoreCase).ToList();
+        var scanUserId = eligible[0].UserId;
+        var timeframe = StrategyTimeframes.For(cohort.StrategyId);
 
-        // Scan EVERY selected pair first (serially — Binolla one-subscribe). Then PickBest + place once.
-        // Claiming mid-loop used to skip the rest of the list after the first live setup.
+        var bag = new ConcurrentBag<CohortCandidate>();
+        var scanned = 0;
+
+        // Serial by necessity — Binolla accepts one asset/change at a time.
         await Parallel.ForEachAsync(
-            allAssets,
+            ordered,
             new ParallelOptions { MaxDegreeOfParallelism = ScanParallelism, CancellationToken = ct },
             async (asset, token) =>
             {
-                if (OpenTradeGate.IsUserHeld(userId))
-                    return;
-
                 try
                 {
                     await using var assetScope = _scopeFactory.CreateAsyncScope();
                     var rsi = assetScope.ServiceProvider.GetRequiredService<RsiSignalAppService>();
-                    using (AmbientUserContext.Use(userId))
+                    using (AmbientUserContext.Use(scanUserId))
                     {
                         var signal = await rsi.GetSignalAsync(
                             asset,
-                            StrategyTimeframes.For(bot.StrategyId),
+                            timeframe,
                             options,
                             autoExecute: false,
                             token,
-                            skipMarketAccess,
-                            strategyId: bot.StrategyId);
-                        if (signal.AutomationError == "SIGNAL_STALE")
-                            Interlocked.Increment(ref staleHits);
-                        else if (signal.Signal is not ("Call" or "Put"))
-                            Interlocked.Increment(ref softNone);
+                            skipMarketAccess: true,
+                            strategyId: cohort.StrategyId);
 
-                        if (!IsLiveSetup(signal, bot.StrategyId))
-                            return;
+                        if (signal.AutomationError is not ("INSUFFICIENT_HISTORY" or "OPEN_TRADE_EXISTS"))
+                            Interlocked.Increment(ref scanned);
 
-                        bag.Add((asset, signal));
+                        if (IsLiveSetup(signal, cohort.StrategyId))
+                            bag.Add(new CohortCandidate(asset, signal));
                     }
                 }
                 catch (ObjectDisposedException ex)
@@ -245,23 +393,10 @@ public sealed class BotSignalWorker : IHostedService
                     // #region agent log
                     ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
                         "H-DISPOSE",
-                        "BotSignalWorker.ProcessBotAsync",
+                        "BotSignalWorker.ScanCohortAsync",
                         "asset_scope_disposed",
                         new { asset, err = ex.ObjectName ?? "unknown" },
                         runId: "missed-entry");
-                    // #endregion
-                }
-                catch (InvalidOperationException ex) when (
-                    ex.Message.Contains("second operation", StringComparison.OrdinalIgnoreCase) ||
-                    ex.Message.Contains("DbContext", StringComparison.OrdinalIgnoreCase))
-                {
-                    Interlocked.Increment(ref dbRace);
-                    // #region agent log
-                    ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-                        "H-DB1",
-                        "BotSignalWorker.ProcessBotAsync",
-                        "dbcontext_race_caught",
-                        new { asset, err = ex.Message.Length > 80 ? ex.Message[..80] : ex.Message });
                     // #endregion
                 }
                 catch
@@ -270,81 +405,71 @@ public sealed class BotSignalWorker : IHostedService
                 }
             }).ConfigureAwait(false);
 
-        var scanMs = (DateTimeOffset.UtcNow - scanStarted).TotalMilliseconds;
-        var best = PickBest(bag.ToList());
+        return new CohortDecision(cohort, barTime, Rank(bag.ToList()), scanned);
+    }
 
-        if (best is { } pick &&
-            !OpenTradeGate.IsUserHeld(userId) &&
-            !ct.IsCancellationRequested)
+    /// <summary>
+    /// Places this bar's decision for one user: the best-ranked candidate they actually
+    /// follow. Returns whether an order went out.
+    /// </summary>
+    private async Task<bool> ExecuteForBotAsync(
+        BotRuntimeConfig bot,
+        CohortDecision decision,
+        RsiStrategyOptions options,
+        CancellationToken ct)
+    {
+        var userId = bot.UserId;
+        if (OpenTradeGate.IsUserHeld(userId) || ct.IsCancellationRequested)
+            return false;
+
+        var selected = new HashSet<string>(bot.ResolvedAssets, StringComparer.OrdinalIgnoreCase);
+        var pick = decision.Candidates.FirstOrDefault(c => selected.Contains(c.Asset));
+        if (pick is null) return false;
+
+        // Re-checked here rather than at scan time: the decision is shared, but its TTL
+        // is wall-clock, and a user reached late must not place a stale entry.
+        if (!IsLiveSetup(pick.Signal, bot.StrategyId)) return false;
+
+        try
         {
-            try
+            await using var execScope = _scopeFactory.CreateAsyncScope();
+            var rsi = execScope.ServiceProvider.GetRequiredService<RsiSignalAppService>();
+            using (AmbientUserContext.Use(userId))
             {
-                await using var execScope = _scopeFactory.CreateAsyncScope();
-                var rsi = execScope.ServiceProvider.GetRequiredService<RsiSignalAppService>();
-                using (AmbientUserContext.Use(userId))
-                {
-                    OpenTradeGate.MarkUserHeld(userId, bot.DurationSeconds);
-                    // #region agent log
-                    ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-                        "H-LIVE",
-                        "BotSignalWorker.ProcessBotAsync",
-                        "best_execute",
-                        new
-                        {
-                            asset = pick.Asset,
-                            signal = pick.Signal.Signal,
-                            liveRsi = pick.Signal.LiveRsi,
-                            closedRsi = pick.Signal.Rsi,
-                            successRate = pick.Signal.Backtest?.SuccessRate,
-                            candidates = bag.Count,
-                            assetCount = allAssets.Count,
-                            secIntoMin
-                        },
-                        runId: "missed-entry");
-                    // #endregion
+                OpenTradeGate.MarkUserHeld(userId, bot.DurationSeconds);
+                // #region agent log
+                ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                    "H-LIVE",
+                    "BotSignalWorker.ExecuteForBotAsync",
+                    "best_execute",
+                    new
+                    {
+                        userId = userId.ToString("N")[..8],
+                        cohort = decision.Cohort.ToString(),
+                        asset = pick.Asset,
+                        signal = pick.Signal.Signal,
+                        liveRsi = pick.Signal.LiveRsi,
+                        closedRsi = pick.Signal.Rsi,
+                        successRate = pick.Signal.Backtest?.SuccessRate,
+                        candidates = decision.Candidates.Count,
+                        secIntoMin = SecondsIntoMinute()
+                    },
+                    runId: "missed-entry");
+                // #endregion
 
-                    var executed = await rsi.TryAutoExecuteAsync(pick.Signal, options, ct).ConfigureAwait(false);
-                    if (!string.IsNullOrEmpty(executed.AutomatedTradeId))
-                        placedCount = 1;
-                    else
-                        OpenTradeGate.ReleaseUser(userId);
-                }
-            }
-            catch
-            {
+                var executed = await rsi.TryAutoExecuteAsync(pick.Signal, options, ct).ConfigureAwait(false);
+                if (!string.IsNullOrEmpty(executed.AutomatedTradeId))
+                    return true;
+
                 OpenTradeGate.ReleaseUser(userId);
+                return false;
             }
         }
-
-        // #region agent log
-        ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-            "H-MISS",
-            "BotSignalWorker.ProcessBotAsync",
-            "scan_tick",
-            new
-            {
-                userId = bot.UserId.ToString("N")[..8],
-                assetCount = allAssets.Count,
-                batch = allAssets.Count,
-                scanMs = Math.Round(scanMs, 0),
-                secIntoMin,
-                candidates = bag.Count,
-                staleHits,
-                softNone,
-                dbRace,
-                placedCount,
-                claimed = placedCount > 0 ? 1 : 0,
-                maxLag = options.EffectiveEntryLagSeconds,
-                lookback = options.BacktestCandleCount,
-                hasBest = best is not null,
-                bestAsset = best?.Asset,
-                skipMarketAccess,
-                scopedPerAsset = true,
-                fullScan = true,
-                serialScan = true
-            },
-            runId: "missed-entry");
-        // #endregion
+        catch
+        {
+            OpenTradeGate.ReleaseUser(userId);
+            return false;
+        }
     }
 
     private static async Task<bool> HasBlockingOpenTradeAsync(
@@ -395,16 +520,19 @@ public sealed class BotSignalWorker : IHostedService
             regime: null,
             out _);
 
-    private static (string Asset, StrategySignal Signal)? PickBest(
-        List<(string Asset, StrategySignal Signal)> signals)
+    /// <summary>
+    /// Orders live setups best-first. Ranking is deterministic — including the final
+    /// tiebreak on symbol — because every user in the cohort walks this one list and they
+    /// must all stop at the same entry.
+    /// </summary>
+    internal static IReadOnlyList<CohortCandidate> Rank(List<CohortCandidate> signals)
     {
-        if (signals.Count == 0) return null;
+        if (signals.Count == 0) return Array.Empty<CohortCandidate>();
 
         // RSI ranks by zone-backtest strength then by how deep into the zone the bar
         // closed. The EMA strategy has no backtest, so those tiebreakers are 0 and the
         // freshest cross simply wins.
-        var ordered = signals
-            .Where(s => IsLiveSetup(s.Signal))
+        return signals
             .OrderByDescending(s => s.Signal.Backtest?.SuccessRate ?? 0m)
             .ThenByDescending(s =>
             {
@@ -417,8 +545,7 @@ public sealed class BotSignalWorker : IHostedService
                     return rsi - RsiEntryLevels.PutMin;
                 return 0m;
             })
+            .ThenBy(s => s.Asset, StringComparer.OrdinalIgnoreCase)
             .ToList();
-
-        return ordered.Count == 0 ? null : ordered[0];
     }
 }

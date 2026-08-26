@@ -500,6 +500,14 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
             $"/trading/{trade.Id}",
             ct);
 
+        if (trade.IdempotencyKey.StartsWith("bot:", StringComparison.OrdinalIgnoreCase)
+            && next is TradeStatus.Profit or TradeStatus.Loss or TradeStatus.Tie)
+        {
+            var botRuntime = scope.ServiceProvider.GetRequiredService<IBotRuntimeService>();
+            var wasLoss = next == TradeStatus.Loss;
+            botRuntime.ApplyStakeAfterOutcome(trade.UserId, trade.Amount, wasLoss);
+        }
+
         _logger.LogInformation(
             "Trade outcome tradeId={TradeId} binollaOrderId={BinollaOrderId} status={Status} pnl={Pnl} elapsedMs={ElapsedMs}",
             trade.Id, item.BinollaOrderId, next, outcome.ProfitLoss, sw.ElapsedMilliseconds);

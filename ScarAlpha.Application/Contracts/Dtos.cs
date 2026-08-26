@@ -117,7 +117,9 @@ public sealed record BotStartRequest(
     bool NotificationsEnabled = true,
     IReadOnlyList<string>? Assets = null,
     /// <summary>Strategy to run: "rsi" (default) or "ema".</summary>
-    string StrategyId = "rsi");
+    string StrategyId = "rsi",
+    /// <summary>Stake progression mode (technical indicator).</summary>
+    string StakeMode = "red-signal-pro");
 public sealed record BotApplyRequest(
     string? Asset = null,
     decimal? Amount = null,
@@ -130,7 +132,8 @@ public sealed record BotApplyRequest(
     string? RiskLevel = null,
     bool? NotificationsEnabled = null,
     IReadOnlyList<string>? Assets = null,
-    string? StrategyId = null);
+    string? StrategyId = null,
+    string? StakeMode = null);
 public sealed record BotRuntimeDto(
     string State,
     string? Asset,
@@ -147,7 +150,9 @@ public sealed record BotRuntimeDto(
     IReadOnlyList<string> Assets,
     DateTimeOffset? PnlSessionStartedAt = null,
     string? StopReason = null,
-    string StrategyId = "rsi");
+    string StrategyId = "rsi",
+    decimal BaseAmount = 0m,
+    string StakeMode = "red-signal-pro");
 
 public sealed record BinollaStatusDto(
     bool Connected,

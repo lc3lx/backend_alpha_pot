@@ -63,7 +63,8 @@ public sealed class BotControlAppService
             request.SignalConfirmationEnabled,
             request.RiskLevel,
             request.NotificationsEnabled,
-            RequireRunnableStrategy(request.StrategyId)));
+            RequireRunnableStrategy(request.StrategyId),
+            request.StakeMode));
     }
 
     public BotRuntimeDto Pause() => Map(_runtime.Pause(_currentUser.UserId));
@@ -83,7 +84,8 @@ public sealed class BotControlAppService
             request.RiskLevel,
             request.NotificationsEnabled,
             request.Assets,
-            request.StrategyId is null ? null : RequireRunnableStrategy(request.StrategyId)));
+            request.StrategyId is null ? null : RequireRunnableStrategy(request.StrategyId),
+            request.StakeMode));
 
     private static BotRuntimeDto Map(BotRuntimeConfig value) =>
         new(
@@ -102,5 +104,7 @@ public sealed class BotControlAppService
             value.ResolvedAssets,
             value.PnlSessionStartedAt,
             value.StopReason,
-            value.StrategyId);
+            value.StrategyId,
+            value.EffectiveBaseAmount,
+            value.StakeMode);
 }

@@ -113,6 +113,9 @@ public static class DependencyInjection
         services.AddSingleton<IAlternatingSignalService, AlternatingSignalService>();
         // Shared across all users: one analysis per pair per closed bar.
         services.AddSingleton<MarketAnalysisCache>();
+        // One trading decision per strategy+duration per bar, fanned out to every user
+        // in that cohort — see CohortSignalCache.
+        services.AddSingleton<CohortSignalCache>();
         services.AddSingleton<EmaRsiTradeTracker>();
 
         var binollaOptions = new BinollaSessionManagerOptions

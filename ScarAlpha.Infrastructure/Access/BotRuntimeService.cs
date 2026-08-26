@@ -23,7 +23,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
 
     public BotRuntimeConfig Get(Guid userId) => _states.TryGetValue(userId, out var state)
         ? state
-        : New(userId, BotRunState.Stopped, Array.Empty<string>(), 25m, 300, 50m, 30m);
+        : New(userId, BotRunState.Stopped, Array.Empty<string>(), 25m, 25m, 300, 50m, 30m, stakeMode: StakeProgression.RedSignalPro);
 
     public BotRuntimeConfig Start(
         Guid userId,
@@ -37,11 +37,13 @@ public sealed class BotRuntimeService : IBotRuntimeService
         bool signalConfirmationEnabled = true,
         string riskLevel = "risk-medium",
         bool notificationsEnabled = true,
-        string strategyId = "rsi") =>
+        string strategyId = "rsi",
+        string stakeMode = StakeProgression.RedSignalPro) =>
         Set(
             userId,
             BotRunState.Running,
             BotAssetList.Normalize(null, assets),
+            amount,
             amount,
             durationSeconds,
             dailyProfitTarget,
@@ -54,6 +56,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
             pnlSessionStartedAt: DateTimeOffset.UtcNow,
             stopReason: null,
             strategyId: strategyId,
+            stakeMode: StakeProgression.NormalizeMode(stakeMode),
             persist: true);
 
     public BotRuntimeConfig Pause(Guid userId)
@@ -64,6 +67,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
             BotRunState.Paused,
             current.ResolvedAssets,
             current.Amount,
+            current.BaseAmount,
             current.DurationSeconds,
             current.DailyProfitTarget,
             current.DailyLossLimit,
@@ -75,6 +79,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
             pnlSessionStartedAt: current.PnlSessionStartedAt,
             stopReason: current.StopReason,
             strategyId: current.StrategyId,
+            stakeMode: current.StakeMode,
             persist: true);
     }
 
@@ -86,6 +91,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
             BotRunState.Stopped,
             current.ResolvedAssets,
             current.Amount,
+            current.BaseAmount,
             current.DurationSeconds,
             current.DailyProfitTarget,
             current.DailyLossLimit,
@@ -97,6 +103,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
             pnlSessionStartedAt: current.PnlSessionStartedAt,
             stopReason: stopReason,
             strategyId: current.StrategyId,
+            stakeMode: current.StakeMode,
             persist: true);
     }
 
@@ -113,17 +120,38 @@ public sealed class BotRuntimeService : IBotRuntimeService
         string? riskLevel = null,
         bool? notificationsEnabled = null,
         IReadOnlyList<string>? assets = null,
-        string? strategyId = null)
+        string? strategyId = null,
+        string? stakeMode = null)
     {
         var current = Get(userId);
         var nextAssets = assets is not null || asset is not null
             ? BotAssetList.Normalize(asset, assets)
             : current.ResolvedAssets;
+
+        var stakeChanged = stakeMode is not null;
+        var nextStake = stakeChanged
+            ? StakeProgression.NormalizeMode(stakeMode)
+            : current.StakeMode;
+
+        decimal nextBase;
+        decimal nextAmount;
+        if (amount.HasValue)
+        {
+            nextBase = amount.Value;
+            nextAmount = amount.Value;
+        }
+        else
+        {
+            nextBase = current.BaseAmount;
+            nextAmount = stakeChanged ? current.EffectiveBaseAmount : current.Amount;
+        }
+
         return Set(
             userId,
             current.State,
             nextAssets,
-            amount ?? current.Amount,
+            nextAmount,
+            nextBase,
             durationSeconds ?? current.DurationSeconds,
             dailyProfitTarget ?? current.DailyProfitTarget,
             dailyLossLimit ?? current.DailyLossLimit,
@@ -135,6 +163,41 @@ public sealed class BotRuntimeService : IBotRuntimeService
             pnlSessionStartedAt: current.PnlSessionStartedAt,
             stopReason: current.StopReason,
             strategyId: strategyId ?? current.StrategyId,
+            stakeMode: nextStake,
+            persist: true);
+    }
+
+    public BotRuntimeConfig ApplyStakeAfterOutcome(Guid userId, decimal lastTradeAmount, bool wasLoss)
+    {
+        var current = Get(userId);
+        if (current.State is not (BotRunState.Running or BotRunState.Paused))
+            return current;
+
+        var nextAmount = wasLoss
+            ? StakeProgression.CalculateNextAfterLoss(current.StakeMode, current.EffectiveBaseAmount, lastTradeAmount)
+            : StakeProgression.ResetAfterWin(current.EffectiveBaseAmount);
+
+        if (nextAmount == current.Amount)
+            return current;
+
+        return Set(
+            userId,
+            current.State,
+            current.ResolvedAssets,
+            nextAmount,
+            current.EffectiveBaseAmount,
+            current.DurationSeconds,
+            current.DailyProfitTarget,
+            current.DailyLossLimit,
+            current.AutoStopAtProfit,
+            current.AutoStopAtLoss,
+            current.SignalConfirmationEnabled,
+            current.RiskLevel,
+            current.NotificationsEnabled,
+            pnlSessionStartedAt: current.PnlSessionStartedAt,
+            stopReason: current.StopReason,
+            strategyId: current.StrategyId,
+            stakeMode: current.StakeMode,
             persist: true);
     }
 
@@ -151,6 +214,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
         BotRunState state,
         IReadOnlyList<string> assets,
         decimal amount,
+        decimal baseAmount,
         int durationSeconds,
         decimal dailyProfitTarget,
         decimal dailyLossLimit,
@@ -162,10 +226,13 @@ public sealed class BotRuntimeService : IBotRuntimeService
         DateTimeOffset? pnlSessionStartedAt,
         string? stopReason,
         bool persist,
-        string strategyId = "rsi")
+        string strategyId = "rsi",
+        string stakeMode = StakeProgression.RedSignalPro)
     {
         if (amount <= 0 || amount > 100_000m)
             throw new ArgumentOutOfRangeException(nameof(amount));
+        if (baseAmount <= 0 || baseAmount > 100_000m)
+            throw new ArgumentOutOfRangeException(nameof(baseAmount));
         if (durationSeconds is < 5 or > 3600)
             throw new ArgumentOutOfRangeException(nameof(durationSeconds));
         if (dailyProfitTarget < 0 || dailyLossLimit < 0)
@@ -178,6 +245,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
             state,
             normalized,
             amount,
+            baseAmount,
             durationSeconds,
             dailyProfitTarget,
             dailyLossLimit,
@@ -188,7 +256,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
             notificationsEnabled,
             pnlSessionStartedAt,
             stopReason,
-            strategyId);
+            strategyId,
+            stakeMode);
         _states[userId] = next;
         if (persist)
             QueuePersist(next);
@@ -221,6 +290,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
         BotRunState state,
         IReadOnlyList<string> assets,
         decimal amount,
+        decimal baseAmount,
         int duration,
         decimal profitTarget,
         decimal lossLimit,
@@ -231,7 +301,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
         bool notificationsEnabled = true,
         DateTimeOffset? pnlSessionStartedAt = null,
         string? stopReason = null,
-        string strategyId = "rsi")
+        string strategyId = "rsi",
+        string stakeMode = StakeProgression.RedSignalPro)
     {
         var list = BotAssetList.Normalize(null, assets);
         return new BotRuntimeConfig(
@@ -251,7 +322,9 @@ public sealed class BotRuntimeService : IBotRuntimeService
             list,
             pnlSessionStartedAt,
             stopReason,
-            NormalizeStrategy(strategyId));
+            NormalizeStrategy(strategyId),
+            baseAmount,
+            StakeProgression.NormalizeMode(stakeMode));
     }
 
     /// <summary>Unknown ids fall back to the always-available RSI strategy.</summary>
@@ -278,7 +351,9 @@ public sealed class BotRuntimeService : IBotRuntimeService
         bool NotificationsEnabled,
         DateTimeOffset? PnlSessionStartedAt,
         string? StopReason,
-        string StrategyId = "rsi")
+        string StrategyId = "rsi",
+        decimal BaseAmount = 0m,
+        string StakeMode = StakeProgression.RedSignalPro)
     {
         public static StoredBotRuntime From(BotRuntimeConfig c) => new(
             c.State.ToString(),
@@ -294,17 +369,21 @@ public sealed class BotRuntimeService : IBotRuntimeService
             c.NotificationsEnabled,
             c.PnlSessionStartedAt,
             c.StopReason,
-            c.StrategyId);
+            c.StrategyId,
+            c.EffectiveBaseAmount,
+            c.StakeMode);
 
         public BotRuntimeConfig ToConfig(Guid userId)
         {
             var state = Enum.TryParse<BotRunState>(State, true, out var s) ? s : BotRunState.Stopped;
             var assets = BotAssetList.Normalize(null, Assets);
+            var amount = Amount <= 0 ? 25m : Amount;
+            var baseAmount = BaseAmount <= 0 ? amount : BaseAmount;
             return new BotRuntimeConfig(
                 userId,
                 state,
                 assets.Count > 0 ? assets[0] : null,
-                Amount <= 0 ? 25m : Amount,
+                amount,
                 DurationSeconds is < 5 or > 3600 ? 300 : DurationSeconds,
                 DailyProfitTarget < 0 ? 50m : DailyProfitTarget,
                 DailyLossLimit < 0 ? 30m : DailyLossLimit,
@@ -317,7 +396,9 @@ public sealed class BotRuntimeService : IBotRuntimeService
                 assets,
                 PnlSessionStartedAt,
                 StopReason,
-                NormalizeStrategy(StrategyId));
+                NormalizeStrategy(StrategyId),
+                baseAmount,
+                StakeProgression.NormalizeMode(StakeMode));
         }
 
         public static BotRuntimeConfig? TryParse(Guid userId, string? json)

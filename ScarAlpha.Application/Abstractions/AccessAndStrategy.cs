@@ -95,8 +95,13 @@ public sealed record BotRuntimeConfig(
     /// <summary>Why the bot last stopped — e.g. DAILY_PROFIT_TARGET_REACHED.</summary>
     string? StopReason = null,
     /// <summary>Which strategy the bot executes: "rsi" or "ema".</summary>
-    string StrategyId = "rsi")
+    string StrategyId = "rsi",
+    /// <summary>Configured base stake — progression resets here after a win.</summary>
+    decimal BaseAmount = 0m,
+    /// <summary>Stake progression mode (technical indicator): red-signal-pro, alpha-momentum, etc.</summary>
+    string StakeMode = "red-signal-pro")
 {
+    public decimal EffectiveBaseAmount => BaseAmount > 0 ? BaseAmount : Amount;
     /// <summary>Selected pairs to analyze (falls back to single Asset).</summary>
     public IReadOnlyList<string> ResolvedAssets =>
         Assets is { Count: > 0 }
@@ -121,7 +126,8 @@ public interface IBotRuntimeService
         bool signalConfirmationEnabled = true,
         string riskLevel = "risk-medium",
         bool notificationsEnabled = true,
-        string strategyId = "rsi");
+        string strategyId = "rsi",
+        string stakeMode = "red-signal-pro");
     BotRuntimeConfig Pause(Guid userId);
     BotRuntimeConfig Stop(Guid userId, string? stopReason = null);
     BotRuntimeConfig Apply(
@@ -137,7 +143,10 @@ public interface IBotRuntimeService
         string? riskLevel = null,
         bool? notificationsEnabled = null,
         IReadOnlyList<string>? assets = null,
-        string? strategyId = null);
+        string? strategyId = null,
+        string? stakeMode = null);
+    /// <summary>Adjust bot stake after a bot trade settles (win resets, loss progresses).</summary>
+    BotRuntimeConfig ApplyStakeAfterOutcome(Guid userId, decimal lastTradeAmount, bool wasLoss);
     IReadOnlyList<BotRuntimeConfig> ListKnown();
     /// <summary>Load persisted runtime into memory (API startup). Does not rewrite DB.</summary>
     void RestoreFromPersistence(BotRuntimeConfig config);

@@ -36,9 +36,13 @@ public static class Indicators
     /// Defaults to the overbought offset when unset.
     ///
     /// <para>Two numbers because the gap is NOT constant. Measured against this broker:
-    /// ~6 points near RSI 66, but only ~2 points near RSI 30. A single offset that fixes
-    /// the top over-corrects the bottom by 4 — which made CALL fire when the chart still
-    /// read 29 instead of 25.</para>
+    /// ~9 points near the overbought level, but only ~2 points near RSI 30. A single
+    /// offset that fixes the top over-corrects the bottom by 7 — which made CALL fire
+    /// when the chart still read 29 instead of 25.</para>
+    ///
+    /// <para>The high offset was re-measured after a live PUT entry: the bot read 75
+    /// with an offset of 6 (raw 81) while the chart read 72, so the true gap at the
+    /// overbought level is 9, not 6. The oversold side was confirmed correct at 2.</para>
     /// </summary>
     public static decimal RsiCalibrationOffsetLow
     {
