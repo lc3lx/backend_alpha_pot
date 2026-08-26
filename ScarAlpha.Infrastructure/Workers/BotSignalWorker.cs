@@ -13,15 +13,18 @@ namespace ScarAlpha.Infrastructure.Workers;
 
 /// <summary>
 /// Keeps bots analyzing/trading while the Mini App is closed.
-/// Each tick scans every selected FX pair in one pass (RSI + zone backtest in parallel)
-/// so a closed 25/75 setup is not missed by rotating batches.
+/// Each tick scans every selected FX pair in one pass (RSI + zone backtest),
+/// then places at most one trade on the best live setup.
 /// </summary>
 public sealed class BotSignalWorker : IHostedService
 {
-    /// <summary>Cap concurrent Binolla history/quote work so the WS is not flooded.</summary>
-    private const int ScanParallelism = 8;
+    /// <summary>
+    /// Must stay 1: Binolla accepts ONE asset/change at a time. Parallel history fetches
+    /// thrash the socket so only the last pair gets candles — looks like "bot only analyzes one pair".
+    /// </summary>
+    private const int ScanParallelism = 1;
     /// <summary>How many users are scanned at once, so none is left waiting past the bar close.</summary>
-    private const int BotParallelism = 8;
+    private const int BotParallelism = 4;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IBotRuntimeService _botRuntime;
     private readonly ILogger<BotSignalWorker> _logger;
@@ -198,20 +201,17 @@ public sealed class BotSignalWorker : IHostedService
         var softNone = 0;
         var dbRace = 0;
         var placedCount = 0;
-        var claimed = 0;
         var userId = bot.UserId;
         var scanStarted = DateTimeOffset.UtcNow;
         var secIntoMin = SecondsIntoMinute();
 
-        // Analyze all selected pairs this tick. First valid Call/Put executes immediately
-        // on that pair's own scope so we do not wait for the rest of the list.
+        // Scan EVERY selected pair first (serially — Binolla one-subscribe). Then PickBest + place once.
+        // Claiming mid-loop used to skip the rest of the list after the first live setup.
         await Parallel.ForEachAsync(
             allAssets,
             new ParallelOptions { MaxDegreeOfParallelism = ScanParallelism, CancellationToken = ct },
             async (asset, token) =>
             {
-                if (Volatile.Read(ref claimed) != 0)
-                    return;
                 if (OpenTradeGate.IsUserHeld(userId))
                     return;
 
@@ -234,39 +234,10 @@ public sealed class BotSignalWorker : IHostedService
                         else if (signal.Signal is not ("Call" or "Put"))
                             Interlocked.Increment(ref softNone);
 
-                        // Gate BEFORE MarkUserHeld below — a rejection after the hold
-                        // would freeze this user for a whole trade duration.
                         if (!IsLiveSetup(signal, bot.StrategyId))
                             return;
 
                         bag.Add((asset, signal));
-                        if (Interlocked.CompareExchange(ref claimed, 1, 0) != 0)
-                            return;
-
-                        OpenTradeGate.MarkUserHeld(userId, bot.DurationSeconds);
-
-                        // #region agent log
-                        ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-                            "H-LIVE",
-                            "BotSignalWorker.ProcessBotAsync",
-                            "immediate_execute",
-                            new
-                            {
-                                asset,
-                                signal = signal.Signal,
-                                liveRsi = signal.LiveRsi,
-                                closedRsi = signal.Rsi,
-                                successRate = signal.Backtest?.SuccessRate,
-                                secIntoMin
-                            },
-                            runId: "missed-entry");
-                        // #endregion
-
-                        var executed = await rsi.TryAutoExecuteAsync(signal, options, token);
-                        if (!string.IsNullOrEmpty(executed.AutomatedTradeId))
-                            Interlocked.Increment(ref placedCount);
-                        else
-                            OpenTradeGate.ReleaseUser(userId);
                     }
                 }
                 catch (ObjectDisposedException ex)
@@ -302,6 +273,49 @@ public sealed class BotSignalWorker : IHostedService
         var scanMs = (DateTimeOffset.UtcNow - scanStarted).TotalMilliseconds;
         var best = PickBest(bag.ToList());
 
+        if (best is { } pick &&
+            !OpenTradeGate.IsUserHeld(userId) &&
+            !ct.IsCancellationRequested)
+        {
+            try
+            {
+                await using var execScope = _scopeFactory.CreateAsyncScope();
+                var rsi = execScope.ServiceProvider.GetRequiredService<RsiSignalAppService>();
+                using (AmbientUserContext.Use(userId))
+                {
+                    OpenTradeGate.MarkUserHeld(userId, bot.DurationSeconds);
+                    // #region agent log
+                    ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                        "H-LIVE",
+                        "BotSignalWorker.ProcessBotAsync",
+                        "best_execute",
+                        new
+                        {
+                            asset = pick.Asset,
+                            signal = pick.Signal.Signal,
+                            liveRsi = pick.Signal.LiveRsi,
+                            closedRsi = pick.Signal.Rsi,
+                            successRate = pick.Signal.Backtest?.SuccessRate,
+                            candidates = bag.Count,
+                            assetCount = allAssets.Count,
+                            secIntoMin
+                        },
+                        runId: "missed-entry");
+                    // #endregion
+
+                    var executed = await rsi.TryAutoExecuteAsync(pick.Signal, options, ct).ConfigureAwait(false);
+                    if (!string.IsNullOrEmpty(executed.AutomatedTradeId))
+                        placedCount = 1;
+                    else
+                        OpenTradeGate.ReleaseUser(userId);
+                }
+            }
+            catch
+            {
+                OpenTradeGate.ReleaseUser(userId);
+            }
+        }
+
         // #region agent log
         ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
             "H-MISS",
@@ -319,14 +333,15 @@ public sealed class BotSignalWorker : IHostedService
                 softNone,
                 dbRace,
                 placedCount,
-                claimed,
-                // The window actually enforced, not the raw option (0 means "use the shared one").
+                claimed = placedCount > 0 ? 1 : 0,
                 maxLag = options.EffectiveEntryLagSeconds,
                 lookback = options.BacktestCandleCount,
                 hasBest = best is not null,
+                bestAsset = best?.Asset,
                 skipMarketAccess,
                 scopedPerAsset = true,
-                fullScan = true
+                fullScan = true,
+                serialScan = true
             },
             runId: "missed-entry");
         // #endregion
