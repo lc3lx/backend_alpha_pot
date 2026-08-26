@@ -86,9 +86,6 @@ public sealed class TradeAppService
         if (link is null || link.Status != BinollaLinkStatus.Connected)
             throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Connect Binolla before trading.", 409);
 
-        if (link.AccountType != BinollaAccountType.Demo)
-            throw new ApiException(ApiErrorCodes.RealTradingDisabled, "Real trading is disabled in this phase.", 403);
-
         var client = _sessions.Get(userId.ToString());
         if (client is null ||
             client.Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected))
@@ -100,10 +97,8 @@ public sealed class TradeAppService
         try
         {
             var balance = await client.GetBalanceAsync(ct);
-            if (balance.CurrentType != AccountType.Demo)
-                throw new ApiException(ApiErrorCodes.RealTradingDisabled, "Real trading is disabled in this phase.", 403);
             if (balance.CurrentBalance < request.Amount)
-                throw new ApiException(ApiErrorCodes.InsufficientBalance, "Insufficient Demo balance.", 400);
+                throw new ApiException(ApiErrorCodes.InsufficientBalance, "Insufficient balance.", 400);
         }
         catch (ApiException) { throw; }
         catch (BinollaAuthenticationException)

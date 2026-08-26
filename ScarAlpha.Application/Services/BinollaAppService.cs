@@ -489,13 +489,15 @@ public sealed class BinollaAppService
         {
             using var balCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
             var balance = await client.GetBalanceAsync(balCts.Token);
-            // Real trading is disabled: never surface Real balance as actionable funds.
+            var accountType = balance.CurrentType == EngineAccount.Real ? "Real" : "Demo";
+            var current =
+                balance.CurrentType == EngineAccount.Real ? balance.RealBalance : balance.DemoBalance;
             return new BinollaBalanceDto(
                 Connected: true,
-                AccountType: "Demo",
+                AccountType: accountType,
                 DemoBalance: balance.DemoBalance,
-                RealBalance: 0m,
-                CurrentBalance: balance.DemoBalance);
+                RealBalance: balance.RealBalance,
+                CurrentBalance: current);
         }
         catch (BinollaAuthenticationException)
         {
@@ -530,16 +532,15 @@ public sealed class BinollaAppService
     {
         await EnsureNotMarketingDemoAsync(ct);
         var accountType = ParseAccountType(request.AccountType);
-        if (accountType == DomainAccount.Real)
-            throw new ApiException(ApiErrorCodes.RealTradingDisabled, "Real trading is disabled in this phase.", 403);
 
         var client = RequireConnectedClient();
-        await client.ChangeAccountAsync(EngineAccount.Demo, ct);
+        var engineType = accountType == DomainAccount.Real ? EngineAccount.Real : EngineAccount.Demo;
+        await client.ChangeAccountAsync(engineType, ct);
 
         var link = await _links.GetByUserIdAsync(_currentUser.UserId, ct);
         if (link is not null)
         {
-            link.AccountType = DomainAccount.Demo;
+            link.AccountType = accountType;
             link.UpdatedAt = DateTimeOffset.UtcNow;
             await _links.UpsertAsync(link, ct);
         }
@@ -658,7 +659,7 @@ public sealed class BinollaAppService
         return value.Trim().ToLowerInvariant() switch
         {
             "demo" => DomainAccount.Demo,
-            "real" => DomainAccount.Real,
+            "real" or "live" => DomainAccount.Real,
             _ => throw new ApiException(ApiErrorCodes.ValidationError, "accountType must be Demo or Real.")
         };
     }
