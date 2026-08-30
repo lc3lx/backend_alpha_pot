@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Configuration;
 using Microsoft.EntityFrameworkCore;
 using ScarAlpha.Domain.Entities;
 
@@ -5,7 +6,18 @@ namespace ScarAlpha.Infrastructure.Persistence;
 
 public sealed class AppDbContext : DbContext
 {
-    public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
+    private readonly bool _useMySql;
+
+    public AppDbContext(DbContextOptions<AppDbContext> options)
+        : this(options, new ConfigurationBuilder().Build())
+    {
+    }
+
+    public AppDbContext(DbContextOptions<AppDbContext> options, IConfiguration configuration)
+        : base(options)
+    {
+        _useMySql = DatabaseProviderHelper.IsMySql(configuration);
+    }
 
     public DbSet<User> Users => Set<User>();
     public DbSet<BinollaLink> BinollaLinks => Set<BinollaLink>();
@@ -20,12 +32,14 @@ public sealed class AppDbContext : DbContext
         {
             e.ToTable("users");
             e.HasKey(x => x.Id);
+            var telegramFilter = _useMySql ? "`TelegramUserId` IS NOT NULL" : "\"TelegramUserId\" IS NOT NULL";
+            var emailFilter = _useMySql ? "`Email` IS NOT NULL" : "\"Email\" IS NOT NULL";
             e.HasIndex(x => x.TelegramUserId)
                 .IsUnique()
-                .HasFilter("\"TelegramUserId\" IS NOT NULL");
+                .HasFilter(telegramFilter);
             e.HasIndex(x => x.Email)
                 .IsUnique()
-                .HasFilter("\"Email\" IS NOT NULL");
+                .HasFilter(emailFilter);
             e.Property(x => x.Email).HasMaxLength(256);
             e.Property(x => x.PasswordHash).HasMaxLength(512);
             e.Property(x => x.Username).HasMaxLength(128);

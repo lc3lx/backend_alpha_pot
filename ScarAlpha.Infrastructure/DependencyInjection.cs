@@ -29,20 +29,29 @@ public static class DependencyInjection
         this IServiceCollection services,
         IConfiguration configuration)
     {
-        var provider = (configuration["DATABASE_PROVIDER"] ?? configuration["Database:Provider"] ?? "Npgsql")
-            .Trim();
-
-        if (string.Equals(provider, "InMemory", StringComparison.OrdinalIgnoreCase))
+        if (DatabaseProviderHelper.IsInMemory(configuration))
         {
             var dbName = configuration["DATABASE_INMEMORY_NAME"] ?? "ScarAlphaLocal";
             services.AddDbContext<AppDbContext>(o => o.UseInMemoryDatabase(dbName));
+        }
+        else if (DatabaseProviderHelper.IsMySql(configuration))
+        {
+            var cs = configuration["DATABASE_CONNECTION_STRING"]
+                     ?? configuration.GetConnectionString("Default")
+                     ?? "Server=127.0.0.1;Port=3306;Database=scaralpha;User=root;Password=;";
+            var serverVersion = ServerVersion.Parse("8.0.36-mysql");
+            services.AddDbContext<AppDbContext>(o =>
+                o.UseMySql(cs, serverVersion, mySql =>
+                    mySql.MigrationsAssembly(typeof(AppDbContext).Assembly.FullName)));
         }
         else
         {
             var cs = configuration["DATABASE_CONNECTION_STRING"]
                      ?? configuration.GetConnectionString("Default")
                      ?? "Host=localhost;Port=5432;Database=scaralpha;Username=postgres;Password=postgres";
-            services.AddDbContext<AppDbContext>(o => o.UseNpgsql(cs));
+            services.AddDbContext<AppDbContext>(o =>
+                o.UseNpgsql(cs, npgsql =>
+                    npgsql.MigrationsAssembly(typeof(AppDbContext).Assembly.FullName)));
         }
 
         services.AddHttpContextAccessor();

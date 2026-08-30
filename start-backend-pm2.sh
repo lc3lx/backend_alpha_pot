@@ -79,14 +79,14 @@ load_env() {
   export ASPNETCORE_ENVIRONMENT="${ASPNETCORE_ENVIRONMENT:-Production}"
   export BACKEND_PORT="${BACKEND_PORT:-5207}"
   export ASPNETCORE_URLS="${ASPNETCORE_URLS:-http://0.0.0.0:${BACKEND_PORT}}"
-  export DATABASE_PROVIDER="${DATABASE_PROVIDER:-Npgsql}"
+  export DATABASE_PROVIDER="${DATABASE_PROVIDER:-MySql}"
   export DATABASE_INMEMORY_NAME="${DATABASE_INMEMORY_NAME:-ScarAlphaVps}"
   export JWT_ISSUER="${JWT_ISSUER:-ScarAlpha}"
   export JWT_AUDIENCE="${JWT_AUDIENCE:-ScarAlpha.App}"
 
   if [[ "${ASPNETCORE_ENVIRONMENT}" == "Production" ]]; then
     if [[ "${DATABASE_PROVIDER}" == "InMemory" ]]; then
-      die "Production forbids DATABASE_PROVIDER=InMemory — set Npgsql + DATABASE_CONNECTION_STRING"
+      die "Production forbids DATABASE_PROVIDER=InMemory — set MySql + DATABASE_CONNECTION_STRING"
     fi
     if [[ -z "${DATABASE_CONNECTION_STRING:-}" ]]; then
       die "Production requires DATABASE_CONNECTION_STRING"

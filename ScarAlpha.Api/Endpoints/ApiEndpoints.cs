@@ -3,6 +3,7 @@ using ScarAlpha.Application.Common;
 using ScarAlpha.Application.Abstractions;
 using ScarAlpha.Application.Contracts;
 using ScarAlpha.Application.Services;
+using ScarAlpha.Infrastructure.Persistence;
 
 namespace ScarAlpha.Api.Endpoints;
 
@@ -516,7 +517,7 @@ public static class HealthEndpoints
             try
             {
                 var canConnect = await db.Database.CanConnectAsync(ct);
-                var providerRaw = (config["DATABASE_PROVIDER"] ?? config["Database:Provider"] ?? "Npgsql").Trim();
+                var providerRaw = (config["DATABASE_PROVIDER"] ?? config["Database:Provider"] ?? DatabaseProviderHelper.DefaultProvider).Trim();
                 var efProvider = db.Database.ProviderName ?? "unknown";
                 var isInMemory = efProvider.Contains("InMemory", StringComparison.OrdinalIgnoreCase)
                                  || string.Equals(providerRaw, "InMemory", StringComparison.OrdinalIgnoreCase);
