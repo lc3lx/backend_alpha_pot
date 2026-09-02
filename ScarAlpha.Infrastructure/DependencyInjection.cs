@@ -117,6 +117,10 @@ public static class DependencyInjection
         var calibLow = configuration.GetValue<decimal?>("Strategy:RsiCalibrationOffsetLow");
         if (calibLow is decimal calLo) Indicators.RsiCalibrationOffsetLow = calLo;
 
+        // How long a pair sits out after the bot loses on it. 0 disables the rule.
+        var pairCooldown = configuration.GetValue<int?>("Strategy:PairLossCooldownSeconds");
+        if (pairCooldown is int pc) PairCooldownRegistry.CooldownSeconds = pc;
+
         services.AddSingleton<IRsiSignalService, RsiSignalService>();
         services.AddSingleton<IEmaRsiSignalService, EmaRsiSignalService>();
         services.AddSingleton<IAlternatingSignalService, AlternatingSignalService>();
@@ -126,6 +130,10 @@ public static class DependencyInjection
         // in that cohort — see CohortSignalCache.
         services.AddSingleton<CohortSignalCache>();
         services.AddSingleton<EmaRsiTradeTracker>();
+
+        // The whole scanned pair set must stay cached, or every bar re-fetches it.
+        var historyEntries = configuration.GetValue<int?>("Binolla:MaxHistoricalEntries");
+        if (historyEntries is int he) BinollaSessionState.MaxHistoricalEntries = he;
 
         var binollaOptions = new BinollaSessionManagerOptions
         {
@@ -165,6 +173,9 @@ public static class DependencyInjection
 
         services.AddSingleton<BotSignalWorker>();
         services.AddHostedService(sp => sp.GetRequiredService<BotSignalWorker>());
+        // Holds the pair history resident so the bar-close scan reads RAM instead of
+        // re-fetching serially from the socket — see MarketWarmupWorker.
+        services.AddHostedService<MarketWarmupWorker>();
 
         services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             .AddJwtBearer();

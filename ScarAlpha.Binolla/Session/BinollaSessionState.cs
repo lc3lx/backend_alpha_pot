@@ -39,7 +39,30 @@ public sealed class BinollaSessionState
     public decimal DemoBalance { get; private set; }
     public DateTimeOffset? BalanceUpdatedAt { get; private set; }
 
-    public const int MaxHistoricalEntries = 24;
+    /// <summary>
+    /// Default working-set cap for cached history AND remembered subscriptions.
+    ///
+    /// <para>This was 24, which silently capped the bot at ~24 (pair, period) keys. A bot
+    /// scanning 20+ pairs evicted a pair before its next visit, so every bar re-fetched
+    /// history from the socket instead of riding the streaming quotes — which is what
+    /// turned a bar-close scan into a 15-second serial crawl. Keeping the whole working
+    /// set resident is what lets <c>ApplyQuoteToMinuteBars</c> advance the bars in place.</para>
+    /// </summary>
+    public const int DefaultMaxHistoricalEntries = 400;
+
+    private static int _maxHistoricalEntries = DefaultMaxHistoricalEntries;
+
+    /// <summary>
+    /// Tunable via <c>Binolla:MaxHistoricalEntries</c>. Each entry holds up to a few
+    /// hundred bars, so this trades memory for not re-fetching. Set once at startup.
+    /// </summary>
+    public static int MaxHistoricalEntries
+    {
+        get => _maxHistoricalEntries;
+        set => _maxHistoricalEntries = value is >= 8 and <= 2000
+            ? value
+            : throw new ArgumentOutOfRangeException(nameof(value), "Must be between 8 and 2000.");
+    }
 
     public ConcurrentDictionary<string, QuoteData> LatestQuotes { get; } = new(StringComparer.OrdinalIgnoreCase);
     public ConcurrentDictionary<string, HistoryData> HistoricalData { get; } = new(StringComparer.OrdinalIgnoreCase);

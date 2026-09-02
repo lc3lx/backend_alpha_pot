@@ -109,13 +109,37 @@ public sealed class BotSignalWorker : IHostedService
 
             try
             {
-                await Task.Delay(TimeSpan.FromSeconds(1), ct).ConfigureAwait(false);
+                await Task.Delay(NextDelay(DateTimeOffset.UtcNow), ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
                 break;
             }
         }
+    }
+
+    /// <summary>
+    /// Sleeps to the next bar boundary rather than a flat second.
+    ///
+    /// <para>Entries are taken on a closed bar, so the only tick that can start a new
+    /// decision is the first one after a bar closes. A fixed 1s cadence lands anywhere in
+    /// that second — on average half a second of pure, avoidable lateness on every entry.
+    /// Waking a hair AFTER the boundary means the closing bar is already complete.</para>
+    ///
+    /// <para>Away from a boundary it still ticks each second, because fan-out has to keep
+    /// retrying for users who were briefly blocked.</para>
+    /// </summary>
+    private static TimeSpan NextDelay(DateTimeOffset now)
+    {
+        const int guardMs = 40;
+        var msIntoSecond = now.Millisecond;
+        var secondsToBoundary = 60 - now.Second;
+
+        // Close enough to the boundary that the next wake should land on it exactly.
+        if (secondsToBoundary <= 1)
+            return TimeSpan.FromMilliseconds(secondsToBoundary * 1000 - msIntoSecond + guardMs);
+
+        return TimeSpan.FromMilliseconds(1000 - msIntoSecond);
     }
 
     private static int SecondsIntoMinute() => DateTimeOffset.UtcNow.Second;
@@ -358,8 +382,14 @@ public sealed class BotSignalWorker : IHostedService
                 .ToList());
         if (assets.Count == 0) return null;
 
-        // Deterministic order so an equal-ranked tie always resolves the same way.
-        var ordered = assets.OrderBy(a => a, StringComparer.OrdinalIgnoreCase).ToList();
+        // A pair the strategy just lost on sits out its cooldown. Filtering here rather
+        // than per user keeps the benched set identical for the whole cohort.
+        var benchAt = DateTimeOffset.UtcNow;
+        var ordered = assets
+            .Where(a => !PairCooldownRegistry.IsBenched(cohort.StrategyId, a, benchAt))
+            .OrderBy(a => a, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (ordered.Count == 0) return null;
         var timeframe = StrategyTimeframes.For(cohort.StrategyId);
 
         // The scan borrows one user's socket. "Connected" is only a proxy for "serving

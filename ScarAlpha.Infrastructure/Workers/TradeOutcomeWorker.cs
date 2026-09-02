@@ -506,6 +506,18 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
             var botRuntime = scope.ServiceProvider.GetRequiredService<IBotRuntimeService>();
             var wasLoss = next == TradeStatus.Loss;
             botRuntime.ApplyStakeAfterOutcome(trade.UserId, trade.Amount, wasLoss);
+
+            if (wasLoss)
+            {
+                // Bench the pair so the bot stops re-entering a setup the market just
+                // punished. Strategy-wide, so every account benches it together.
+                var strategyId = PairCooldownRegistry.StrategyFromBotKey(trade.IdempotencyKey);
+                PairCooldownRegistry.RecordLoss(strategyId, trade.Asset, DateTimeOffset.UtcNow);
+
+                _logger.LogInformation(
+                    "Pair benched after loss strategy={Strategy} asset={Asset} forSeconds={Seconds}",
+                    strategyId, trade.Asset, PairCooldownRegistry.CooldownSeconds);
+            }
         }
 
         _logger.LogInformation(
