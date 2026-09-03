@@ -7,6 +7,7 @@ using ScarAlpha.Binolla.Models;
 using ScarAlpha.Domain.Entities;
 using ScarAlpha.Domain.Enums;
 using EngineDirection = ScarAlpha.Binolla.Models.TradeDirection;
+using EngineAccount = ScarAlpha.Binolla.Models.AccountType;
 using DomainDirection = ScarAlpha.Domain.Enums.TradeDirection;
 
 namespace ScarAlpha.Application.Services;
@@ -94,9 +95,10 @@ public sealed class TradeAppService
         }
 
         // Authoritative balance check from live Binolla session (not a local wallet).
+        BalanceInfo balance;
         try
         {
-            var balance = await client.GetBalanceAsync(ct);
+            balance = await client.GetBalanceAsync(ct);
             if (balance.CurrentBalance < request.Amount)
                 throw new ApiException(ApiErrorCodes.InsufficientBalance, "Insufficient balance.", 400);
         }
@@ -109,6 +111,17 @@ public sealed class TradeAppService
         {
             _logger.LogWarning(ex, "Balance check failed for user {UserId}", userId);
             throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Unable to verify Binolla balance.", 409);
+        }
+
+        var tradeAccountType = balance.CurrentType == EngineAccount.Real
+            ? BinollaAccountType.Real
+            : BinollaAccountType.Demo;
+        // Keep the persisted link in sync with the live Binolla book.
+        if (link.AccountType != tradeAccountType)
+        {
+            link.AccountType = tradeAccountType;
+            link.UpdatedAt = DateTimeOffset.UtcNow;
+            await _links.UpsertAsync(link, ct);
         }
 
         if (PairPayoutGate.MinPayoutPercent > 0)
@@ -148,6 +161,7 @@ public sealed class TradeAppService
             Amount = request.Amount,
             DurationSeconds = request.DurationSeconds,
             Status = TradeStatus.Pending,
+            AccountType = tradeAccountType,
             IdempotencyKey = key,
             CreatedAt = now,
             UpdatedAt = now
@@ -250,9 +264,37 @@ public sealed class TradeAppService
             parsedStatus = s;
         }
 
-        var total = await _trades.CountByUserAsync(userId, parsedStatus, asset, ct);
-        var trades = await _trades.ListByUserAsync(userId, pageSize, (page - 1) * pageSize, parsedStatus, asset, ct);
+        var linkAccountType = await ResolveCurrentAccountTypeAsync(ct);
+
+        var total = await _trades.CountByUserAsync(userId, parsedStatus, asset, linkAccountType, ct);
+        var trades = await _trades.ListByUserAsync(
+            userId, pageSize, (page - 1) * pageSize, parsedStatus, asset, linkAccountType, ct);
         return new TradeListResponse(trades.Select(Map).ToList(), total, page, pageSize);
+    }
+
+    private async Task<BinollaAccountType> ResolveCurrentAccountTypeAsync(CancellationToken ct)
+    {
+        var link = await _links.GetByUserIdAsync(_currentUser.UserId, ct);
+        if (link is not null)
+            return link.AccountType;
+
+        var client = _sessions.Get(_currentUser.UserId.ToString());
+        if (client is not null)
+        {
+            try
+            {
+                var balance = await client.GetBalanceAsync(ct);
+                return balance.CurrentType == EngineAccount.Real
+                    ? BinollaAccountType.Real
+                    : BinollaAccountType.Demo;
+            }
+            catch
+            {
+                /* fall through */
+            }
+        }
+
+        return BinollaAccountType.Demo;
     }
 
     public async Task<TradeDto> GetTradeAsync(Guid tradeId, CancellationToken ct)
@@ -335,5 +377,6 @@ public sealed class TradeAppService
         trade.Pnl,
         trade.ErrorCode,
         trade.CreatedAt,
-        trade.UpdatedAt);
+        trade.UpdatedAt,
+        trade.AccountType.ToString());
 }

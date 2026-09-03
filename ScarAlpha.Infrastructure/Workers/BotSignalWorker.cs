@@ -320,8 +320,11 @@ public sealed class BotSignalWorker : IHostedService
             }
 
             // Only block on truly live open trades — expired/stuck ones must not freeze the bot.
+            var links = scope.ServiceProvider.GetRequiredService<IBinollaLinkRepository>();
+            var link = await links.GetByUserIdAsync(bot.UserId, ct).ConfigureAwait(false);
+            var accountType = link?.AccountType ?? BinollaAccountType.Demo;
             if (OpenTradeGate.IsUserHeld(bot.UserId) ||
-                await HasBlockingOpenTradeAsync(trades, bot.UserId, ct).ConfigureAwait(false))
+                await HasBlockingOpenTradeAsync(trades, bot.UserId, accountType, ct).ConfigureAwait(false))
             {
                 // #region agent log
                 ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
@@ -591,11 +594,14 @@ public sealed class BotSignalWorker : IHostedService
     private static async Task<bool> HasBlockingOpenTradeAsync(
         ITradeRepository trades,
         Guid userId,
+        BinollaAccountType accountType,
         CancellationToken ct)
     {
         var now = DateTimeOffset.UtcNow;
-        var running = await trades.ListByUserAsync(userId, take: 20, status: TradeStatus.Running, ct: ct);
-        var pending = await trades.ListByUserAsync(userId, take: 10, status: TradeStatus.Pending, ct: ct);
+        var running = await trades.ListByUserAsync(
+            userId, take: 20, status: TradeStatus.Running, accountType: accountType, ct: ct);
+        var pending = await trades.ListByUserAsync(
+            userId, take: 10, status: TradeStatus.Pending, accountType: accountType, ct: ct);
         var blockers = running.Concat(pending).Where(trade => OpenTradeGate.IsBlocking(trade, now)).ToList();
         var staleRunning = running.Count(trade => !OpenTradeGate.IsBlocking(trade, now));
         if (blockers.Count > 0 || staleRunning > 0)

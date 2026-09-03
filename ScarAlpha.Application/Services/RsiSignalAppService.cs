@@ -26,6 +26,7 @@ public sealed class RsiSignalAppService
     private readonly TradeAppService _trades;
     private readonly IBotRuntimeService _botRuntime;
     private readonly ITradeRepository _tradeRepository;
+    private readonly IBinollaLinkRepository _links;
     private readonly ILogger<RsiSignalAppService> _logger;
 
     public RsiSignalAppService(
@@ -42,6 +43,7 @@ public sealed class RsiSignalAppService
         TradeAppService trades,
         IBotRuntimeService botRuntime,
         ITradeRepository tradeRepository,
+        IBinollaLinkRepository links,
         ILogger<RsiSignalAppService> logger)
     {
         _currentUser = currentUser;
@@ -57,6 +59,7 @@ public sealed class RsiSignalAppService
         _trades = trades;
         _botRuntime = botRuntime;
         _tradeRepository = tradeRepository;
+        _links = links;
         _logger = logger;
     }
 
@@ -589,10 +592,11 @@ public sealed class RsiSignalAppService
 
         // One live trade at a time — expired/stuck Running rows must not freeze the bot.
         var now = DateTimeOffset.UtcNow;
+        var accountType = await CurrentAccountTypeAsync(ct);
         var runningRows = await _tradeRepository.ListByUserAsync(
-            userId, take: 20, status: TradeStatus.Running, ct: ct);
+            userId, take: 20, status: TradeStatus.Running, accountType: accountType, ct: ct);
         var pendingRows = await _tradeRepository.ListByUserAsync(
-            userId, take: 10, status: TradeStatus.Pending, ct: ct);
+            userId, take: 10, status: TradeStatus.Pending, accountType: accountType, ct: ct);
         var blocking = runningRows.Concat(pendingRows).Where(t => OpenTradeGate.IsBlocking(t, now)).ToList();
         if (blocking.Count > 0)
         {
@@ -641,9 +645,9 @@ public sealed class RsiSignalAppService
         try
         {
             runningRows = await _tradeRepository.ListByUserAsync(
-                userId, take: 20, status: TradeStatus.Running, ct: ct);
+                userId, take: 20, status: TradeStatus.Running, accountType: accountType, ct: ct);
             pendingRows = await _tradeRepository.ListByUserAsync(
-                userId, take: 10, status: TradeStatus.Pending, ct: ct);
+                userId, take: 10, status: TradeStatus.Pending, accountType: accountType, ct: ct);
             if (runningRows.Concat(pendingRows).Any(t => OpenTradeGate.IsBlocking(t, DateTimeOffset.UtcNow)))
                 return signal with { AutomationError = "OPEN_TRADE_EXISTS" };
 
@@ -778,7 +782,8 @@ public sealed class RsiSignalAppService
         var startOfUtcDay = new DateTimeOffset(DateTime.UtcNow.Date, TimeSpan.Zero);
         var from = bot.PnlSessionStartedAt ?? startOfUtcDay;
 
-        var trades = await _tradeRepository.ListByUserAsync(_currentUser.UserId, take: 1000, ct: ct);
+        var trades = await _tradeRepository.ListByUserAsync(
+            _currentUser.UserId, take: 1000, accountType: await CurrentAccountTypeAsync(ct), ct: ct);
         var pnl = trades
             .Where(trade =>
                 trade.UpdatedAt >= from &&
@@ -838,13 +843,20 @@ public sealed class RsiSignalAppService
         return await HasBlockingOpenTradeAsync(ct);
     }
 
+    private async Task<BinollaAccountType> CurrentAccountTypeAsync(CancellationToken ct)
+    {
+        var link = await _links.GetByUserIdAsync(_currentUser.UserId, ct);
+        return link?.AccountType ?? BinollaAccountType.Demo;
+    }
+
     private async Task<bool> HasBlockingOpenTradeAsync(CancellationToken ct)
     {
         var now = DateTimeOffset.UtcNow;
+        var accountType = await CurrentAccountTypeAsync(ct);
         var running = await _tradeRepository.ListByUserAsync(
-            _currentUser.UserId, take: 20, status: TradeStatus.Running, ct: ct);
+            _currentUser.UserId, take: 20, status: TradeStatus.Running, accountType: accountType, ct: ct);
         var pending = await _tradeRepository.ListByUserAsync(
-            _currentUser.UserId, take: 10, status: TradeStatus.Pending, ct: ct);
+            _currentUser.UserId, take: 10, status: TradeStatus.Pending, accountType: accountType, ct: ct);
         var blockers = running.Concat(pending).Where(t => OpenTradeGate.IsBlocking(t, now)).ToList();
         if (blockers.Count > 0)
         {

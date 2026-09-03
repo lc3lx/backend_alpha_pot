@@ -47,11 +47,13 @@ public interface ITradeRepository
         int skip = 0,
         TradeStatus? status = null,
         string? asset = null,
+        BinollaAccountType? accountType = null,
         CancellationToken ct = default);
     Task<int> CountByUserAsync(
         Guid userId,
         TradeStatus? status = null,
         string? asset = null,
+        BinollaAccountType? accountType = null,
         CancellationToken ct = default);
     Task<IReadOnlyList<Trade>> ListOpenTradesAsync(CancellationToken ct = default);
     Task<(IReadOnlyList<Trade> Items, int Total)> SearchAdminAsync(

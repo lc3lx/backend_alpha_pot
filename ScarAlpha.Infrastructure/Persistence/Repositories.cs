@@ -212,9 +212,10 @@ public sealed class TradeRepository : ITradeRepository
         int skip = 0,
         TradeStatus? status = null,
         string? asset = null,
+        BinollaAccountType? accountType = null,
         CancellationToken ct = default)
     {
-        var q = Filter(_db.Trades.AsQueryable(), userId, status, asset);
+        var q = Filter(_db.Trades.AsQueryable(), userId, status, asset, accountType);
         return await q
             .OrderByDescending(x => x.CreatedAt)
             .Skip(skip)
@@ -226,8 +227,9 @@ public sealed class TradeRepository : ITradeRepository
         Guid userId,
         TradeStatus? status = null,
         string? asset = null,
+        BinollaAccountType? accountType = null,
         CancellationToken ct = default) =>
-        Filter(_db.Trades.AsQueryable(), userId, status, asset).CountAsync(ct);
+        Filter(_db.Trades.AsQueryable(), userId, status, asset, accountType).CountAsync(ct);
 
     public async Task<IReadOnlyList<Trade>> ListOpenTradesAsync(CancellationToken ct = default) =>
         await _db.Trades
@@ -281,13 +283,16 @@ public sealed class TradeRepository : ITradeRepository
         IQueryable<Trade> q,
         Guid userId,
         TradeStatus? status,
-        string? asset)
+        string? asset,
+        BinollaAccountType? accountType = null)
     {
         q = q.Where(x => x.UserId == userId);
         if (status.HasValue)
             q = q.Where(x => x.Status == status.Value);
         if (!string.IsNullOrWhiteSpace(asset))
             q = q.Where(x => x.Asset == asset);
+        if (accountType.HasValue)
+            q = q.Where(x => x.AccountType == accountType.Value);
         return q;
     }
 }

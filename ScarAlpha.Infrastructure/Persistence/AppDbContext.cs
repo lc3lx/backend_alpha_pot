@@ -84,11 +84,13 @@ public sealed class AppDbContext : DbContext
             e.HasIndex(x => x.UserId);
             e.HasIndex(x => new { x.UserId, x.IdempotencyKey }).IsUnique();
             e.HasIndex(x => x.Status);
+            e.HasIndex(x => new { x.UserId, x.AccountType });
             e.Property(x => x.Asset).HasMaxLength(64).IsRequired();
             e.Property(x => x.IdempotencyKey).HasMaxLength(128).IsRequired();
             e.Property(x => x.BinollaOrderId).HasMaxLength(128);
             e.Property(x => x.Amount).HasPrecision(18, 8);
             e.Property(x => x.Pnl).HasPrecision(18, 8);
+            e.Property(x => x.AccountType).HasConversion<int>();
             e.HasOne(x => x.User).WithMany(x => x.Trades).HasForeignKey(x => x.UserId);
         });
 

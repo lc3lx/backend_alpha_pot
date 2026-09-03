@@ -89,6 +89,8 @@ public class Trade
     public decimal Amount { get; set; }
     public int DurationSeconds { get; set; }
     public TradeStatus Status { get; set; } = TradeStatus.Pending;
+    /// <summary>Binolla Demo vs Real book this trade was placed on.</summary>
+    public BinollaAccountType AccountType { get; set; } = BinollaAccountType.Demo;
     public decimal? Pnl { get; set; }
     public string IdempotencyKey { get; set; } = string.Empty;
     public string? ErrorCode { get; set; }

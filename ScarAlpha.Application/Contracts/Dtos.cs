@@ -188,7 +188,8 @@ public sealed record TradeDto(
     decimal? Pnl,
     string? ErrorCode,
     DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt);
+    DateTimeOffset UpdatedAt,
+    string AccountType = "Demo");
 
 public sealed record TradeListResponse(
     IReadOnlyList<TradeDto> Items,
