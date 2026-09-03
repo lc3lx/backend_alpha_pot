@@ -119,6 +119,15 @@ public sealed class RsiSignalAppService
             return SoftNone(symbol, wirePeriod);
         }
 
+        if (PairPayoutGate.MinPayoutPercent > 0)
+        {
+            var payout = await PairPayoutGate.TryGetPayoutAsync(client, symbol, ct).ConfigureAwait(false);
+            if (payout is int known && !PairPayoutGate.IsTradable(known))
+            {
+                return SoftNone(symbol, wirePeriod) with { AutomationError = "PAYOUT_TOO_LOW" };
+            }
+        }
+
         if (await IsAnalysisPausedAsync(ct))
         {
             return SoftNone(symbol, wirePeriod) with { AutomationError = "OPEN_TRADE_EXISTS" };
@@ -559,6 +568,17 @@ public sealed class RsiSignalAppService
         var selected = bot.ResolvedAssets;
         if (selected.Count > 0 && !BotAssetList.Contains(selected, signal.Asset))
             return signal with { AutomationError = "ASSET_NOT_SELECTED" };
+
+        if (PairPayoutGate.MinPayoutPercent > 0)
+        {
+            var client = await EnsureLiveClientAsync(ct);
+            if (client is not null)
+            {
+                var payout = await PairPayoutGate.TryGetPayoutAsync(client, signal.Asset, ct).ConfigureAwait(false);
+                if (payout is int known && !PairPayoutGate.IsTradable(known))
+                    return signal with { AutomationError = "PAYOUT_TOO_LOW", Signal = "None" };
+            }
+        }
 
         var dailyLimit = await GetReachedDailyLimitAsync(bot, ct);
         if (dailyLimit is not null)

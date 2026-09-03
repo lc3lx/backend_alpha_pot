@@ -111,6 +111,18 @@ public sealed class TradeAppService
             throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Unable to verify Binolla balance.", 409);
         }
 
+        if (PairPayoutGate.MinPayoutPercent > 0)
+        {
+            var payout = await PairPayoutGate.TryGetPayoutAsync(client, request.Asset.Trim(), ct);
+            if (payout is int known && !PairPayoutGate.IsTradable(known))
+            {
+                throw new ApiException(
+                    ApiErrorCodes.ValidationError,
+                    $"Pair payout ({known}%) is below the minimum {PairPayoutGate.MinPayoutPercent}%.",
+                    400);
+            }
+        }
+
         var direction = ParseDirection(request.Direction);
         // #region agent log
         ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(

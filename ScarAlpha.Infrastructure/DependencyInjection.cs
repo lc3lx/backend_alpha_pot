@@ -121,6 +121,9 @@ public static class DependencyInjection
         var pairCooldown = configuration.GetValue<int?>("Strategy:PairLossCooldownSeconds");
         if (pairCooldown is int pc) PairCooldownRegistry.CooldownSeconds = pc;
 
+        var minPairPayout = configuration.GetValue<int?>("Strategy:MinPairPayoutPercent");
+        if (minPairPayout is int mp) PairPayoutGate.MinPayoutPercent = mp;
+
         services.AddSingleton<IRsiSignalService, RsiSignalService>();
         services.AddSingleton<IEmaRsiSignalService, EmaRsiSignalService>();
         services.AddSingleton<IAlternatingSignalService, AlternatingSignalService>();

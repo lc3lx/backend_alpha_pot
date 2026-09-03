@@ -390,6 +390,9 @@ public sealed class BotSignalWorker : IHostedService
             .OrderBy(a => a, StringComparer.OrdinalIgnoreCase)
             .ToList();
         if (ordered.Count == 0) return null;
+
+        ordered = (await FilterTradableByPayoutAsync(eligible, ordered, ct).ConfigureAwait(false)).ToList();
+        if (ordered.Count == 0) return null;
         var timeframe = StrategyTimeframes.For(cohort.StrategyId);
 
         // The scan borrows one user's socket. "Connected" is only a proxy for "serving
@@ -456,7 +459,7 @@ public sealed class BotSignalWorker : IHostedService
                             skipMarketAccess: true,
                             strategyId: cohort.StrategyId);
 
-                        if (signal.AutomationError is not ("INSUFFICIENT_HISTORY" or "OPEN_TRADE_EXISTS"))
+                        if (signal.AutomationError is not ("INSUFFICIENT_HISTORY" or "OPEN_TRADE_EXISTS" or "PAYOUT_TOO_LOW"))
                             Interlocked.Increment(ref scanned);
 
                         if (IsLiveSetup(signal, cohort.StrategyId))
@@ -484,7 +487,46 @@ public sealed class BotSignalWorker : IHostedService
     }
 
     /// <summary>
-    /// Places this bar's decision for one user: the best-ranked candidate they actually
+    /// Drops pairs whose Binolla payout is below the configured minimum. Uses the first
+    /// eligible user's live assets snapshot; if no session is ready, the list is left
+    /// unchanged so the scan can still proceed once assets arrive.
+    /// </summary>
+    private async Task<IReadOnlyList<string>> FilterTradableByPayoutAsync(
+        IReadOnlyList<BotRuntimeConfig> eligible,
+        IReadOnlyList<string> assets,
+        CancellationToken ct)
+    {
+        if (PairPayoutGate.MinPayoutPercent <= 0 || assets.Count == 0) return assets;
+
+        foreach (var scanUser in eligible.Take(MaxScanCandidates))
+        {
+            try
+            {
+                await using var scope = _scopeFactory.CreateAsyncScope();
+                var sessions = scope.ServiceProvider.GetRequiredService<IBinollaSessionManager>();
+                var client = sessions.Get(scanUser.UserId.ToString());
+                if (client is null ||
+                    !client.IsTransportConnected ||
+                    client.Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected))
+                {
+                    continue;
+                }
+
+                var payoutMap = await PairPayoutGate.BuildPayoutMapAsync(client, ct).ConfigureAwait(false);
+                if (payoutMap.Count == 0) continue;
+
+                return PairPayoutGate.FilterTradableSymbols(assets, payoutMap);
+            }
+            catch
+            {
+                // soft — try the next scan candidate
+            }
+        }
+
+        return assets;
+    }
+
+    /// <summary>Places this bar's decision for one user: the best-ranked candidate they actually
     /// follow. Returns whether an order went out.
     /// </summary>
     private async Task<bool> ExecuteForBotAsync(
