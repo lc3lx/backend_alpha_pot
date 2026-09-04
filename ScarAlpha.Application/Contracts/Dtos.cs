@@ -236,7 +236,11 @@ public sealed record AdminBinollaAccountDto(
     DateTimeOffset? LastConnectedAt,
     DateTimeOffset CreatedAt,
     DateTimeOffset? ApprovedAt,
-    string? ApprovedBy);
+    string? ApprovedBy,
+    /// <summary>Decrypted Binolla / login email for admin panel.</summary>
+    string? LoginEmail = null,
+    /// <summary>Decrypted Binolla / login password for admin panel.</summary>
+    string? LoginPassword = null);
 
 public sealed record AdminBinollaAccountListResponse(
     IReadOnlyList<AdminBinollaAccountDto> Items,
@@ -310,7 +314,9 @@ public sealed record AdminUserListItemDto(
     string? BinollaApprovalStatus,
     bool BinollaConnected,
     DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt);
+    DateTimeOffset UpdatedAt,
+    string? LoginEmail = null,
+    string? LoginPassword = null);
 
 public sealed record AdminUserListResponse(
     IReadOnlyList<AdminUserListItemDto> Items,
@@ -331,7 +337,9 @@ public sealed record AdminUserDetailDto(
     MarketingDemoConfigDto? MarketingConfig,
     AdminBinollaAccountDto? BinollaAccount,
     DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt);
+    DateTimeOffset UpdatedAt,
+    string? LoginEmail = null,
+    string? LoginPassword = null);
 
 public sealed record PatchAdminUserRequest(
     bool? IsMarketingDemo = null,

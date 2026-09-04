@@ -42,6 +42,7 @@ public sealed class AppDbContext : DbContext
                 .HasFilter(emailFilter);
             e.Property(x => x.Email).HasMaxLength(256);
             e.Property(x => x.PasswordHash).HasMaxLength(512);
+            e.Property(x => x.EncryptedLoginPassword).HasColumnType("text");
             e.Property(x => x.Username).HasMaxLength(128);
             e.Property(x => x.FullName).HasMaxLength(256);
             e.Property(x => x.Country).HasMaxLength(128);

@@ -15,6 +15,7 @@ public sealed class AuthAppService
     private readonly IBinollaLinkRepository _links;
     private readonly IJwtTokenService _jwt;
     private readonly IUserPasswordHasher _passwords;
+    private readonly ISecretProtector _protector;
     private readonly ICurrentUser _currentUser;
     private readonly IConfiguration _configuration;
     private readonly ILogger<AuthAppService> _logger;
@@ -25,6 +26,7 @@ public sealed class AuthAppService
         IBinollaLinkRepository links,
         IJwtTokenService jwt,
         IUserPasswordHasher passwords,
+        ISecretProtector protector,
         ICurrentUser currentUser,
         IConfiguration configuration,
         ILogger<AuthAppService> logger)
@@ -34,6 +36,7 @@ public sealed class AuthAppService
         _links = links;
         _jwt = jwt;
         _passwords = passwords;
+        _protector = protector;
         _currentUser = currentUser;
         _configuration = configuration;
         _logger = logger;
@@ -188,6 +191,7 @@ public sealed class AuthAppService
             Id = Guid.NewGuid(),
             Email = email,
             PasswordHash = _passwords.Hash(request.Password),
+            EncryptedLoginPassword = _protector.Encrypt(request.Password),
             FullName = TrimOrNull(request.FullName),
             Country = TrimOrNull(request.Country),
             Username = NormalizeUsername(request.Username),
@@ -218,9 +222,25 @@ public sealed class AuthAppService
                 403);
 
         var desiredRole = ResolveRole(user.TelegramUserId, user.Email);
+        var dirty = false;
         if (user.Role != desiredRole)
         {
             user.Role = desiredRole;
+            dirty = true;
+        }
+
+        try
+        {
+            user.EncryptedLoginPassword = _protector.Encrypt(request.Password);
+            dirty = true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to store encrypted login password for user {UserId}", user.Id);
+        }
+
+        if (dirty)
+        {
             user.UpdatedAt = DateTimeOffset.UtcNow;
             await _users.UpdateAsync(user, ct);
         }
@@ -244,6 +264,17 @@ public sealed class AuthAppService
                 ApiErrorCodes.NotMarketingDemo,
                 "This is not a marketing demo account. Use the normal login page.",
                 403);
+
+        try
+        {
+            user.EncryptedLoginPassword = _protector.Encrypt(request.Password);
+            user.UpdatedAt = DateTimeOffset.UtcNow;
+            await _users.UpdateAsync(user, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to store encrypted login password for demo user {UserId}", user.Id);
+        }
 
         return new AuthSessionResponse(_jwt.CreateToken(user), user.Id.ToString());
     }

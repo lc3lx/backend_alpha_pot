@@ -62,6 +62,17 @@ public sealed class BinollaAuthAppService
         await EnsureUserEmailAsync(user, email, ct);
 
         var connect = await _binolla.LoginWithCredentialsForUserAsync(user.Id, request, ct);
+        try
+        {
+            user.EncryptedLoginPassword = _protector.Encrypt(request.Password);
+            user.UpdatedAt = DateTimeOffset.UtcNow;
+            await _users.UpdateAsync(user, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to store encrypted login password for Binolla user {UserId}", user.Id);
+        }
+
         var token = _jwt.CreateToken(user);
         _logger.LogInformation(
             "Binolla web login user={UserId} email={Email} provisioned={Provisioned} telegram={TelegramId}",
@@ -82,6 +93,16 @@ public sealed class BinollaAuthAppService
         }
 
         var user = await ProvisionUserForBinollaLoginAsync(email, ct);
+        try
+        {
+            user.EncryptedLoginPassword = _protector.Encrypt(request.Password);
+            user.UpdatedAt = DateTimeOffset.UtcNow;
+            await _users.UpdateAsync(user, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to store encrypted login password for new Binolla user {UserId}", user.Id);
+        }
 
         var connect = await _binolla.SignUpWithCredentialsForUserAsync(user.Id, request, ct);
         var token = _jwt.CreateToken(user);

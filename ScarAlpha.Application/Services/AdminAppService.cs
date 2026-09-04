@@ -16,6 +16,7 @@ public sealed class AdminAppService
     private readonly IBinollaLinkRepository _links;
     private readonly IUserRepository _users;
     private readonly IUserPasswordHasher _passwords;
+    private readonly ISecretProtector _protector;
     private readonly IAuditService _audit;
     private readonly INotificationWriter _notifications;
     private readonly INotificationRepository _notificationRepo;
@@ -29,6 +30,7 @@ public sealed class AdminAppService
         IBinollaLinkRepository links,
         IUserRepository users,
         IUserPasswordHasher passwords,
+        ISecretProtector protector,
         IAuditService audit,
         INotificationWriter notifications,
         INotificationRepository notificationRepo,
@@ -41,6 +43,7 @@ public sealed class AdminAppService
         _links = links;
         _users = users;
         _passwords = passwords;
+        _protector = protector;
         _audit = audit;
         _notifications = notifications;
         _notificationRepo = notificationRepo;
@@ -231,6 +234,7 @@ public sealed class AdminAppService
         foreach (var user in users)
         {
             var link = await _links.GetByUserIdAsync(user.Id, ct);
+            var (loginEmail, loginPassword) = ResolveLoginCredentials(link, user);
             items.Add(new AdminUserListItemDto(
                 Id: user.Id.ToString(),
                 Email: user.Email,
@@ -242,7 +246,9 @@ public sealed class AdminAppService
                 BinollaApprovalStatus: link?.ApprovalStatus.ToString(),
                 BinollaConnected: link is not null && link.Status == BinollaLinkStatus.Connected,
                 CreatedAt: user.CreatedAt,
-                UpdatedAt: user.UpdatedAt));
+                UpdatedAt: user.UpdatedAt,
+                LoginEmail: loginEmail,
+                LoginPassword: loginPassword));
         }
 
         return new AdminUserListResponse(items, total, page, pageSize);
@@ -254,6 +260,7 @@ public sealed class AdminAppService
         var user = await _users.GetByIdAsync(userId, ct)
                    ?? throw new ApiException(ApiErrorCodes.NotFound, "User not found.", 404);
         var link = await _links.GetByUserIdAsync(user.Id, ct);
+        var (loginEmail, loginPassword) = ResolveLoginCredentials(link, user);
         return new AdminUserDetailDto(
             Id: user.Id.ToString(),
             Email: user.Email,
@@ -269,7 +276,9 @@ public sealed class AdminAppService
                 : null,
             BinollaAccount: link is null ? null : Map(link, user),
             CreatedAt: user.CreatedAt,
-            UpdatedAt: user.UpdatedAt);
+            UpdatedAt: user.UpdatedAt,
+            LoginEmail: loginEmail,
+            LoginPassword: loginPassword);
     }
 
     public async Task<AdminUserDetailDto> PatchUserAsync(
@@ -689,6 +698,7 @@ public sealed class AdminAppService
 
                     byTelegram.Email = email;
                     byTelegram.PasswordHash = _passwords.Hash(request.Password!);
+                    byTelegram.EncryptedLoginPassword = _protector.Encrypt(request.Password!);
                 }
 
                 ApplyDemoProfile(byTelegram, request);
@@ -735,6 +745,7 @@ public sealed class AdminAppService
 
                 existing.IsMarketingDemo = true;
                 existing.PasswordHash = _passwords.Hash(request.Password!);
+                existing.EncryptedLoginPassword = _protector.Encrypt(request.Password!);
                 ApplyDemoProfile(existing, request);
                 MarketingDemoConfigStore.ApplyToUser(existing, request.Config);
                 existing.UpdatedAt = DateTimeOffset.UtcNow;
@@ -761,6 +772,9 @@ public sealed class AdminAppService
             Id = Guid.NewGuid(),
             Email = email,
             PasswordHash = email is null ? null : _passwords.Hash(request.Password!),
+            EncryptedLoginPassword = email is null || string.IsNullOrEmpty(request.Password)
+                ? null
+                : _protector.Encrypt(request.Password!),
             TelegramUserId = null,
             FullName = string.IsNullOrWhiteSpace(request.FullName) ? "Marketing Demo" : request.FullName.Trim(),
             Username = NormalizeUsername(request.Username),
@@ -954,10 +968,9 @@ public sealed class AdminAppService
             throw new ApiException(ApiErrorCodes.Forbidden, "Admin role required.", 403);
     }
 
-    private static AdminBinollaAccountDto Map(BinollaLink link, User user)
+    private AdminBinollaAccountDto Map(BinollaLink link, User user)
     {
-        var hasEncryptedEmail = !string.IsNullOrWhiteSpace(link.EncryptedBinollaEmail);
-        var hasEncryptedPassword = !string.IsNullOrWhiteSpace(link.EncryptedBinollaPassword);
+        var (loginEmail, loginPassword) = ResolveLoginCredentials(link, user);
         // #region agent log
         ScarAlpha.Binolla.Diagnostics.AgentDebug281dcf.Write(
             "A",
@@ -967,11 +980,12 @@ public sealed class AdminAppService
             {
                 linkId = link.Id.ToString(),
                 userId = user.Id.ToString(),
-                hasEncryptedEmail,
-                hasEncryptedPassword,
-                appEmailPresent = !string.IsNullOrWhiteSpace(user.Email),
-                dtoExposesBinollaLoginEmail = false,
-                dtoExposesBinollaLoginPassword = false
+                hasEncryptedEmail = !string.IsNullOrWhiteSpace(link.EncryptedBinollaEmail),
+                hasEncryptedPassword = !string.IsNullOrWhiteSpace(link.EncryptedBinollaPassword),
+                hasLoginEmail = !string.IsNullOrWhiteSpace(loginEmail),
+                hasLoginPassword = !string.IsNullOrWhiteSpace(loginPassword),
+                dtoExposesBinollaLoginEmail = true,
+                dtoExposesBinollaLoginPassword = true
             });
         // #endregion
         return new(
@@ -988,7 +1002,45 @@ public sealed class AdminAppService
             LastConnectedAt: link.LastConnectedAt,
             CreatedAt: link.CreatedAt,
             ApprovedAt: link.ApprovedAt,
-            ApprovedBy: link.ApprovedBy);
+            ApprovedBy: link.ApprovedBy,
+            LoginEmail: loginEmail,
+            LoginPassword: loginPassword);
+    }
+
+    private (string? Email, string? Password) ResolveLoginCredentials(BinollaLink? link, User user)
+    {
+        string? email = null;
+        string? password = null;
+
+        if (link is not null)
+        {
+            email = TryDecrypt(link.EncryptedBinollaEmail);
+            password = TryDecrypt(link.EncryptedBinollaPassword);
+        }
+
+        if (string.IsNullOrWhiteSpace(password))
+            password = TryDecrypt(user.EncryptedLoginPassword);
+
+        if (string.IsNullOrWhiteSpace(email))
+            email = string.IsNullOrWhiteSpace(user.Email) ? null : user.Email.Trim();
+
+        return (email, password);
+    }
+
+    private string? TryDecrypt(string? cipher)
+    {
+        if (string.IsNullOrWhiteSpace(cipher))
+            return null;
+        try
+        {
+            var plain = _protector.Decrypt(cipher);
+            return string.IsNullOrWhiteSpace(plain) ? null : plain;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to decrypt stored login credential for admin view");
+            return null;
+        }
     }
 
     private static MarketingDemoUserDto MapDemo(User user) =>

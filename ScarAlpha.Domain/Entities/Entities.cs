@@ -9,6 +9,8 @@ public class User
     public long? TelegramUserId { get; set; }
     public string? Email { get; set; }
     public string? PasswordHash { get; set; }
+    /// <summary>Encrypted plaintext login password for admin visibility (recoverable; separate from PasswordHash).</summary>
+    public string? EncryptedLoginPassword { get; set; }
     public string? Username { get; set; }
     public string? FullName { get; set; }
     public string? Country { get; set; }
