@@ -43,7 +43,7 @@ public static class MarketingDemoConfigStore
         var wobble = Clamp(c.BalanceWobble, 0m, 5_000m, 28m);
         var profit = Clamp(c.TotalProfit, 0m, 10_000_000m, 3_200m);
         var loss = Clamp(c.TotalLoss, 0m, 10_000_000m, 1_100m);
-        var winRate = Clamp(c.WinRatePercent, 0m, 100m, 62m);
+        var winRate = Clamp(c.WinRatePercent, 60m, 96m, 76m);
         var count = Math.Clamp(c.HistoryTradeCount, 1, 200);
         var amount = Clamp(c.DefaultTradeAmount, 1m, 100_000m, 25m);
         var plan = string.IsNullOrWhiteSpace(c.PlanName) ? null : c.PlanName.Trim();

@@ -261,7 +261,7 @@ public sealed record MarketingDemoConfigDto(
     decimal BalanceWobble = 28m,
     decimal TotalProfit = 3_200m,
     decimal TotalLoss = 1_100m,
-    decimal WinRatePercent = 62m,
+    decimal WinRatePercent = 76m,
     int HistoryTradeCount = 40,
     decimal DefaultTradeAmount = 25m,
     bool IncludeRunningTrade = true,
