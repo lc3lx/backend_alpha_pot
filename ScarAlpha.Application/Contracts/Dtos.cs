@@ -119,7 +119,8 @@ public sealed record BotStartRequest(
     /// <summary>Strategy to run: "rsi" (default) or "ema".</summary>
     string StrategyId = "rsi",
     /// <summary>Stake progression mode (technical indicator).</summary>
-    string StakeMode = "red-signal-pro");
+    string StakeMode = "red-signal-pro",
+    string? MarketTypeId = null);
 public sealed record BotApplyRequest(
     string? Asset = null,
     decimal? Amount = null,
@@ -133,7 +134,8 @@ public sealed record BotApplyRequest(
     bool? NotificationsEnabled = null,
     IReadOnlyList<string>? Assets = null,
     string? StrategyId = null,
-    string? StakeMode = null);
+    string? StakeMode = null,
+    string? MarketTypeId = null);
 public sealed record BotRuntimeDto(
     string State,
     string? Asset,
@@ -152,7 +154,8 @@ public sealed record BotRuntimeDto(
     string? StopReason = null,
     string StrategyId = "rsi",
     decimal BaseAmount = 0m,
-    string StakeMode = "red-signal-pro");
+    string StakeMode = "red-signal-pro",
+    string MarketTypeId = "all-markets");
 
 public sealed record BinollaStatusDto(
     bool Connected,

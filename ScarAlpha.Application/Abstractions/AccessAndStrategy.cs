@@ -99,7 +99,9 @@ public sealed record BotRuntimeConfig(
     /// <summary>Configured base stake — progression resets here after a win.</summary>
     decimal BaseAmount = 0m,
     /// <summary>Stake progression mode (technical indicator): red-signal-pro, alpha-momentum, etc.</summary>
-    string StakeMode = "red-signal-pro")
+    string StakeMode = "red-signal-pro",
+    /// <summary>UI market scope: global-indicators | binolla-market | all-markets.</summary>
+    string MarketTypeId = "all-markets")
 {
     public decimal EffectiveBaseAmount => BaseAmount > 0 ? BaseAmount : Amount;
     /// <summary>Selected pairs to analyze (falls back to single Asset).</summary>
@@ -127,7 +129,8 @@ public interface IBotRuntimeService
         string riskLevel = "risk-medium",
         bool notificationsEnabled = true,
         string strategyId = "rsi",
-        string stakeMode = "red-signal-pro");
+        string stakeMode = "red-signal-pro",
+        string? marketTypeId = null);
     BotRuntimeConfig Pause(Guid userId);
     BotRuntimeConfig Stop(Guid userId, string? stopReason = null);
     BotRuntimeConfig Apply(
@@ -144,7 +147,8 @@ public interface IBotRuntimeService
         bool? notificationsEnabled = null,
         IReadOnlyList<string>? assets = null,
         string? strategyId = null,
-        string? stakeMode = null);
+        string? stakeMode = null,
+        string? marketTypeId = null);
     /// <summary>Adjust bot stake after a bot trade settles (win resets, loss progresses).</summary>
     BotRuntimeConfig ApplyStakeAfterOutcome(Guid userId, decimal lastTradeAmount, bool wasLoss);
     IReadOnlyList<BotRuntimeConfig> ListKnown();

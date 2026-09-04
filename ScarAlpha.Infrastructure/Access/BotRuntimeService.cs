@@ -36,13 +36,46 @@ public sealed class BotRuntimeService : IBotRuntimeService
                     state = state.State.ToString(),
                     strategyId = state.StrategyId,
                     stakeMode = state.StakeMode,
+                    marketTypeId = state.MarketTypeId,
                     assetCount = state.ResolvedAssets.Count
                 });
             // #endregion
             return state;
         }
 
-        var defaults = New(userId, BotRunState.Stopped, Array.Empty<string>(), 25m, 25m, 300, 50m, 30m, stakeMode: StakeProgression.RedSignalPro);
+        var hydrated = TryHydrateFromDb(userId);
+        if (hydrated is not null)
+        {
+            _states[userId] = hydrated;
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.AgentDebug281dcf.Write(
+                "B",
+                "BotRuntimeService.Get",
+                "get_hydrated_from_db",
+                new
+                {
+                    userId = userId.ToString(),
+                    state = hydrated.State.ToString(),
+                    strategyId = hydrated.StrategyId,
+                    stakeMode = hydrated.StakeMode,
+                    marketTypeId = hydrated.MarketTypeId,
+                    assetCount = hydrated.ResolvedAssets.Count
+                });
+            // #endregion
+            return hydrated;
+        }
+
+        var defaults = New(
+            userId,
+            BotRunState.Stopped,
+            Array.Empty<string>(),
+            25m,
+            25m,
+            300,
+            50m,
+            30m,
+            stakeMode: StakeProgression.RedSignalPro,
+            marketTypeId: "all-markets");
         // #region agent log
         ScarAlpha.Binolla.Diagnostics.AgentDebug281dcf.Write(
             "B",
@@ -53,10 +86,27 @@ public sealed class BotRuntimeService : IBotRuntimeService
                 userId = userId.ToString(),
                 strategyId = defaults.StrategyId,
                 stakeMode = defaults.StakeMode,
+                marketTypeId = defaults.MarketTypeId,
                 assetCount = defaults.ResolvedAssets.Count
             });
         // #endregion
         return defaults;
+    }
+
+    private BotRuntimeConfig? TryHydrateFromDb(Guid userId)
+    {
+        try
+        {
+            using var scope = _scopes.CreateScope();
+            var users = scope.ServiceProvider.GetRequiredService<IUserRepository>();
+            var user = users.GetByIdAsync(userId).ConfigureAwait(false).GetAwaiter().GetResult();
+            return StoredBotRuntime.TryParse(userId, user?.BotRuntimeJson);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to hydrate bot runtime from DB for {UserId}", userId);
+            return null;
+        }
     }
 
     public BotRuntimeConfig Start(
@@ -72,8 +122,11 @@ public sealed class BotRuntimeService : IBotRuntimeService
         string riskLevel = "risk-medium",
         bool notificationsEnabled = true,
         string strategyId = "rsi",
-        string stakeMode = StakeProgression.RedSignalPro) =>
-        Set(
+        string stakeMode = StakeProgression.RedSignalPro,
+        string? marketTypeId = null)
+    {
+        var current = Get(userId);
+        return Set(
             userId,
             BotRunState.Running,
             BotAssetList.Normalize(null, assets),
@@ -91,7 +144,9 @@ public sealed class BotRuntimeService : IBotRuntimeService
             stopReason: null,
             strategyId: strategyId,
             stakeMode: StakeProgression.NormalizeMode(stakeMode),
+            marketTypeId: NormalizeMarketType(marketTypeId ?? current.MarketTypeId),
             persist: true);
+    }
 
     public BotRuntimeConfig Pause(Guid userId)
     {
@@ -114,6 +169,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
             stopReason: current.StopReason,
             strategyId: current.StrategyId,
             stakeMode: current.StakeMode,
+            marketTypeId: current.MarketTypeId,
             persist: true);
     }
 
@@ -138,6 +194,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
             stopReason: stopReason,
             strategyId: current.StrategyId,
             stakeMode: current.StakeMode,
+            marketTypeId: current.MarketTypeId,
             persist: true);
     }
 
@@ -155,7 +212,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
         bool? notificationsEnabled = null,
         IReadOnlyList<string>? assets = null,
         string? strategyId = null,
-        string? stakeMode = null)
+        string? stakeMode = null,
+        string? marketTypeId = null)
     {
         var current = Get(userId);
         var nextAssets = assets is not null || asset is not null
@@ -198,6 +256,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
             stopReason: current.StopReason,
             strategyId: strategyId ?? current.StrategyId,
             stakeMode: nextStake,
+            marketTypeId: NormalizeMarketType(marketTypeId ?? current.MarketTypeId),
             persist: true);
         // #region agent log
         ScarAlpha.Binolla.Diagnostics.AgentDebug281dcf.Write(
@@ -210,6 +269,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
                 state = next.State.ToString(),
                 strategyId = next.StrategyId,
                 stakeMode = next.StakeMode,
+                marketTypeId = next.MarketTypeId,
                 assetCount = next.ResolvedAssets.Count,
                 amount = next.Amount
             });
@@ -248,6 +308,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
             stopReason: current.StopReason,
             strategyId: current.StrategyId,
             stakeMode: current.StakeMode,
+            marketTypeId: current.MarketTypeId,
             persist: true);
     }
 
@@ -277,7 +338,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
         string? stopReason,
         bool persist,
         string strategyId = "rsi",
-        string stakeMode = StakeProgression.RedSignalPro)
+        string stakeMode = StakeProgression.RedSignalPro,
+        string marketTypeId = "all-markets")
     {
         if (amount <= 0 || amount > 100_000m)
             throw new ArgumentOutOfRangeException(nameof(amount));
@@ -307,7 +369,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
             pnlSessionStartedAt,
             stopReason,
             strategyId,
-            stakeMode);
+            stakeMode,
+            marketTypeId);
         _states[userId] = next;
         if (persist)
             QueuePersist(next);
@@ -352,7 +415,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
         DateTimeOffset? pnlSessionStartedAt = null,
         string? stopReason = null,
         string strategyId = "rsi",
-        string stakeMode = StakeProgression.RedSignalPro)
+        string stakeMode = StakeProgression.RedSignalPro,
+        string marketTypeId = "all-markets")
     {
         var list = BotAssetList.Normalize(null, assets);
         return new BotRuntimeConfig(
@@ -374,7 +438,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
             stopReason,
             NormalizeStrategy(strategyId),
             baseAmount,
-            StakeProgression.NormalizeMode(stakeMode));
+            StakeProgression.NormalizeMode(stakeMode),
+            NormalizeMarketType(marketTypeId));
     }
 
     /// <summary>Unknown ids fall back to the always-available RSI strategy.</summary>
@@ -385,6 +450,17 @@ public sealed class BotRuntimeService : IBotRuntimeService
         if (string.Equals(id, "smart", StringComparison.OrdinalIgnoreCase)) return "smart";
         if (string.Equals(id, "alt5", StringComparison.OrdinalIgnoreCase)) return "alt5";
         return "rsi";
+    }
+
+    internal static string NormalizeMarketType(string? marketTypeId)
+    {
+        var id = marketTypeId?.Trim().ToLowerInvariant();
+        return id switch
+        {
+            "global-indicators" => "global-indicators",
+            "binolla-market" => "binolla-market",
+            _ => "all-markets"
+        };
     }
 
     public sealed record StoredBotRuntime(
@@ -403,7 +479,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
         string? StopReason,
         string StrategyId = "rsi",
         decimal BaseAmount = 0m,
-        string StakeMode = StakeProgression.RedSignalPro)
+        string StakeMode = StakeProgression.RedSignalPro,
+        string MarketTypeId = "all-markets")
     {
         public static StoredBotRuntime From(BotRuntimeConfig c) => new(
             c.State.ToString(),
@@ -421,7 +498,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
             c.StopReason,
             c.StrategyId,
             c.EffectiveBaseAmount,
-            c.StakeMode);
+            c.StakeMode,
+            c.MarketTypeId);
 
         public BotRuntimeConfig ToConfig(Guid userId)
         {
@@ -448,7 +526,8 @@ public sealed class BotRuntimeService : IBotRuntimeService
                 StopReason,
                 NormalizeStrategy(StrategyId),
                 baseAmount,
-                StakeProgression.NormalizeMode(StakeMode));
+                StakeProgression.NormalizeMode(StakeMode),
+                NormalizeMarketType(MarketTypeId));
         }
 
         public static BotRuntimeConfig? TryParse(Guid userId, string? json)

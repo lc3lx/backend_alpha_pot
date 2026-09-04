@@ -39,25 +39,22 @@ public sealed class BotRuntimeRestoreHostedService : IHostedService
             {
                 var cfg = BotRuntimeService.StoredBotRuntime.TryParse(user.Id, user.BotRuntimeJson);
                 if (cfg is null) continue;
-                var skippedStopped = cfg.State is not (BotRunState.Running or BotRunState.Paused);
+                // Restore Stopped configs too so /status returns saved settings after API restart.
                 // #region agent log
                 ScarAlpha.Binolla.Diagnostics.AgentDebug281dcf.Write(
                     "B",
                     "BotRuntimeRestoreHostedService.StartAsync",
-                    skippedStopped ? "skip_stopped_runtime" : "restore_runtime",
+                    "restore_runtime",
                     new
                     {
                         userId = user.Id.ToString(),
                         state = cfg.State.ToString(),
                         strategyId = cfg.StrategyId,
                         stakeMode = cfg.StakeMode,
-                        assetCount = cfg.ResolvedAssets.Count,
-                        skippedStopped
+                        marketTypeId = cfg.MarketTypeId,
+                        assetCount = cfg.ResolvedAssets.Count
                     });
                 // #endregion
-                if (skippedStopped)
-                    continue;
-                if (cfg.ResolvedAssets.Count == 0) continue;
                 _runtime.RestoreFromPersistence(cfg);
                 restored++;
             }
