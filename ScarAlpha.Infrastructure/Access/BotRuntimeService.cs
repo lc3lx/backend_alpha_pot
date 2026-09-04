@@ -21,9 +21,43 @@ public sealed class BotRuntimeService : IBotRuntimeService
         _logger = logger;
     }
 
-    public BotRuntimeConfig Get(Guid userId) => _states.TryGetValue(userId, out var state)
-        ? state
-        : New(userId, BotRunState.Stopped, Array.Empty<string>(), 25m, 25m, 300, 50m, 30m, stakeMode: StakeProgression.RedSignalPro);
+    public BotRuntimeConfig Get(Guid userId)
+    {
+        if (_states.TryGetValue(userId, out var state))
+        {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.AgentDebug281dcf.Write(
+                "B",
+                "BotRuntimeService.Get",
+                "get_from_memory",
+                new
+                {
+                    userId = userId.ToString(),
+                    state = state.State.ToString(),
+                    strategyId = state.StrategyId,
+                    stakeMode = state.StakeMode,
+                    assetCount = state.ResolvedAssets.Count
+                });
+            // #endregion
+            return state;
+        }
+
+        var defaults = New(userId, BotRunState.Stopped, Array.Empty<string>(), 25m, 25m, 300, 50m, 30m, stakeMode: StakeProgression.RedSignalPro);
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.AgentDebug281dcf.Write(
+            "B",
+            "BotRuntimeService.Get",
+            "get_defaults_no_hydrate",
+            new
+            {
+                userId = userId.ToString(),
+                strategyId = defaults.StrategyId,
+                stakeMode = defaults.StakeMode,
+                assetCount = defaults.ResolvedAssets.Count
+            });
+        // #endregion
+        return defaults;
+    }
 
     public BotRuntimeConfig Start(
         Guid userId,
@@ -146,7 +180,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
             nextAmount = stakeChanged ? current.EffectiveBaseAmount : current.Amount;
         }
 
-        return Set(
+        var next = Set(
             userId,
             current.State,
             nextAssets,
@@ -165,6 +199,22 @@ public sealed class BotRuntimeService : IBotRuntimeService
             strategyId: strategyId ?? current.StrategyId,
             stakeMode: nextStake,
             persist: true);
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.AgentDebug281dcf.Write(
+            "C",
+            "BotRuntimeService.Apply",
+            "apply_persisted",
+            new
+            {
+                userId = userId.ToString(),
+                state = next.State.ToString(),
+                strategyId = next.StrategyId,
+                stakeMode = next.StakeMode,
+                assetCount = next.ResolvedAssets.Count,
+                amount = next.Amount
+            });
+        // #endregion
+        return next;
     }
 
     public BotRuntimeConfig ApplyStakeAfterOutcome(Guid userId, decimal lastTradeAmount, bool wasLoss)

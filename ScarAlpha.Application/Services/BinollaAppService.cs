@@ -611,6 +611,19 @@ public sealed class BinollaAppService
     private async Task PersistBinollaCredentialsAsync(Guid userId, string email, string password, CancellationToken ct)
     {
         var link = await _links.GetByUserIdAsync(userId, ct);
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.AgentDebug281dcf.Write(
+            "B",
+            "BinollaAppService.PersistBinollaCredentialsAsync",
+            "persist_entry",
+            new
+            {
+                userId = userId.ToString(),
+                linkNull = link is null,
+                emailLen = email?.Trim().Length ?? 0,
+                passwordLen = password?.Length ?? 0
+            });
+        // #endregion
         if (link is null) return;
         try
         {
@@ -618,9 +631,29 @@ public sealed class BinollaAppService
             link.EncryptedBinollaPassword = _protector.Encrypt(password);
             link.UpdatedAt = DateTimeOffset.UtcNow;
             await _links.UpsertAsync(link, ct);
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.AgentDebug281dcf.Write(
+                "B",
+                "BinollaAppService.PersistBinollaCredentialsAsync",
+                "persist_ok",
+                new
+                {
+                    userId = userId.ToString(),
+                    linkId = link.Id.ToString(),
+                    hasEncryptedEmail = !string.IsNullOrWhiteSpace(link.EncryptedBinollaEmail),
+                    hasEncryptedPassword = !string.IsNullOrWhiteSpace(link.EncryptedBinollaPassword)
+                });
+            // #endregion
         }
         catch (Exception ex)
         {
+            // #region agent log
+            ScarAlpha.Binolla.Diagnostics.AgentDebug281dcf.Write(
+                "B",
+                "BinollaAppService.PersistBinollaCredentialsAsync",
+                "persist_fail",
+                new { userId = userId.ToString(), error = ex.GetType().Name });
+            // #endregion
             _logger.LogWarning(ex, "Failed to persist Binolla credentials for user {UserId}", userId);
         }
     }

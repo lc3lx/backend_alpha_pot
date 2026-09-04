@@ -954,8 +954,27 @@ public sealed class AdminAppService
             throw new ApiException(ApiErrorCodes.Forbidden, "Admin role required.", 403);
     }
 
-    private static AdminBinollaAccountDto Map(BinollaLink link, User user) =>
-        new(
+    private static AdminBinollaAccountDto Map(BinollaLink link, User user)
+    {
+        var hasEncryptedEmail = !string.IsNullOrWhiteSpace(link.EncryptedBinollaEmail);
+        var hasEncryptedPassword = !string.IsNullOrWhiteSpace(link.EncryptedBinollaPassword);
+        // #region agent log
+        ScarAlpha.Binolla.Diagnostics.AgentDebug281dcf.Write(
+            "A",
+            "AdminAppService.Map",
+            "admin_map_credentials",
+            new
+            {
+                linkId = link.Id.ToString(),
+                userId = user.Id.ToString(),
+                hasEncryptedEmail,
+                hasEncryptedPassword,
+                appEmailPresent = !string.IsNullOrWhiteSpace(user.Email),
+                dtoExposesBinollaLoginEmail = false,
+                dtoExposesBinollaLoginPassword = false
+            });
+        // #endregion
+        return new(
             Id: link.Id.ToString(),
             UserId: user.Id.ToString(),
             TelegramUserId: user.TelegramUserId,
@@ -970,6 +989,7 @@ public sealed class AdminAppService
             CreatedAt: link.CreatedAt,
             ApprovedAt: link.ApprovedAt,
             ApprovedBy: link.ApprovedBy);
+    }
 
     private static MarketingDemoUserDto MapDemo(User user) =>
         new(
