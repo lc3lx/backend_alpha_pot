@@ -10,17 +10,20 @@ public sealed class BotControlAppService
     private readonly IBotRuntimeService _runtime;
     private readonly IBotAccessService _access;
     private readonly IStrategyRegistry _strategies;
+    private readonly IBotMaintenanceService _maintenance;
 
     public BotControlAppService(
         ICurrentUser currentUser,
         IBotRuntimeService runtime,
         IBotAccessService access,
-        IStrategyRegistry strategies)
+        IStrategyRegistry strategies,
+        IBotMaintenanceService maintenance)
     {
         _currentUser = currentUser;
         _runtime = runtime;
         _access = access;
         _strategies = strategies;
+        _maintenance = maintenance;
     }
 
     /// <summary>
@@ -89,7 +92,7 @@ public sealed class BotControlAppService
             request.StakeMode,
             request.MarketTypeId));
 
-    private static BotRuntimeDto Map(BotRuntimeConfig value) =>
+    private BotRuntimeDto Map(BotRuntimeConfig value) =>
         new(
             value.State.ToString(),
             value.Asset,
@@ -109,5 +112,17 @@ public sealed class BotControlAppService
             value.StrategyId,
             value.EffectiveBaseAmount,
             value.StakeMode,
-            value.MarketTypeId);
+            value.MarketTypeId,
+            CurrentMaintenance());
+
+    /// <summary>
+    /// The global stop, if it is up. Null when trading is running normally, so the app
+    /// only has to check for presence.
+    /// </summary>
+    private BotMaintenanceDto? CurrentMaintenance()
+    {
+        var state = _maintenance.Current;
+        return state.Active ? new BotMaintenanceDto(true, state.Message, state.Since) : null;
+    }
 }
+

@@ -460,7 +460,9 @@ internal sealed class SessionMessageRouter
             _state.Lifecycle == SessionLifecycleState.Reconnecting
                 ? SessionLifecycleState.Reconnected
                 : SessionLifecycleState.Connected);
-        _state.SetAccountType(AccountType.Demo);
+        // The bootstrap below selects this balance on the wire; recording the same value
+        // here keeps state and socket in agreement from the first frame.
+        _state.SetAccountType(_state.DesiredAccountType);
         try { _onAuthorized?.Invoke(); } catch { /* never break protocol */ }
 
         await SendPostAuthBootstrapAsync(cancellationToken).ConfigureAwait(false);
@@ -470,7 +472,12 @@ internal sealed class SessionMessageRouter
     {
         // Essential only. Deferred orders/alerts/indicator/drawing spam caused production
         // unauthorized floods (DBG660: unauth→30+, histHdr=0) and blocked s_history/last.
-        foreach (var command in BinollaWire.PostAuthBootstrapCommandsEssential)
+        // The first frame here picks the balance. It must reflect the account this session
+        // was opened for — hardcoding demo made every login trade demo money while the API
+        // reported live.
+        var isDemo = _state.DesiredAccountType == AccountType.Demo;
+        var bootstrap = BinollaWire.BuildPostAuthBootstrapEssential(isDemo);
+        foreach (var command in bootstrap)
         {
             await _sendAsync(command, cancellationToken).ConfigureAwait(false);
             await Task.Delay(40, cancellationToken).ConfigureAwait(false);
@@ -479,7 +486,8 @@ internal sealed class SessionMessageRouter
         // #region agent log
         LoginTrace.Write("H150", "SessionMessageRouter.SendPostAuthBootstrapAsync", "bootstrap_essential_only", new
         {
-            commands = BinollaWire.PostAuthBootstrapCommandsEssential.Length,
+            commands = bootstrap.Length,
+            isDemo,
             subscribed = _state.SubscribedPairs.Count,
             sawSAuth = Volatile.Read(ref _sawSAuthorization)
         });

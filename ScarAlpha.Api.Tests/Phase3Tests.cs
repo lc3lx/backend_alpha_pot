@@ -101,7 +101,7 @@ public sealed class RateLimitedApiFactory : WebApplicationFactory<Program>
                 });
 
             var connectedUsers = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
-            SessionManager.Setup(m => m.GetOrCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>()))
+            SessionManager.Setup(m => m.GetOrCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>(), It.IsAny<AccountType>()))
                 .ReturnsAsync((string userId, string _, CancellationToken _, string? __) =>
                 {
                     connectedUsers[userId] = 1;

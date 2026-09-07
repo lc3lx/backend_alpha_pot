@@ -73,11 +73,17 @@ public interface IBinollaClient : IAsyncDisposable
 
 public interface IBinollaSessionManager : IAsyncDisposable
 {
+    /// <param name="accountType">
+    /// Which balance the session should select in its post-auth bootstrap. Live unless the
+    /// caller asks otherwise — the bootstrap frame is the only place this can be chosen,
+    /// because a second account/change after connect races the unauthorized window.
+    /// </param>
     Task<IBinollaClient> GetOrCreateAsync(
         string userId,
         string ssid,
         CancellationToken cancellationToken = default,
-        string? cookieHeader = null);
+        string? cookieHeader = null,
+        AccountType accountType = AccountType.Real);
 
     IBinollaClient? Get(string userId);
 

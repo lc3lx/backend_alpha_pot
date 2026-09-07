@@ -31,6 +31,11 @@ public static class BinollaWire
     public const string EvHistoryLast = "s_history/last";
     public const string EvAuthorization = "s_authorization";
 
+    /// <summary>
+    /// Bootstrap for a session that should open on the DEMO balance.
+    /// Prefer <see cref="BuildPostAuthBootstrapEssential"/> — these fixed arrays exist for
+    /// callers that have no account type to hand.
+    /// </summary>
     public static readonly string[] PostAuthBootstrapCommands =
     {
         "42[\"account/change\",{\"demo\":1}]",
@@ -44,13 +49,33 @@ public static class BinollaWire
         "42[\"drawing/load\"]"
     };
 
-    /// <summary>Commands required for Demo market browse right after SSID auth.</summary>
+    /// <summary>Commands required for market browse right after SSID auth (demo balance).</summary>
     public static readonly string[] PostAuthBootstrapCommandsEssential =
     {
         "42[\"account/change\",{\"demo\":1}]",
         "42[\"balances/list\"]",
         "42[\"assets/list\"]",
     };
+
+    /// <summary>
+    /// The essential bootstrap for a specific balance.
+    ///
+    /// <para>The very first frame after auth selects which balance the socket trades on,
+    /// and it used to be hardcoded to <c>demo:1</c>. That silently pinned every session to
+    /// the demo balance no matter what the account was configured for — the API would
+    /// report "Real" from the database while the socket, and therefore every order, was on
+    /// demo money.</para>
+    ///
+    /// <para>Sending a second <c>account/change</c> after connect is NOT a fix for that:
+    /// it raced the unauthorized window and dropped freshly opened sessions. The selection
+    /// has to be part of this first bootstrap.</para>
+    /// </summary>
+    public static string[] BuildPostAuthBootstrapEssential(bool isDemo) =>
+    [
+        BinollaFraming.BuildAccountChange(isDemo),
+        "42[\"balances/list\"]",
+        "42[\"assets/list\"]",
+    ];
 
     /// <summary>Secondary lists — deferred so they do not race the first unauthorized window.</summary>
     public static readonly string[] PostAuthBootstrapCommandsDeferred =

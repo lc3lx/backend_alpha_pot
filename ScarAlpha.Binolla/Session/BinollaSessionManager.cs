@@ -36,7 +36,8 @@ public sealed class BinollaSessionManager : IBinollaSessionManager
         string userId,
         string ssid,
         CancellationToken cancellationToken = default,
-        string? cookieHeader = null)
+        string? cookieHeader = null,
+        AccountType accountType = AccountType.Real)
     {
         ThrowIfDisposed();
         if (string.IsNullOrWhiteSpace(userId))
@@ -47,6 +48,7 @@ public sealed class BinollaSessionManager : IBinollaSessionManager
         if (_sessions.TryGetValue(userId, out var existing))
         {
             existing.Session.State.Touch();
+            existing.Session.State.SetDesiredAccountType(accountType);
             await EnsureSessionUsesSsidAsync(existing.Session, ssid, cancellationToken, cookieHeader)
                 .ConfigureAwait(false);
             return existing.Session;
@@ -70,6 +72,9 @@ public sealed class BinollaSessionManager : IBinollaSessionManager
                     $"Max concurrent sessions reached ({_options.MaxConcurrentSessions}).");
 
             session = new BinollaSession(userId, _options, _transportFactory);
+            // Must be set BEFORE the handshake: the bootstrap that selects the balance runs
+            // the moment authorization lands.
+            session.State.SetDesiredAccountType(accountType);
             entry = new SessionEntry(session);
             if (!_sessions.TryAdd(userId, entry))
             {

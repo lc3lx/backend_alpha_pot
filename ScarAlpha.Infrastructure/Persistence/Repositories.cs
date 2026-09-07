@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using ScarAlpha.Application.Abstractions;
 using ScarAlpha.Domain.Entities;
 using ScarAlpha.Domain.Enums;
@@ -359,5 +360,68 @@ public sealed class NotificationRepository : INotificationRepository
             .Take(pageSize)
             .ToListAsync(ct);
         return (items, total);
+    }
+}
+
+public sealed class AppSettingRepository : IAppSettingRepository
+{
+    private readonly AppDbContext _db;
+
+    public AppSettingRepository(AppDbContext db) => _db = db;
+
+    public async Task<string?> GetAsync(string key, CancellationToken ct = default)
+    {
+        var row = await _db.AppSettings.AsNoTracking()
+            .FirstOrDefaultAsync(x => x.Key == key, ct);
+        return row?.Value;
+    }
+
+    public async Task SetAsync(string key, string? value, CancellationToken ct = default)
+    {
+        var row = await _db.AppSettings.FirstOrDefaultAsync(x => x.Key == key, ct);
+        if (row is null)
+        {
+            _db.AppSettings.Add(new AppSetting
+            {
+                Key = key,
+                Value = value,
+                UpdatedAt = DateTimeOffset.UtcNow
+            });
+        }
+        else
+        {
+            row.Value = value;
+            row.UpdatedAt = DateTimeOffset.UtcNow;
+        }
+
+        await _db.SaveChangesAsync(ct);
+    }
+}
+
+/// <summary>
+/// Lets the singleton maintenance service reach the scoped DbContext.
+///
+/// The flag is read on every worker tick, so the service itself must be a singleton;
+/// EF's context is scoped. This opens a short-lived scope per access, which is fine
+/// because reads come from the service's in-memory copy and writes are rare.
+/// </summary>
+public sealed class ScopedAppSettingRepository : IAppSettingRepository
+{
+    private readonly IServiceScopeFactory _scopeFactory;
+
+    public ScopedAppSettingRepository(IServiceScopeFactory scopeFactory) => _scopeFactory = scopeFactory;
+
+    public async Task<string?> GetAsync(string key, CancellationToken ct = default)
+    {
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var inner = scope.ServiceProvider.GetRequiredService<IAppSettingRepository>();
+        return await inner.GetAsync(key, ct);
+    }
+
+    public async Task SetAsync(string key, string? value, CancellationToken ct = default)
+    {
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var inner = scope.ServiceProvider.GetRequiredService<IAppSettingRepository>();
+        await inner.SetAsync(key, value, ct);
     }
 }

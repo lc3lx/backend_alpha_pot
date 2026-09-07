@@ -137,3 +137,15 @@ public class AuditEvent
     public string? Detail { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
 }
+
+/// <summary>
+/// Small key/value store for process-wide switches that must survive a restart.
+/// Introduced for the bot maintenance flag: an admin stopping every bot has to stay
+/// stopped after a deploy, otherwise the next restart quietly resumes live trading.
+/// </summary>
+public class AppSetting
+{
+    public string Key { get; set; } = string.Empty;
+    public string? Value { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; }
+}

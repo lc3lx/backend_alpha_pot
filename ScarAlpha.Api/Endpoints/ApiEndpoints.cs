@@ -455,6 +455,16 @@ public static class AdminEndpoints
         bots.MapGet("/{userId:guid}", async (Guid userId, AdminAppService svc, CancellationToken ct) =>
             Results.Ok(await svc.GetBotAsync(userId, ct)));
 
+        // Fleet-wide switch: stops/starts every bot and raises the maintenance notice.
+        bots.MapGet("/fleet", async (AdminAppService svc, CancellationToken ct) =>
+            Results.Ok(await svc.GetFleetStateAsync(ct)));
+
+        bots.MapPost("/fleet", async (
+            [FromBody] AdminMaintenanceRequest request,
+            AdminAppService svc,
+            CancellationToken ct) =>
+            Results.Ok(await svc.SetFleetStateAsync(request, ct)));
+
         bots.MapPost("/{userId:guid}/control", async (
             Guid userId,
             [FromBody] AdminBotControlRequest request,

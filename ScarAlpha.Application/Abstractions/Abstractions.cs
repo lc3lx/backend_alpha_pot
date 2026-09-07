@@ -116,3 +116,10 @@ public interface IIdempotencyGate
 {
     Task<IAsyncDisposable> AcquireAsync(Guid userId, string key, CancellationToken ct = default);
 }
+
+/// <summary>Key/value settings that outlive a process restart.</summary>
+public interface IAppSettingRepository
+{
+    Task<string?> GetAsync(string key, CancellationToken ct = default);
+    Task SetAsync(string key, string? value, CancellationToken ct = default);
+}

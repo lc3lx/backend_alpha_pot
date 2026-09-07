@@ -144,7 +144,8 @@ public sealed class StrategySelectionTests
             new FakeCurrentUser(),
             runtime,
             new AlwaysAllowedAccess(),
-            new StrategyRegistry());
+            new StrategyRegistry(),
+            new NoMaintenance());
 
         return (control, runtime);
     }
@@ -162,4 +163,15 @@ public sealed class StrategySelectionTests
             Task.FromResult(new BotAccessResult(
                 BotAccessState.Allowed, true, true, "Demo", "Approved"));
     }
+}
+
+/// <summary>Maintenance never active — these tests are about strategy selection.</summary>
+internal sealed class NoMaintenance : IBotMaintenanceService
+{
+    public BotMaintenanceState Current { get; } = new(false, null, null);
+
+    public Task WarmAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task<BotMaintenanceState> SetAsync(bool active, string? message, CancellationToken ct = default) =>
+        Task.FromResult(Current);
 }

@@ -59,6 +59,7 @@ public static class DependencyInjection
         services.AddScoped<IBinollaLinkRepository, BinollaLinkRepository>();
         services.AddScoped<ITradeRepository, TradeRepository>();
         services.AddScoped<INotificationRepository, NotificationRepository>();
+        services.AddScoped<IAppSettingRepository, AppSettingRepository>();
         services.AddScoped<INotificationWriter, NotificationWriter>();
         services.AddScoped<ICurrentUser, HttpCurrentUser>();
         services.AddSingleton<ITelegramAuthService, TelegramAuthService>();
@@ -132,6 +133,11 @@ public static class DependencyInjection
         // One trading decision per strategy+duration per bar, fanned out to every user
         // in that cohort — see CohortSignalCache.
         services.AddSingleton<CohortSignalCache>();
+        // Global stop switch — read on every worker tick, so it is a singleton
+        // holding an in-memory copy of the persisted flag.
+        services.AddSingleton<IBotMaintenanceService>(sp =>
+            new BotMaintenanceService(
+                new ScopedAppSettingRepository(sp.GetRequiredService<IServiceScopeFactory>())));
         services.AddSingleton<EmaRsiTradeTracker>();
 
         // The whole scanned pair set must stay cached, or every bar re-fetches it.

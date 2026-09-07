@@ -25,9 +25,18 @@ public sealed class AppDbContext : DbContext
     public DbSet<Trade> Trades => Set<Trade>();
     public DbSet<AuditEvent> AuditEvents => Set<AuditEvent>();
     public DbSet<UserNotification> UserNotifications => Set<UserNotification>();
+    public DbSet<AppSetting> AppSettings => Set<AppSetting>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
+        modelBuilder.Entity<AppSetting>(e =>
+        {
+            e.ToTable("app_settings");
+            e.HasKey(x => x.Key);
+            e.Property(x => x.Key).HasMaxLength(128);
+            e.Property(x => x.Value).HasMaxLength(1024);
+        });
+
         modelBuilder.Entity<User>(e =>
         {
             e.ToTable("users");

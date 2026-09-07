@@ -110,7 +110,7 @@ public sealed class Phase9SessionRestoreTests : IClassFixture<ApiFactory>
         _factory.SimulateProcessRestart();
 
         _factory.SessionManager
-            .Setup(m => m.GetOrCreateAsync(badUserId, It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>()))
+            .Setup(m => m.GetOrCreateAsync(badUserId, It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>(), It.IsAny<AccountType>()))
             .ThrowsAsync(new BinollaAuthenticationException("SSID expired"));
 
         var restorer = _factory.Services.GetRequiredService<IBinollaSessionRestorer>();
@@ -128,7 +128,7 @@ public sealed class Phase9SessionRestoreTests : IClassFixture<ApiFactory>
 
         // Reset mock for other tests sharing the factory.
         _factory.SessionManager
-            .Setup(m => m.GetOrCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>()))
+            .Setup(m => m.GetOrCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>(), It.IsAny<AccountType>()))
             .ReturnsAsync((string userId, string _, CancellationToken _, string? __) =>
             {
                 _factory.ConnectedUsers[userId] = 1;
@@ -148,7 +148,7 @@ public sealed class Phase9SessionRestoreTests : IClassFixture<ApiFactory>
 
         var attempts = 0;
         _factory.SessionManager
-            .Setup(m => m.GetOrCreateAsync(userId, It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>()))
+            .Setup(m => m.GetOrCreateAsync(userId, It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>(), It.IsAny<AccountType>()))
             .Returns(() =>
             {
                 attempts++;
@@ -163,7 +163,7 @@ public sealed class Phase9SessionRestoreTests : IClassFixture<ApiFactory>
         _factory.ConnectedUsers.Should().NotContainKey(userId);
 
         _factory.SessionManager
-            .Setup(m => m.GetOrCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>()))
+            .Setup(m => m.GetOrCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>(), It.IsAny<AccountType>()))
             .ReturnsAsync((string uid, string _, CancellationToken _, string? __) =>
             {
                 _factory.ConnectedUsers[uid] = 1;

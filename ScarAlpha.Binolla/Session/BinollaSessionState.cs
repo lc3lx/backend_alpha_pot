@@ -34,7 +34,19 @@ public sealed class BinollaSessionState
     public DateTimeOffset LastActivityUtc { get; private set; } = DateTimeOffset.UtcNow;
     public bool ChartEnabled { get; set; }
 
-    public AccountType AccountType { get; private set; } = AccountType.Demo;
+    public AccountType AccountType { get; private set; } = AccountType.Real;
+
+    /// <summary>
+    /// Which balance this session should select in its post-auth bootstrap, and re-select
+    /// on every reconnect. Live by default; demo is opt-in.
+    /// </summary>
+    public AccountType DesiredAccountType { get; private set; } = AccountType.Real;
+
+    public void SetDesiredAccountType(AccountType type)
+    {
+        DesiredAccountType = type;
+        Touch();
+    }
     public decimal RealBalance { get; private set; }
     public decimal DemoBalance { get; private set; }
     public DateTimeOffset? BalanceUpdatedAt { get; private set; }

@@ -189,7 +189,7 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
                     ClosedAt = DateTimeOffset.UtcNow
                 });
 
-            SessionManager.Setup(m => m.GetOrCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>()))
+            SessionManager.Setup(m => m.GetOrCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>(), It.IsAny<AccountType>()))
                 .ReturnsAsync((string userId, string _, CancellationToken _, string? __) =>
                 {
                     ConnectedUsers[userId] = 1;

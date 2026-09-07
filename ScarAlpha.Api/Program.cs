@@ -5,6 +5,7 @@ using Microsoft.EntityFrameworkCore;
 using ScarAlpha.Api.Endpoints;
 using ScarAlpha.Api.Middleware;
 using ScarAlpha.Application.Common;
+using ScarAlpha.Application.Services;
 using ScarAlpha.Infrastructure;
 using ScarAlpha.Infrastructure.Persistence;
 using Serilog;
@@ -132,6 +133,10 @@ try
         {
             await db.Database.EnsureCreatedAsync();
         }
+
+        // Load the persisted global stop BEFORE the workers start. Without this a restart
+        // would resume live trading for everyone while an admin still had it held down.
+        await scope.ServiceProvider.GetRequiredService<IBotMaintenanceService>().WarmAsync();
     }
 
     app.UseMiddleware<ExceptionHandlingMiddleware>();

@@ -265,6 +265,9 @@ public sealed class BinollaSession : IBinollaClient
             .ConfigureAwait(false);
 
         State.SetAccountType(accountType);
+        // Remember it: a reconnect re-runs the bootstrap, and without this the session
+        // would silently fall back to the default balance.
+        State.SetDesiredAccountType(accountType);
     }
 
     public async Task<OrderResponse> PlaceOrderAsync(

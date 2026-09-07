@@ -58,6 +58,7 @@ public sealed class BotSignalWorker : IHostedService
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IBotRuntimeService _botRuntime;
     private readonly CohortSignalCache _decisions;
+    private readonly IBotMaintenanceService _maintenance;
     private readonly ILogger<BotSignalWorker> _logger;
     private CancellationTokenSource? _cts;
     private Task? _loop;
@@ -66,11 +67,13 @@ public sealed class BotSignalWorker : IHostedService
         IServiceScopeFactory scopeFactory,
         IBotRuntimeService botRuntime,
         CohortSignalCache decisions,
+        IBotMaintenanceService maintenance,
         ILogger<BotSignalWorker> logger)
     {
         _scopeFactory = scopeFactory;
         _botRuntime = botRuntime;
         _decisions = decisions;
+        _maintenance = maintenance;
         _logger = logger;
     }
 
@@ -149,6 +152,11 @@ public sealed class BotSignalWorker : IHostedService
 
     private async Task TickAsync(CancellationToken ct)
     {
+        // Hard stop. Stopping the runtimes alone is not enough — a user pressing Start
+        // would put themselves straight back into live trading while an admin has the
+        // fleet held down.
+        if (_maintenance.Current.Active) return;
+
         var running = _botRuntime.ListKnown()
             .Where(b => b.State == BotRunState.Running && b.ResolvedAssets.Count > 0)
             .ToList();

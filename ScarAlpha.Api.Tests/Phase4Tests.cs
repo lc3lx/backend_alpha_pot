@@ -75,7 +75,7 @@ public sealed class PendingApprovalApiFactory : WebApplicationFactory<Program>
             });
         var mgr = new Mock<IBinollaSessionManager>(MockBehavior.Loose);
         var connected = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>();
-        mgr.Setup(m => m.GetOrCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>()))
+        mgr.Setup(m => m.GetOrCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>(), It.IsAny<AccountType>()))
             .ReturnsAsync((string uid, string _, CancellationToken _, string? __) => { connected[uid] = 1; return client.Object; });
         mgr.Setup(m => m.Get(It.IsAny<string>())).Returns((string uid) => connected.ContainsKey(uid) ? client.Object : null);
         services.AddSingleton(mgr.Object);

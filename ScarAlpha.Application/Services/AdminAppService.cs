@@ -21,6 +21,7 @@ public sealed class AdminAppService
     private readonly INotificationWriter _notifications;
     private readonly INotificationRepository _notificationRepo;
     private readonly IBotRuntimeService _botRuntime;
+    private readonly IBotMaintenanceService _maintenance;
     private readonly IBotAccessService _botAccess;
     private readonly ITradeRepository _trades;
     private readonly ILogger<AdminAppService> _logger;
@@ -35,6 +36,7 @@ public sealed class AdminAppService
         INotificationWriter notifications,
         INotificationRepository notificationRepo,
         IBotRuntimeService botRuntime,
+        IBotMaintenanceService maintenance,
         IBotAccessService botAccess,
         ITradeRepository trades,
         ILogger<AdminAppService> logger)
@@ -48,6 +50,7 @@ public sealed class AdminAppService
         _notifications = notifications;
         _notificationRepo = notificationRepo;
         _botRuntime = botRuntime;
+        _maintenance = maintenance;
         _botAccess = botAccess;
         _trades = trades;
         _logger = logger;
@@ -524,7 +527,8 @@ public sealed class AdminAppService
                 DailyLossLimit: runtime.DailyLossLimit,
                 UpdatedAt: runtime.UpdatedAt,
                 IsMarketingDemo: user.IsMarketingDemo,
-                Assets: runtime.ResolvedAssets));
+                Assets: runtime.ResolvedAssets,
+                StrategyId: runtime.StrategyId));
         }
 
         rows = rows
@@ -558,7 +562,8 @@ public sealed class AdminAppService
             DailyLossLimit: runtime.DailyLossLimit,
             UpdatedAt: runtime.UpdatedAt,
             IsMarketingDemo: user.IsMarketingDemo,
-            Assets: runtime.ResolvedAssets);
+            Assets: runtime.ResolvedAssets,
+            StrategyId: runtime.StrategyId);
     }
 
     public async Task<AdminBotRuntimeDto> ControlBotAsync(
@@ -587,13 +592,15 @@ public sealed class AdminAppService
                 var access = await _botAccess.CheckAsync(userId, ct);
                 if (access.Access != BotAccessState.Allowed && !user.IsMarketingDemo)
                     throw new ApiException(ApiErrorCodes.Forbidden, $"User bot access is {access.Access}.", 403);
+                var current = _botRuntime.Get(userId);
                 next = _botRuntime.Start(
                     userId,
                     assets,
                     request.Amount ?? 25m,
                     request.DurationSeconds ?? 300,
                     request.DailyProfitTarget ?? 50m,
-                    request.DailyLossLimit ?? 30m);
+                    request.DailyLossLimit ?? 30m,
+                    strategyId: request.StrategyId ?? current.StrategyId);
                 break;
             }
             case "pause":
@@ -610,7 +617,8 @@ public sealed class AdminAppService
                     request.DurationSeconds,
                     request.DailyProfitTarget,
                     request.DailyLossLimit,
-                    assets: request.Assets);
+                    assets: request.Assets,
+                    strategyId: request.StrategyId);
                 break;
             default:
                 throw new ApiException(ApiErrorCodes.ValidationError, "action must be start, pause, stop, or apply.");
@@ -627,6 +635,86 @@ public sealed class AdminAppService
             ct: ct);
 
         return await GetBotAsync(userId, ct);
+    }
+
+    /// <summary>
+    /// Stops or resumes the trading bot for EVERY user at once.
+    ///
+    /// <para>Stopping also raises the maintenance flag, which does two things: the signal
+    /// worker refuses to place anything while it is up, and every user's bot page shows
+    /// the maintenance notice instead of the controls. Stopping the runtimes alone would
+    /// not be enough — a user could simply press Start again.</para>
+    ///
+    /// <para>Resuming lowers the flag and restarts the bots that this switch stopped, so
+    /// an admin does not have to visit each account. Bots the user had already stopped
+    /// themselves stay stopped.</para>
+    /// </summary>
+    public async Task<AdminFleetActionResponse> SetFleetStateAsync(
+        AdminMaintenanceRequest request,
+        CancellationToken ct)
+    {
+        await EnsureAdminAsync(ct);
+        if (request is null)
+            throw new ApiException(ApiErrorCodes.ValidationError, "Request body is required.");
+
+        var affected = 0;
+
+        if (request.Active)
+        {
+            // Flag first: a bot restarted between the two steps must still be refused.
+            await _maintenance.SetAsync(true, request.Message, ct);
+
+            foreach (var bot in _botRuntime.ListKnown())
+            {
+                if (bot.State == BotRunState.Stopped) continue;
+                _botRuntime.Stop(bot.UserId, StopReasons.AdminMaintenance);
+                affected++;
+            }
+        }
+        else
+        {
+            await _maintenance.SetAsync(false, null, ct);
+
+            foreach (var bot in _botRuntime.ListKnown())
+            {
+                // Only the ones this switch stopped. A user who stopped their own bot
+                // must not be put back into live trading by an unrelated admin action.
+                if (bot.StopReason != StopReasons.AdminMaintenance) continue;
+                if (bot.ResolvedAssets.Count == 0) continue;
+
+                _botRuntime.Start(
+                    bot.UserId,
+                    bot.ResolvedAssets,
+                    bot.Amount,
+                    bot.DurationSeconds,
+                    bot.DailyProfitTarget,
+                    bot.DailyLossLimit,
+                    strategyId: bot.StrategyId);
+                affected++;
+            }
+        }
+
+        var state = _maintenance.Current;
+        await _audit.RecordAsync(
+            action: request.Active ? "AdminBotsStopAll" : "AdminBotsStartAll",
+            actorUserId: _currentUser.UserId,
+            targetUserId: null,
+            targetBinollaLinkId: null,
+            previousState: (!request.Active).ToString(),
+            newState: request.Active.ToString(),
+            detail: $"botsAffected={affected};message={request.Message}",
+            ct: ct);
+
+        return new AdminFleetActionResponse(state.Active, state.Message, state.Since, affected);
+    }
+
+    /// <summary>Current global stop state, for the admin panel.</summary>
+    public async Task<AdminFleetActionResponse> GetFleetStateAsync(CancellationToken ct)
+    {
+        await EnsureAdminAsync(ct);
+        var state = _maintenance.Current;
+        var running = _botRuntime.ListKnown().Count(b => b.State == BotRunState.Running);
+        return new AdminFleetActionResponse(state.Active, state.Message, state.Since, running);
     }
 
     public async Task<AdminTradeListResponse> ListTradesAsync(

@@ -256,11 +256,16 @@ public sealed class BinollaAppService
             // Drop any zombie in-memory session so cookie+SSID attach on a fresh socket.
             await _sessions.RemoveAsync(userId.ToString(), workCt);
 
+            // The balance is chosen HERE, in the session's post-auth bootstrap. Sending a
+            // second account/change after connect races the unauthorized window and drops
+            // the fresh socket, which is why this has to be passed in rather than switched
+            // afterwards.
             var client = await _sessions.GetOrCreateAsync(
                 userId.ToString(),
                 request.Ssid.Trim(),
                 workCt,
-                cookieHeader);
+                cookieHeader,
+                accountType == DomainAccount.Demo ? EngineAccount.Demo : EngineAccount.Real);
 
             if (!client.IsTransportConnected ||
                 client.Lifecycle is SessionLifecycleState.AuthenticationFailed

@@ -158,7 +158,12 @@ public sealed record BotRuntimeDto(
     string StrategyId = "rsi",
     decimal BaseAmount = 0m,
     string StakeMode = "red-signal-pro",
-    string MarketTypeId = "all-markets");
+    string MarketTypeId = "all-markets",
+    /// <summary>
+    /// Set while an admin has the whole fleet stopped. The bot page shows the maintenance
+    /// notice instead of its controls while this is present.
+    /// </summary>
+    BotMaintenanceDto? Maintenance = null);
 
 public sealed record BinollaStatusDto(
     bool Connected,
@@ -418,7 +423,9 @@ public sealed record AdminBotRuntimeDto(
     decimal DailyLossLimit,
     DateTimeOffset UpdatedAt,
     bool IsMarketingDemo,
-    IReadOnlyList<string> Assets);
+    IReadOnlyList<string> Assets,
+    /// <summary>Strategy this bot runs, so an admin can see and change it.</summary>
+    string StrategyId = "rsi");
 
 public sealed record AdminBotListResponse(
     IReadOnlyList<AdminBotRuntimeDto> Items,
@@ -433,7 +440,22 @@ public sealed record AdminBotControlRequest(
     int? DurationSeconds = null,
     decimal? DailyProfitTarget = null,
     decimal? DailyLossLimit = null,
-    IReadOnlyList<string>? Assets = null);
+    IReadOnlyList<string>? Assets = null,
+    /// <summary>Strategy the bot should run (rsi, ema, alt5, smart…). Null keeps the current one.</summary>
+    string? StrategyId = null);
+
+/// <summary>Turns the global bot stop on or off.</summary>
+public sealed record AdminMaintenanceRequest(bool Active, string? Message = null);
+
+/// <summary>Result of a fleet-wide start/stop.</summary>
+public sealed record AdminFleetActionResponse(
+    bool MaintenanceActive,
+    string? Message,
+    DateTimeOffset? Since,
+    int BotsAffected);
+
+/// <summary>Maintenance state as the user's app sees it.</summary>
+public sealed record BotMaintenanceDto(bool Active, string? Message, DateTimeOffset? Since);
 
 public sealed record AdminTradeDto(
     string Id,

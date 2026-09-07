@@ -94,3 +94,13 @@ public static class PairCooldownRegistry
     private static string Key(string? strategyId, string asset) =>
         $"{(strategyId ?? "rsi").Trim().ToLowerInvariant()}:{asset.Trim().ToUpperInvariant()}";
 }
+
+/// <summary>Reasons the bot runtime records when it stops a bot.</summary>
+public static class StopReasons
+{
+    /// <summary>
+    /// An admin stopped every bot. Kept distinct so resuming only restarts the bots this
+    /// switch stopped — a user who stopped their own bot stays stopped.
+    /// </summary>
+    public const string AdminMaintenance = "ADMIN_MAINTENANCE";
+}
