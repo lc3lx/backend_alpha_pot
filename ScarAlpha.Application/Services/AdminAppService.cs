@@ -591,7 +591,15 @@ public sealed class AdminAppService
                     throw new ApiException(ApiErrorCodes.ValidationError, "Select at least one trading pair to start the bot.");
                 var access = await _botAccess.CheckAsync(userId, ct);
                 if (access.Access != BotAccessState.Allowed && !user.IsMarketingDemo)
-                    throw new ApiException(ApiErrorCodes.Forbidden, $"User bot access is {access.Access}.", 403);
+                {
+                    // Starting a bot for an account that is not approved/connected would
+                    // fail at the broker anyway; say which so the admin can fix it.
+                    throw new ApiException(
+                        ApiErrorCodes.Forbidden,
+                        $"Cannot start this user's bot: their access is {access.Access}. "
+                        + "Approve the account and make sure Binolla is connected first.",
+                        403);
+                }
                 var current = _botRuntime.Get(userId);
                 next = _botRuntime.Start(
                     userId,
@@ -1067,14 +1075,30 @@ public sealed class AdminAppService
         link.UpdatedAt = DateTimeOffset.UtcNow;
     }
 
+    /// <summary>
+    /// Admin gate. Deliberately reports WHICH half failed: the two causes need different
+    /// fixes and an identical message made them impossible to tell apart.
+    /// </summary>
     private async Task EnsureAdminAsync(CancellationToken ct)
     {
         if (!_currentUser.IsAdmin)
-            throw new ApiException(ApiErrorCodes.Forbidden, "Admin role required.", 403);
+        {
+            // The signed-in token carries no Admin role. Usually a token issued before the
+            // account was promoted — signing out and back in mints a new one.
+            throw new ApiException(
+                ApiErrorCodes.Forbidden,
+                "Your session does not carry the admin role. Sign out and sign in again.",
+                403);
+        }
 
         var user = await _users.GetByIdAsync(_currentUser.UserId, ct);
         if (user is null || user.Role != UserRole.Admin)
-            throw new ApiException(ApiErrorCodes.Forbidden, "Admin role required.", 403);
+        {
+            throw new ApiException(
+                ApiErrorCodes.Forbidden,
+                "This account is not an administrator.",
+                403);
+        }
     }
 
     private AdminBinollaAccountDto Map(BinollaLink link, User user)
