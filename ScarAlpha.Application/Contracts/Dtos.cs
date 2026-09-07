@@ -42,9 +42,12 @@ public sealed record MeResponse(
     BinollaStatusDto? Binolla,
     bool IsMarketingDemo = false);
 
-public sealed record BinollaConnectRequest(string Ssid, string AccountType = "Demo");
+// Default is Real: live is the product's normal state and demo is an admin-granted
+// privilege. Leaving these at "Demo" meant a caller that simply omitted the field was
+// asking for the locked balance and got refused.
+public sealed record BinollaConnectRequest(string Ssid, string AccountType = "Real");
 
-public sealed record BinollaCredentialRequest(string Email, string Password, string AccountType = "Demo");
+public sealed record BinollaCredentialRequest(string Email, string Password, string AccountType = "Real");
 
 public sealed record BinollaAccountTypeRequest(string AccountType);
 
@@ -314,6 +317,8 @@ public sealed record AdminUserListItemDto(
     long? TelegramUserId,
     string Role,
     bool IsMarketingDemo,
+    /// <summary>Whether an admin has unlocked the Binolla demo balance for this user.</summary>
+    bool DemoAllowed,
     string? BinollaApprovalStatus,
     bool BinollaConnected,
     DateTimeOffset CreatedAt,
@@ -337,6 +342,8 @@ public sealed record AdminUserDetailDto(
     string Role,
     bool IsAdmin,
     bool IsMarketingDemo,
+    /// <summary>Whether an admin has unlocked the Binolla demo balance for this user.</summary>
+    bool DemoAllowed,
     MarketingDemoConfigDto? MarketingConfig,
     AdminBinollaAccountDto? BinollaAccount,
     DateTimeOffset CreatedAt,
@@ -346,6 +353,8 @@ public sealed record AdminUserDetailDto(
 
 public sealed record PatchAdminUserRequest(
     bool? IsMarketingDemo = null,
+    /// <summary>Unlock/lock the Binolla demo balance. Null leaves it unchanged.</summary>
+    bool? DemoAllowed = null,
     long? TelegramUserId = null,
     bool ClearTelegramUserId = false,
     MarketingDemoConfigDto? Config = null);

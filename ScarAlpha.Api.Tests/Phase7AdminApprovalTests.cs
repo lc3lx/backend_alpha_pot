@@ -172,7 +172,7 @@ public sealed class Phase7AdminApprovalTests : IClassFixture<ApiFactory>
     private async Task ConnectOnlyAsync(string token)
     {
         using var req = Authed(HttpMethod.Post, "/api/binolla/connect", token);
-        req.Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"demo\"}]", accountType = "Demo" });
+        req.Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"demo\"}]" });
         (await _client.SendAsync(req)).EnsureSuccessStatusCode();
     }
 

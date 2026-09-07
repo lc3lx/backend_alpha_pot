@@ -211,7 +211,7 @@ public sealed class Phase9SessionRestoreTests : IClassFixture<ApiFactory>
     private async Task ConnectAsync(string token, string ssid)
     {
         using var req = Authed(HttpMethod.Post, "/api/binolla/connect", token);
-        req.Content = JsonContent.Create(new { ssid, accountType = "Demo" });
+        req.Content = JsonContent.Create(new { ssid });
         (await _client.SendAsync(req)).EnsureSuccessStatusCode();
     }
 

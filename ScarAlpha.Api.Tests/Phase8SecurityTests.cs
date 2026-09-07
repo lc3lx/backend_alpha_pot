@@ -88,7 +88,8 @@ public sealed class Phase8SecurityTests : IClassFixture<ApiFactory>
         using var req = Authed(HttpMethod.Get, "/api/binolla/balance", token);
         var json = await (await _client.SendAsync(req)).Content.ReadFromJsonAsync<JsonElement>();
         json.GetProperty("realBalance").GetDecimal().Should().Be(0);
-        json.GetProperty("accountType").GetString().Should().Be("Demo");
+        // Live by default now: demo is only linked when an admin has unlocked it.
+        json.GetProperty("accountType").GetString().Should().Be("Real");
     }
 
     [Fact]
@@ -273,7 +274,7 @@ public sealed class Phase8SecurityTests : IClassFixture<ApiFactory>
     private async Task ConnectOnlyAsync(string token)
     {
         using var req = Authed(HttpMethod.Post, "/api/binolla/connect", token);
-        req.Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"demo\"}]", accountType = "Demo" });
+        req.Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"demo\"}]" });
         (await _client.SendAsync(req)).EnsureSuccessStatusCode();
     }
 

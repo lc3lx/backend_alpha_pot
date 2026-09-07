@@ -48,6 +48,8 @@ public sealed class AppDbContext : DbContext
             e.Property(x => x.Country).HasMaxLength(128);
             e.Property(x => x.Role).HasConversion<int>();
             e.Property(x => x.IsMarketingDemo).HasDefaultValue(false);
+            // Locked by default — an admin has to open demo for a specific user.
+            e.Property(x => x.DemoAllowed).HasDefaultValue(false);
             e.HasIndex(x => x.IsMarketingDemo);
             e.Property(x => x.MarketingDemoConfigJson).HasColumnType("text");
             e.Property(x => x.BotRuntimeJson).HasColumnType("text");

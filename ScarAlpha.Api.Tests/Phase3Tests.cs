@@ -199,7 +199,7 @@ public sealed class Phase3MarketApiTests : IClassFixture<ApiFactory>
         var token = await LoginAsync(id);
         using var req = new HttpRequestMessage(HttpMethod.Post, "/api/binolla/connect")
         {
-            Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"demo\"}]", accountType = "Demo" })
+            Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"demo\"}]" })
         };
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
         (await _client.SendAsync(req)).EnsureSuccessStatusCode();
@@ -420,7 +420,7 @@ public sealed class Phase3TradingHardeningTests : IClassFixture<ApiFactory>
         var token = (await login.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("accessToken").GetString()!;
         using var req = new HttpRequestMessage(HttpMethod.Post, "/api/binolla/connect")
         {
-            Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"demo\"}]", accountType = "Demo" })
+            Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"demo\"}]" })
         };
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
         (await _client.SendAsync(req)).EnsureSuccessStatusCode();
@@ -449,7 +449,7 @@ public sealed class Phase3RateLimitTests : IClassFixture<RateLimitedApiFactory>
 
         using (var connect = new HttpRequestMessage(HttpMethod.Post, "/api/binolla/connect")
         {
-            Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"demo\"}]", accountType = "Demo" })
+            Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"demo\"}]" })
         })
         {
             connect.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);

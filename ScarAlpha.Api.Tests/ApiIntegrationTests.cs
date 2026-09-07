@@ -434,8 +434,7 @@ public sealed class BinollaApiTests : IClassFixture<ApiFactory>
         {
             Content = JsonContent.Create(new
             {
-                ssid = """42["authorization",{"isDemo":true,"token":"SECRET_SSID_VALUE"}]""",
-                accountType = "Demo"
+                ssid = """42["authorization",{"isDemo":true,"token":"SECRET_SSID_VALUE"}]"""
             })
         };
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
@@ -473,18 +472,22 @@ public sealed class BinollaApiTests : IClassFixture<ApiFactory>
         json.GetProperty("currentBalance").GetDecimal().Should().Be(1000m);
     }
 
+    /// <summary>
+    /// The gate now points the other way. Live is the product's default, so connecting
+    /// without asking for demo must succeed; it is DEMO that needs an admin to unlock it.
+    /// </summary>
     [Fact]
-    public async Task Real_trading_is_rejected()
+    public async Task Demo_account_is_rejected_until_an_admin_unlocks_it()
     {
         var token = await LoginAsync(4003);
         using var req = new HttpRequestMessage(HttpMethod.Post, "/api/binolla/connect")
         {
-            Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"x\"}]", accountType = "Real" })
+            Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"x\"}]", accountType = "Demo" })
         };
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
         var res = await _client.SendAsync(req);
         res.StatusCode.Should().Be(System.Net.HttpStatusCode.Forbidden);
-        (await res.Content.ReadAsStringAsync()).Should().Contain("REAL_TRADING_DISABLED");
+        (await res.Content.ReadAsStringAsync()).Should().Contain("DEMO_ACCOUNT_LOCKED");
     }
 
     [Fact]
@@ -520,7 +523,7 @@ public sealed class BinollaApiTests : IClassFixture<ApiFactory>
     {
         using var req = new HttpRequestMessage(HttpMethod.Post, "/api/binolla/connect")
         {
-            Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"demo\"}]", accountType = "Demo" })
+            Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"demo\"}]" })
         };
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
         (await _client.SendAsync(req)).EnsureSuccessStatusCode();
@@ -616,8 +619,7 @@ public sealed class TradeApiTests : IClassFixture<ApiFactory>
             Content = JsonContent.Create(new
             {
                 email = "trader@example.com",
-                password = "secret-pass",
-                accountType = "Demo"
+                password = "secret-pass"
             })
         };
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
@@ -629,7 +631,8 @@ public sealed class TradeApiTests : IClassFixture<ApiFactory>
         raw.ToLowerInvariant().Should().NotContain("password");
         var body = JsonDocument.Parse(raw).RootElement;
         body.GetProperty("connected").GetBoolean().Should().BeTrue();
-        body.GetProperty("accountType").GetString().Should().Be("Demo");
+        // Live by default now: demo is only linked when an admin has unlocked it.
+        body.GetProperty("accountType").GetString().Should().Be("Real");
         body.GetProperty("approvalStatus").GetString().Should().Be("Pending");
     }
 
@@ -642,8 +645,7 @@ public sealed class TradeApiTests : IClassFixture<ApiFactory>
             Content = JsonContent.Create(new
             {
                 email = "newtrader@example.com",
-                password = "secret-pass",
-                accountType = "Demo"
+                password = "secret-pass"
             })
         };
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
@@ -689,7 +691,7 @@ public sealed class TradeApiTests : IClassFixture<ApiFactory>
         var token = await LoginAsync(id);
         using var req = new HttpRequestMessage(HttpMethod.Post, "/api/binolla/connect")
         {
-            Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"demo\"}]", accountType = "Demo" })
+            Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"demo\"}]" })
         };
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
         (await _client.SendAsync(req)).EnsureSuccessStatusCode();

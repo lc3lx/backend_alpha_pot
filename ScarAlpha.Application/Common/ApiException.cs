@@ -19,6 +19,8 @@ public static class ApiErrorCodes
     public const string InsufficientBalance = "INSUFFICIENT_BALANCE";
     public const string InvalidTrade = "INVALID_TRADE";
     public const string RealTradingDisabled = "REAL_TRADING_DISABLED";
+    /// <summary>Demo balance requested by a user an admin has not unlocked it for.</summary>
+    public const string DemoAccountLocked = "DEMO_ACCOUNT_LOCKED";
     public const string DuplicateRequest = "DUPLICATE_REQUEST";
     public const string NotFound = "NOT_FOUND";
     public const string ValidationError = "VALIDATION_ERROR";

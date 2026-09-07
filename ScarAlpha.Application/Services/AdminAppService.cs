@@ -243,6 +243,7 @@ public sealed class AdminAppService
                 TelegramUserId: user.TelegramUserId,
                 Role: user.Role.ToString(),
                 IsMarketingDemo: user.IsMarketingDemo,
+                DemoAllowed: user.DemoAllowed,
                 BinollaApprovalStatus: link?.ApprovalStatus.ToString(),
                 BinollaConnected: link is not null && link.Status == BinollaLinkStatus.Connected,
                 CreatedAt: user.CreatedAt,
@@ -271,6 +272,7 @@ public sealed class AdminAppService
             Role: user.Role.ToString(),
             IsAdmin: user.Role == UserRole.Admin,
             IsMarketingDemo: user.IsMarketingDemo,
+            DemoAllowed: user.DemoAllowed,
             MarketingConfig: user.IsMarketingDemo || user.MarketingDemoConfigJson != null
                 ? MarketingDemoConfigStore.FromUser(user)
                 : null,
@@ -297,6 +299,7 @@ public sealed class AdminAppService
             throw new ApiException(ApiErrorCodes.ValidationError, "Admin accounts cannot be marketing demos.");
 
         var previousDemo = user.IsMarketingDemo.ToString();
+        var previousDemoAllowed = user.DemoAllowed.ToString();
 
         if (request.ClearTelegramUserId)
         {
@@ -316,6 +319,9 @@ public sealed class AdminAppService
                 MarketingDemoConfigStore.ApplyToUser(user, request.Config ?? MarketingDemoConfigStore.Default);
         }
 
+        if (request.DemoAllowed is bool allowDemo)
+            user.DemoAllowed = allowDemo;
+
         if (request.Config is not null)
             MarketingDemoConfigStore.ApplyToUser(user, request.Config);
 
@@ -331,6 +337,21 @@ public sealed class AdminAppService
                 targetBinollaLinkId: null,
                 previousState: previousDemo,
                 newState: user.IsMarketingDemo.ToString(),
+                detail: "via PATCH /api/admin/users",
+                ct: ct);
+        }
+
+        // Unlocking the demo balance is a permission change on a live-money account, so
+        // it belongs in the audit trail exactly like the marketing-demo switch.
+        if (request.DemoAllowed is bool demoAccess && demoAccess.ToString() != previousDemoAllowed)
+        {
+            await _audit.RecordAsync(
+                action: demoAccess ? "DemoAccountUnlocked" : "DemoAccountLocked",
+                actorUserId: _currentUser.UserId,
+                targetUserId: user.Id,
+                targetBinollaLinkId: null,
+                previousState: previousDemoAllowed,
+                newState: user.DemoAllowed.ToString(),
                 detail: "via PATCH /api/admin/users",
                 ct: ct);
         }

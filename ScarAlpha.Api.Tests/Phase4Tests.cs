@@ -173,7 +173,7 @@ public sealed class Phase4BusinessModelTests : IClassFixture<ApiFactory>
     private async Task<JsonElement> ConnectAsync(string token, bool approve)
     {
         using var req = Authed(HttpMethod.Post, "/api/binolla/connect", token);
-        req.Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"demo\"}]", accountType = "Demo" });
+        req.Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"demo\"}]" });
         var res = await _client.SendAsync(req);
         res.EnsureSuccessStatusCode();
         if (approve)
@@ -186,7 +186,7 @@ public sealed class Phase4BusinessModelTests : IClassFixture<ApiFactory>
 
         // Return connect-like shape for assertions that check access after approval.
         using var connectAgain = Authed(HttpMethod.Post, "/api/binolla/connect", token);
-        connectAgain.Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"demo\"}]", accountType = "Demo" });
+        connectAgain.Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"demo\"}]" });
         var connectRes = await _client.SendAsync(connectAgain);
         connectRes.EnsureSuccessStatusCode();
         return await connectRes.Content.ReadFromJsonAsync<JsonElement>();
@@ -215,7 +215,7 @@ public sealed class Phase4PendingApprovalTests : IClassFixture<PendingApprovalAp
 
         using var connect = new HttpRequestMessage(HttpMethod.Post, "/api/binolla/connect")
         {
-            Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"demo\"}]", accountType = "Demo" })
+            Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"demo\"}]" })
         };
         connect.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
         var connectRes = await _client.SendAsync(connect);
@@ -261,7 +261,7 @@ public sealed class Phase4RejectedTests : IClassFixture<PendingApprovalApiFactor
 
         using var connect = new HttpRequestMessage(HttpMethod.Post, "/api/binolla/connect")
         {
-            Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"demo\"}]", accountType = "Demo" })
+            Content = JsonContent.Create(new { ssid = "42[\"authorization\",{\"token\":\"demo\"}]" })
         };
         connect.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
         (await _client.SendAsync(connect)).EnsureSuccessStatusCode();

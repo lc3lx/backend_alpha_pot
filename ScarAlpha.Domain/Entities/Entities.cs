@@ -25,6 +25,12 @@ public class User
     /// </summary>
     public string? MarketingDemoConfigJson { get; set; }
     /// <summary>
+    /// Whether this user may use their Binolla DEMO balance. Off by default: everyone
+    /// trades live, and demo is a privilege an admin grants — the reverse of how it
+    /// started, when demo was forced on everybody and live was unreachable.
+    /// </summary>
+    public bool DemoAllowed { get; set; }
+    /// <summary>
     /// Persisted bot runtime (Running/Paused/Stopped + settings) so the bot survives API restarts.
     /// </summary>
     public string? BotRuntimeJson { get; set; }

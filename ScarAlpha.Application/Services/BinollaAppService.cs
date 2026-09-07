@@ -21,6 +21,7 @@ public sealed class BinollaAppService
     private readonly IBinollaCredentialAuth _credentialAuth;
     private readonly IBinollaSessionRestorer _restorer;
     private readonly IMarketingDemoService _demo;
+    private readonly IUserRepository _users;
     private readonly ILogger<BinollaAppService> _logger;
 
     public BinollaAppService(
@@ -32,6 +33,7 @@ public sealed class BinollaAppService
         IBinollaCredentialAuth credentialAuth,
         IBinollaSessionRestorer restorer,
         IMarketingDemoService demo,
+        IUserRepository users,
         ILogger<BinollaAppService> logger)
     {
         _currentUser = currentUser;
@@ -42,6 +44,7 @@ public sealed class BinollaAppService
         _credentialAuth = credentialAuth;
         _restorer = restorer;
         _demo = demo;
+        _users = users;
         _logger = logger;
     }
 
@@ -235,9 +238,10 @@ public sealed class BinollaAppService
         if (string.IsNullOrWhiteSpace(request.Ssid))
             throw new ApiException(ApiErrorCodes.ValidationError, "ssid is required.");
 
+        // Live is the default and demo is the privilege. Anyone may connect live; asking
+        // for demo requires an admin to have unlocked it for this account.
         var accountType = ParseAccountType(request.AccountType);
-        if (accountType == DomainAccount.Real)
-            throw new ApiException(ApiErrorCodes.RealTradingDisabled, "Real trading is disabled in this phase.", 403);
+        await EnsureAccountTypeAllowedAsync(userId, accountType, ct);
 
         var encrypted = _protector.Encrypt(request.Ssid.Trim());
 
@@ -302,7 +306,9 @@ public sealed class BinollaAppService
             link.EncryptedSsid = encrypted;
             if (!string.IsNullOrWhiteSpace(cookieHeader))
                 link.EncryptedCookieHeader = _protector.Encrypt(cookieHeader.Trim());
-            link.AccountType = DomainAccount.Demo;
+            // Honour what was actually requested (and validated above). This used to be
+            // pinned to Demo, which is why live was unreachable whatever the caller sent.
+            link.AccountType = accountType;
             link.Status = BinollaLinkStatus.Connected;
             link.LastConnectedAt = now;
             link.UpdatedAt = now;
@@ -331,7 +337,7 @@ public sealed class BinollaAppService
 
             return new BinollaConnectResponse(
                 Connected: true,
-                AccountType: "Demo",
+                AccountType: accountType.ToString(),
                 Access: AccountAppService.MapAccess(access.Access),
                 AdminApproved: access.AdminApproved,
                 ApprovalStatus: access.ApprovalStatus,
@@ -364,7 +370,7 @@ public sealed class BinollaAppService
                 link.EncryptedSsid = encrypted;
                 if (!string.IsNullOrWhiteSpace(cookieHeader))
                     link.EncryptedCookieHeader = _protector.Encrypt(cookieHeader.Trim());
-                link.AccountType = DomainAccount.Demo;
+                link.AccountType = accountType;
                 link.Status = BinollaLinkStatus.Connected;
                 link.LastConnectedAt = now;
                 link.UpdatedAt = now;
@@ -372,7 +378,7 @@ public sealed class BinollaAppService
                 var access = await _access.CheckAsync(userId, CancellationToken.None);
                 return new BinollaConnectResponse(
                     Connected: true,
-                    AccountType: "Demo",
+                    AccountType: accountType.ToString(),
                     Access: AccountAppService.MapAccess(access.Access),
                     AdminApproved: access.AdminApproved,
                     ApprovalStatus: access.ApprovalStatus,
@@ -479,7 +485,9 @@ public sealed class BinollaAppService
             // Background restore still warming — never 500 the shell.
             return new BinollaBalanceDto(
                 Connected: false,
-                AccountType: "Demo",
+                // Placeholder while the session warms. Live is the product default, so a
+                // hardcoded "Demo" here would tell a live user they are on demo money.
+                AccountType: nameof(DomainAccount.Real),
                 DemoBalance: 0m,
                 RealBalance: 0m,
                 CurrentBalance: 0m);
@@ -532,6 +540,7 @@ public sealed class BinollaAppService
     {
         await EnsureNotMarketingDemoAsync(ct);
         var accountType = ParseAccountType(request.AccountType);
+        await EnsureAccountTypeAllowedAsync(_currentUser.UserId, accountType, ct);
 
         var client = RequireConnectedClient();
         var engineType = accountType == DomainAccount.Real ? EngineAccount.Real : EngineAccount.Demo;
@@ -684,10 +693,36 @@ public sealed class BinollaAppService
         return client;
     }
 
+    /// <summary>
+    /// Blocks the Binolla DEMO balance unless an admin has unlocked it for this user.
+    ///
+    /// <para>Live trading is the default state of the product; demo is a concession an
+    /// admin grants per account. Enforced here rather than at the endpoint so connect,
+    /// re-login and the runtime account switch all go through the same rule.</para>
+    /// </summary>
+    private async Task EnsureAccountTypeAllowedAsync(
+        Guid userId,
+        DomainAccount accountType,
+        CancellationToken ct)
+    {
+        if (accountType != DomainAccount.Demo)
+            return;
+
+        var user = await _users.GetByIdAsync(userId, ct);
+        if (user?.DemoAllowed == true)
+            return;
+
+        throw new ApiException(
+            ApiErrorCodes.DemoAccountLocked,
+            "The demo account is locked. Ask an administrator to enable it for your account.",
+            403);
+    }
+
     private static DomainAccount ParseAccountType(string? value)
     {
+        // Unspecified means live. Demo is now opt-in and admin-gated.
         if (string.IsNullOrWhiteSpace(value))
-            return DomainAccount.Demo;
+            return DomainAccount.Real;
 
         return value.Trim().ToLowerInvariant() switch
         {
