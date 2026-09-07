@@ -1,5 +1,6 @@
 using FluentAssertions;
 using ScarAlpha.Application.Common;
+using ScarAlpha.Application.Contracts;
 using ScarAlpha.Domain.Entities;
 using Xunit;
 
@@ -42,6 +43,21 @@ public sealed class DemoAccountLockTests
         // frontend needs to tell a locked demo from a disabled product.
         ApiErrorCodes.DemoAccountLocked.Should().Be("DEMO_ACCOUNT_LOCKED");
         ApiErrorCodes.DemoAccountLocked.Should().NotBe(ApiErrorCodes.RealTradingDisabled);
+    }
+
+    /// <summary>
+    /// The request contracts must default to LIVE.
+    ///
+    /// <para>This is the exact bug that broke every login after the lock landed: the
+    /// records defaulted <c>AccountType</c> to "Demo", so a caller that simply omitted the
+    /// field was asking for the locked balance and was refused with DEMO_ACCOUNT_LOCKED.
+    /// The frontends did exactly that.</para>
+    /// </summary>
+    [Fact]
+    public void Connect_contracts_default_to_live()
+    {
+        new BinollaConnectRequest("ssid").AccountType.Should().Be("Real");
+        new BinollaCredentialRequest("a@b.com", "pw").AccountType.Should().Be("Real");
     }
 
     [Fact]
