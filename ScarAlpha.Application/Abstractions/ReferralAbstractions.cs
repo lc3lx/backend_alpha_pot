@@ -22,6 +22,18 @@ public interface IReferralRepository
     /// of it meant a referrer earned nothing for weeks while their invitees traded daily.</para>
     /// </summary>
     Task<int> CountActiveAsync(Guid referrerUserId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Per-referred-user totals for one referrer: how much each person has traded and how
+    /// much commission they have produced.
+    ///
+    /// <para>Returned as one grouped query rather than a lookup per member — a referrer at
+    /// tier 5 has 100+ members, and a per-member round trip would make their referral page
+    /// issue a hundred queries.</para>
+    /// </summary>
+    Task<IReadOnlyDictionary<Guid, ReferralMemberTotals>> SummarizeByReferredAsync(
+        Guid referrerUserId,
+        CancellationToken ct = default);
     /// <summary>Count of every user this referrer has ever referred, qualified or not.</summary>
     Task<int> CountAllAsync(Guid referrerUserId, CancellationToken ct = default);
     Task<(IReadOnlyList<ReferralQualification> Items, int Total)> ListByReferrerAsync(
@@ -80,3 +92,11 @@ public interface IReferralAccrualService
 {
     Task OnTradeSettledAsync(Trade trade, CancellationToken ct = default);
 }
+
+/// <param name="CommissionedTrades">Trades that produced commission for the referrer.</param>
+/// <param name="TradedVolume">Sum of those trades' stake.</param>
+/// <param name="CommissionEarned">What the referrer earned from this person.</param>
+public readonly record struct ReferralMemberTotals(
+    int CommissionedTrades,
+    decimal TradedVolume,
+    decimal CommissionEarned);

@@ -54,6 +54,23 @@ public interface IBinollaSessionRestorer
     /// Kick a non-blocking restore if the user is not live. Safe to call on every status poll.
     /// </summary>
     void EnsureBackgroundRestore(Guid userId);
+
+    /// <summary>
+    /// Whether a fresh credential login may be attempted for this user right now.
+    ///
+    /// <para>A credential login drives a headless browser and takes 20-40s. The bot worker
+    /// ticks every second, so without this check a broker that is refusing logins gets
+    /// hammered continuously — which is exactly how an IP earns a rate-limit ban and turns
+    /// a recoverable outage into a lasting one.</para>
+    /// </summary>
+    bool CanAttemptCredentialLogin(Guid userId);
+
+    /// <summary>
+    /// Records a failed credential login so the next attempt waits. Backoff grows with
+    /// consecutive failures — a broker returning 403 will keep doing so, and retrying at
+    /// the same rate only deepens the hole.
+    /// </summary>
+    void MarkCredentialLoginFailed(Guid userId);
 }
 
 public enum StrategyCatalogStatus

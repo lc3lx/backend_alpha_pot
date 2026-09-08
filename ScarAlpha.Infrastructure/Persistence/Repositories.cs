@@ -515,6 +515,27 @@ public sealed class ReferralRepository : IReferralRepository
         }
     }
 
+    public async Task<IReadOnlyDictionary<Guid, ReferralMemberTotals>> SummarizeByReferredAsync(
+        Guid referrerUserId,
+        CancellationToken ct = default)
+    {
+        var rows = await _db.ReferralCommissions
+            .Where(x => x.ReferrerUserId == referrerUserId)
+            .GroupBy(x => x.ReferredUserId)
+            .Select(g => new
+            {
+                ReferredUserId = g.Key,
+                Trades = g.Count(),
+                Volume = g.Sum(x => x.TradeAmount),
+                Commission = g.Sum(x => x.Amount)
+            })
+            .ToListAsync(ct);
+
+        return rows.ToDictionary(
+            r => r.ReferredUserId,
+            r => new ReferralMemberTotals(r.Trades, r.Volume, r.Commission));
+    }
+
     public Task<decimal> SumCommissionsAsync(Guid referrerUserId, CancellationToken ct = default) =>
         SumOrZeroAsync(_db.ReferralCommissions.Where(x => x.ReferrerUserId == referrerUserId).Select(x => x.Amount), ct);
 

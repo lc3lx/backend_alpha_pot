@@ -161,6 +161,39 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
     {
         _authFailed.TryRemove(userId, out _);
         _retryAfterUtc.TryRemove(userId, out _);
+        _credentialFailures.TryRemove(userId, out _);
+    }
+
+    /// <summary>Consecutive failed credential logins, for the backoff below.</summary>
+    private readonly ConcurrentDictionary<Guid, int> _credentialFailures = new();
+
+    /// <summary>One in-flight credential login per user; a second would just queue browsers.</summary>
+    private readonly ConcurrentDictionary<Guid, byte> _credentialInFlight = new();
+
+    public bool CanAttemptCredentialLogin(Guid userId)
+    {
+        if (IsCoolingDown(userId))
+            return false;
+
+        // Claim the slot. Released by MarkCredentialLoginFailed or ClearAuthFailure, so a
+        // caller that never reports back cannot leak it past the cooldown either.
+        return _credentialInFlight.TryAdd(userId, 1);
+    }
+
+    public void MarkCredentialLoginFailed(Guid userId)
+    {
+        _credentialInFlight.TryRemove(userId, out _);
+
+        var failures = _credentialFailures.AddOrUpdate(userId, 1, (_, n) => n + 1);
+
+        // 30s, 60s, 120s, 240s … capped at 15 minutes. A broker refusing logins is not
+        // going to change its mind inside a second, and backing off is what keeps the IP
+        // out of a rate-limit ban.
+        var baseSeconds = Math.Max(1, _options.FailureCooldownSeconds);
+        var factor = Math.Min(1 << Math.Min(failures - 1, 6), 32);
+        var delay = Math.Min(baseSeconds * factor, 900);
+
+        _retryAfterUtc[userId] = DateTimeOffset.UtcNow.AddSeconds(delay);
     }
 
     public void EnsureBackgroundRestore(Guid userId)

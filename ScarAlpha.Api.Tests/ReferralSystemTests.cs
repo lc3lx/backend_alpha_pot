@@ -215,7 +215,10 @@ public sealed class ReferralQualificationServiceTests : IClassFixture<ReferralSy
         var referred = await _f.CreateUserAsync();
         await _f.AttachAsync(referrer.Id, referred.Id, DateTimeOffset.UtcNow.AddDays(-20));
 
-        var today = DateTimeOffset.UtcNow;
+        // Anchored to a fixed hour, not UtcNow: the second trade is +2h, so running this
+        // after 22:00 UTC pushed it into the next UTC day and counted two active days.
+        // The rule under test is "same UTC day counts once", so the day must be pinned.
+        var today = new DateTimeOffset(DateTimeOffset.UtcNow.Date, TimeSpan.Zero).AddHours(10);
         await _f.Qualification.RecordBotTradeActivityAsync(referred.Id, today, default);
         await _f.Qualification.RecordBotTradeActivityAsync(referred.Id, today.AddHours(2), default);
 

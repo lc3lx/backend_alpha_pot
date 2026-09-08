@@ -153,13 +153,24 @@ public sealed class ReferralAppService
     {
         page = Math.Max(1, page);
         pageSize = Math.Clamp(pageSize, 1, 100);
-        var (items, total) = await _referrals.ListByReferrerAsync(_currentUser.UserId, page, pageSize, ct);
+        var userId = _currentUser.UserId;
+        var (items, total) = await _referrals.ListByReferrerAsync(userId, page, pageSize, ct);
+
+        // One grouped query for the whole page instead of a lookup per member.
+        var totals = await _referrals.SummarizeByReferredAsync(userId, ct);
+
+        // The rate every member currently earns the referrer is the referrer's own tier —
+        // it is not per-member. Showing it on each row answers "what do I get from this
+        // person" without the user having to cross-reference the tier card.
+        var activeCount = await _referrals.CountActiveAsync(userId, ct);
+        var ratePercent = ReferralTiers.ResolveTier(activeCount)?.RatePercent ?? 0m;
 
         var dtos = new List<ReferralMemberDto>(items.Count);
         foreach (var q in items)
         {
             var referred = await _users.GetByIdAsync(q.ReferredUserId, ct);
-            dtos.Add(MapMember(q, referred));
+            totals.TryGetValue(q.ReferredUserId, out var t);
+            dtos.Add(MapMember(q, referred, t, ratePercent));
         }
 
         return new ReferralMembersResponse(dtos, total, page, pageSize);
@@ -258,7 +269,11 @@ public sealed class ReferralAppService
         Reached: qualifiedCount >= tier.MinReferrals,
         IsCurrent: currentTier?.Level == tier.Level);
 
-    internal static ReferralMemberDto MapMember(ReferralQualification q, User? referred) => new(
+    internal static ReferralMemberDto MapMember(
+        ReferralQualification q,
+        User? referred,
+        ReferralMemberTotals totals = default,
+        decimal ratePercent = 0m) => new(
         UserId: q.ReferredUserId.ToString(),
         DisplayName: referred?.FullName ?? referred?.Username ?? referred?.Email,
         ReferredAt: q.WindowStartedAt,
@@ -268,7 +283,16 @@ public sealed class ReferralAppService
         QualificationDays: ReferralConfig.QualificationDays,
         WindowEndsAt: q.WindowStartedAt.AddDays(ReferralConfig.QualificationDays),
         Qualified: q.Qualified,
-        QualifiedAt: q.QualifiedAt);
+        QualifiedAt: q.QualifiedAt,
+        // Qualified implies traded — qualification requires active trading days — so a
+        // legacy row without FirstBotTradeAt still reads as active here.
+        IsActive: q.FirstBotTradeAt is not null || q.Qualified,
+        // BotTradeCount is every settled trade; the commissioned count only covers trades
+        // that actually paid, which is lower before the referrer reaches tier 1.
+        TradeCount: q.BotTradeCount,
+        TradedVolume: totals.TradedVolume,
+        CommissionEarned: totals.CommissionEarned,
+        RatePercent: ratePercent);
 
     internal static ReferralRewardDto MapReward(ReferralReward r) => new(
         r.Id.ToString(),

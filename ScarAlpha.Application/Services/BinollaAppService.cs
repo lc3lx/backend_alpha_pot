@@ -608,7 +608,14 @@ public sealed class BinollaAppService
         if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(password))
             return null;
 
-        _restorer.ClearAuthFailure(userId);
+        // Ask BEFORE trying. This used to call ClearAuthFailure() here, which wiped the
+        // very cooldown that exists to stop this loop: the bot worker calls this on every
+        // tick while a session is down, so a broker refusing logins was getting a fresh
+        // headless-browser attempt every few seconds, each one taking 20-40s and
+        // overlapping the last. The failure marker is now cleared only on success.
+        if (!_restorer.CanAttemptCredentialLogin(userId))
+            return null;
+
         // #region agent log
         ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
             "BR1",
@@ -617,9 +624,28 @@ public sealed class BinollaAppService
             new { hasEmail = email.Length > 0 });
         // #endregion
 
-        return await LoginWithCredentialsAsync(
-            new BinollaCredentialRequest(email, password, link.AccountType.ToString()),
-            ct);
+        try
+        {
+            var result = await LoginWithCredentialsAsync(
+                new BinollaCredentialRequest(email, password, link.AccountType.ToString()),
+                ct);
+
+            // Only a real login clears the backoff.
+            _restorer.ClearAuthFailure(userId);
+            return result;
+        }
+        catch (ApiException)
+        {
+            // Broker refused (bad credentials, blocked IP, bot check). Back off instead of
+            // returning to the caller's retry loop at full speed.
+            _restorer.MarkCredentialLoginFailed(userId);
+            return null;
+        }
+        catch
+        {
+            _restorer.MarkCredentialLoginFailed(userId);
+            throw;
+        }
     }
 
     private async Task PersistBinollaCredentialsAsync(Guid userId, string email, string password, CancellationToken ct)

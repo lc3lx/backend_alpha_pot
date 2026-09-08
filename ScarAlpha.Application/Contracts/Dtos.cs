@@ -248,7 +248,17 @@ public sealed record ReferralMemberDto(
     int QualificationDays,
     DateTimeOffset WindowEndsAt,
     bool Qualified,
-    DateTimeOffset? QualifiedAt);
+    DateTimeOffset? QualifiedAt,
+    /// <summary>True once this person has actually started trading.</summary>
+    bool IsActive = false,
+    /// <summary>Settled bot trades recorded for this person.</summary>
+    int TradeCount = 0,
+    /// <summary>Total stake across the trades that paid the referrer.</summary>
+    decimal TradedVolume = 0m,
+    /// <summary>What the referrer has earned from this person so far.</summary>
+    decimal CommissionEarned = 0m,
+    /// <summary>The commission rate currently applied, as a percent of stake.</summary>
+    decimal RatePercent = 0m);
 
 public sealed record ReferralMembersResponse(IReadOnlyList<ReferralMemberDto> Items, int Total, int Page, int PageSize);
 
