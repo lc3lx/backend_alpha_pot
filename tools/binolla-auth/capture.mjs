@@ -726,8 +726,23 @@ async function main() {
       } else if (/Registration \| Binolla/i.test(diag?.title || '')) {
         error =
           'Binolla signup stayed on registration page (form/API did not create a session)';
+      } else if ((apiResult.attempts || []).some((a) => a.status === 403)) {
+        // 403 on an auth endpoint is an edge/WAF refusal, not a credential problem —
+        // wrong credentials come back as 401 with a message. Saying so plainly stops the
+        // hours otherwise spent re-checking a password that was never the issue.
+        const snippet = lastBody ? ` Server said: ${lastBody.slice(0, 120)}` : '';
+        error =
+          'Binolla refused the login from this server (HTTP 403 — blocked before the ' +
+          'password was checked). This is an IP/location or bot-protection block, not a ' +
+          'wrong password. Set BINOLLA_AUTH_PROXY in scaralpha.env to a proxy in an ' +
+          'allowed country, or paste the SSID from Binolla Edit Profile.' +
+          snippet +
+          (apiHint ? ` [${apiHint}]` : '');
       } else if (apiHint) {
-        error = `${error} [${apiHint}]`;
+        // Always carry whatever the server actually returned; a bare status code gave the
+        // operator nothing to act on.
+        const snippet = lastBody ? ` Server said: ${lastBody.slice(0, 120)}` : '';
+        error = `${error} [${apiHint}]${snippet}`;
       }
 
       process.stdout.write(JSON.stringify({ ok: false, error }));

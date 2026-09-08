@@ -315,6 +315,12 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
             || blob.Contains("(GB)", StringComparison.OrdinalIgnoreCase)
             || blob.Contains("geo-restriction", StringComparison.OrdinalIgnoreCase))
             return "geo-blocked";
+        // A 403 on Binolla's auth endpoint is an edge/WAF refusal — the request was
+        // rejected before the password was ever checked. Wrong credentials come back as
+        // 401 with a message, so these two must not read the same to an operator.
+        if (blob.Contains("/auth/login:403", StringComparison.OrdinalIgnoreCase)
+            || blob.Contains("HTTP 403", StringComparison.OrdinalIgnoreCase))
+            return "edge-blocked";
         if (blob.Contains("browserType.launch", StringComparison.OrdinalIgnoreCase))
             return "browser-launch";
         if (blob.Contains("timed out", StringComparison.OrdinalIgnoreCase))
@@ -329,6 +335,14 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         {
             return "Binolla browser failed to start on the server (missing Chromium OS libraries). "
                    + "On the VPS run: cd /home/web/backend/tools/binolla-auth && chmod +x install-deps.sh && ./install-deps.sh";
+        }
+
+        if (kind == "edge-blocked")
+        {
+            return "Binolla refused the login from this server (HTTP 403 - blocked before the "
+                   + "password was checked). This is an IP/location or bot-protection block, not "
+                   + "a wrong password. Set BINOLLA_AUTH_PROXY in scaralpha.env to a proxy in an "
+                   + "allowed country, or paste your Binolla SSID from Edit Profile.";
         }
 
         if (kind == "geo-blocked")
