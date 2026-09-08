@@ -68,6 +68,20 @@ public sealed class BinollaAppService
             throw new ApiException(ApiErrorCodes.ValidationError, "Request body is required.");
         ValidateCredentialRequest(request);
 
+        // The throttle lives HERE, at the choke point every login funnels through, rather
+        // than only on the background relogin. A client retrying POST /api/binolla/login
+        // was spawning a fresh headless browser per request — five overlapping 40-second
+        // captures were observed in production — and each one hitting a broker that is
+        // already refusing us is what turns a temporary block into a durable IP ban.
+        if (!_restorer.CanAttemptCredentialLogin(userId))
+        {
+            throw new ApiException(
+                ApiErrorCodes.BinollaLoginFailed,
+                "A Binolla login attempt is already running or was just refused. "
+                + "Wait a moment before trying again.",
+                429);
+        }
+
         using var workCts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
         var workCt = workCts.Token;
 
@@ -79,10 +93,12 @@ public sealed class BinollaAppService
         }
         catch (ApiException)
         {
+            _restorer.MarkCredentialLoginFailed(userId);
             throw;
         }
         catch (Exception ex)
         {
+            _restorer.MarkCredentialLoginFailed(userId);
             _logger.LogWarning(ex, "Binolla credential login failed for user {UserId}", userId);
             throw new ApiException(
                 ApiErrorCodes.BinollaLoginFailed,
@@ -90,6 +106,8 @@ public sealed class BinollaAppService
                 400);
         }
 
+        // Captured a session: release the throttle so the next outage retries promptly.
+        _restorer.ClearAuthFailure(userId);
         return await CompleteCredentialConnectForUserAsync(userId, captured, request, sw, workCt);
     }
 
@@ -608,13 +626,13 @@ public sealed class BinollaAppService
         if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(password))
             return null;
 
-        // Ask BEFORE trying. This used to call ClearAuthFailure() here, which wiped the
-        // very cooldown that exists to stop this loop: the bot worker calls this on every
-        // tick while a session is down, so a broker refusing logins was getting a fresh
-        // headless-browser attempt every few seconds, each one taking 20-40s and
-        // overlapping the last. The failure marker is now cleared only on success.
-        if (!_restorer.CanAttemptCredentialLogin(userId))
-            return null;
+        // No throttle check here: LoginWithCredentialsForUserAsync owns it, so the guard
+        // lives at the one place every login path funnels through. Claiming the slot twice
+        // would make this method block its own inner call and never attempt anything.
+        //
+        // This used to call ClearAuthFailure() before trying, which wiped the very cooldown
+        // meant to stop this loop — the bot worker calls this every tick while a session is
+        // down, so a refusing broker got a fresh 40-second browser every few seconds.
 
         // #region agent log
         ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
@@ -626,25 +644,16 @@ public sealed class BinollaAppService
 
         try
         {
-            var result = await LoginWithCredentialsAsync(
+            // Throttling and failure marking happen inside; a refusal (including the
+            // "already running / just refused" 429) simply means no session this round.
+            return await LoginWithCredentialsAsync(
                 new BinollaCredentialRequest(email, password, link.AccountType.ToString()),
                 ct);
-
-            // Only a real login clears the backoff.
-            _restorer.ClearAuthFailure(userId);
-            return result;
         }
         catch (ApiException)
         {
-            // Broker refused (bad credentials, blocked IP, bot check). Back off instead of
-            // returning to the caller's retry loop at full speed.
-            _restorer.MarkCredentialLoginFailed(userId);
+            // Background restore is best-effort — never surface this to the caller's loop.
             return null;
-        }
-        catch
-        {
-            _restorer.MarkCredentialLoginFailed(userId);
-            throw;
         }
     }
 
