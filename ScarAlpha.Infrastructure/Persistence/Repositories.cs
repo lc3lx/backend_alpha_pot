@@ -430,6 +430,18 @@ public sealed class ReferralRepository : IReferralRepository
     public Task<int> CountAllAsync(Guid referrerUserId, CancellationToken ct = default) =>
         _db.ReferralQualifications.CountAsync(x => x.ReferrerUserId == referrerUserId, ct);
 
+    public Task<int> CountActiveAsync(Guid referrerUserId, CancellationToken ct = default) =>
+        // "Started trading" is FirstBotTradeAt being set — stamped on the referred user's
+        // first settled real-account bot trade.
+        //
+        // Qualified counts too, and not only for tidiness: qualification requires active
+        // trading days, so a qualified referral has necessarily traded. Rows that reached
+        // that state before FirstBotTradeAt was being written would otherwise silently
+        // drop out of their referrer's tier and cut the rate they are already earning.
+        _db.ReferralQualifications.CountAsync(
+            x => x.ReferrerUserId == referrerUserId && (x.FirstBotTradeAt != null || x.Qualified),
+            ct);
+
     public async Task<(IReadOnlyList<ReferralQualification> Items, int Total)> ListByReferrerAsync(
         Guid referrerUserId, int page, int pageSize, CancellationToken ct = default)
     {

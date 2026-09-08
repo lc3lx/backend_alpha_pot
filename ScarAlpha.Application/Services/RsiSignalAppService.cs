@@ -522,8 +522,22 @@ public sealed class RsiSignalAppService
         RegimeSnapshot? regime = null)
     {
         var userId = _currentUser.UserId;
+
+        // ONLY the server-side worker places bot trades.
+        //
+        // This used to ignore `autoExecute` and place from any caller whose bot was
+        // Running, which made the read-only signal endpoint a third trade source next to
+        // the worker. Every UI polls that endpoint for the pair it happens to be showing,
+        // so a user with the web app and the Mini App open at once had three independent
+        // placers running on three different pairs. The idempotency key carries the asset
+        // (bot:{strategy}:{asset}:{bar}:{direction}), so different pairs produce different
+        // keys and nothing deduplicated them — the user simply got two trades.
+        //
+        // The worker is the single writer; polling is display only.
+        if (!autoExecute)
+            return signal;
+
         var bot = _botRuntime.Get(userId);
-        // Home polls without autoExecute still place when Running — but only after full gate.
         if (bot.State != BotRunState.Running)
             return signal;
 

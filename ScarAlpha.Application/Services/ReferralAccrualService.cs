@@ -54,8 +54,12 @@ public sealed class ReferralAccrualService : IReferralAccrualService
         if (ReferralConfig.CommissionFromQualifiedOnly && !qualification.Qualified)
             return;
 
-        var qualifiedCount = await _referrals.CountQualifiedAsync(qualification.ReferrerUserId, ct);
-        var tier = ReferralTiers.ResolveTier(qualifiedCount);
+        // Commission is earned as soon as invitees are trading, and the rate follows how
+        // many of them are trading — not how many have cleared the full qualification.
+        // Rewards (tier gifts, the iPhone) still require full qualification; those run in
+        // ReferralRewardService off CountQualifiedAsync and are untouched by this.
+        var activeCount = await _referrals.CountActiveAsync(qualification.ReferrerUserId, ct);
+        var tier = ReferralTiers.ResolveTier(activeCount);
         if (tier is null)
             return; // referrer has not reached tier 1 yet
 

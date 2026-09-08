@@ -13,6 +13,15 @@ public interface IReferralRepository
     Task UpdateQualificationAsync(ReferralQualification qualification, CancellationToken ct = default);
     /// <summary>Count of this referrer's referred users whose qualification is currently true.</summary>
     Task<int> CountQualifiedAsync(Guid referrerUserId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Referred users who have actually started trading (they have a first bot trade).
+    ///
+    /// <para>This is the commission tier's basis. Full qualification — deposit, the 15-day
+    /// window, active days — still gates the REWARDS, but making commission wait for all
+    /// of it meant a referrer earned nothing for weeks while their invitees traded daily.</para>
+    /// </summary>
+    Task<int> CountActiveAsync(Guid referrerUserId, CancellationToken ct = default);
     /// <summary>Count of every user this referrer has ever referred, qualified or not.</summary>
     Task<int> CountAllAsync(Guid referrerUserId, CancellationToken ct = default);
     Task<(IReadOnlyList<ReferralQualification> Items, int Total)> ListByReferrerAsync(

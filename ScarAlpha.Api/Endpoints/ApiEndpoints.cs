@@ -275,8 +275,7 @@ public static class StrategyEndpoints
             [FromQuery] decimal overbought = 75m,
             [FromQuery] int backtestCandles = 200,
             [FromQuery] int expiryCandles = 5,
-            [FromQuery] decimal minimumSuccessRate = 75m,
-            [FromQuery] bool autoExecute = false) =>
+            [FromQuery] decimal minimumSuccessRate = 75m) =>
         {
             _ = (oversold, overbought, period);
             var strategyId = botRuntime.Get(currentUser.UserId).StrategyId;
@@ -294,8 +293,11 @@ public static class StrategyEndpoints
                 BacktestCandleCount: backtestCandles,
                 ExpiryCandles: expiryCandles,
                 MinimumSuccessRate: minimumSuccessRate);
+            // Always read-only. This endpoint is polled by every UI for whichever pair is
+            // on screen; letting a caller opt into placing made each open tab an extra
+            // trade source. BotSignalWorker is the only writer.
             return Results.Ok(await svc.GetSignalAsync(
-                asset, timeframe, options, autoExecute, ct, strategyId: strategyId));
+                asset, timeframe, options, autoExecute: false, ct, strategyId: strategyId));
         });
         return group;
     }

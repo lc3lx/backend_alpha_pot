@@ -106,9 +106,14 @@ public sealed class ReferralAppService
 
         var qualifiedCount = await _referrals.CountQualifiedAsync(userId, ct);
         var totalCount = await _referrals.CountAllAsync(userId, ct);
+        var activeCount = await _referrals.CountActiveAsync(userId, ct);
 
-        var currentTier = ReferralTiers.ResolveTier(qualifiedCount);
-        var nextTier = ReferralTiers.All.FirstOrDefault(t => t.MinReferrals > qualifiedCount);
+        // The displayed tier must be the one being PAID, which follows referrals that are
+        // trading. Showing the qualified-count tier here would quote a rate that does not
+        // match what actually lands in the balance. Qualified count still drives the
+        // rewards progress shown alongside it.
+        var currentTier = ReferralTiers.ResolveTier(activeCount);
+        var nextTier = ReferralTiers.All.FirstOrDefault(t => t.MinReferrals > activeCount);
         var hasNextTier = nextTier.Level != 0;
 
         var commissions = await _referrals.SumCommissionsAsync(userId, ct);

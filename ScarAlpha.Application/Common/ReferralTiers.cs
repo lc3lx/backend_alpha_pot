@@ -3,11 +3,19 @@ namespace ScarAlpha.Application.Common;
 public readonly record struct ReferralTier(int Level, int MinReferrals, decimal RatePercent, decimal GiftUsd);
 
 /// <summary>
-/// The five referral commission tiers. A referrer's tier is the highest one whose
-/// MinReferrals threshold is met by their current count of *qualified* referred users
-/// (deposit ≥ <see cref="ReferralConfig.MinDepositUsd"/>, the 15-day window elapsed, and
-/// active bot trading throughout — see <see cref="ScarAlpha.Domain.Entities.ReferralQualification"/>).
-/// Below 5 qualified referrals a referrer earns no commission (no tier reached).
+/// The five referral tiers. The threshold is read against two different counts depending
+/// on what is being decided:
+///
+/// <list type="bullet">
+/// <item><b>Commission</b> — counted against referrals that are ACTIVE (they have started
+/// trading). Paid immediately, so a referrer earns while their invitees trade rather than
+/// waiting out the qualification window.</item>
+/// <item><b>Rewards</b> (tier gifts, the iPhone) — counted against QUALIFIED referrals:
+/// deposit ≥ <see cref="ReferralConfig.MinDepositUsd"/>, the 15-day window elapsed, and
+/// sustained active trading. See <see cref="ScarAlpha.Domain.Entities.ReferralQualification"/>.</item>
+/// </list>
+///
+/// Below 5 referrals no tier is reached and nothing is earned.
 /// </summary>
 public static class ReferralTiers
 {
@@ -52,8 +60,14 @@ public static class ReferralConfig
     public static int MinActiveDaysInWindow { get; set; } = 5;
     /// <summary>How often the background watcher polls live balances for deposit detection.</summary>
     public static int BalancePollMinutes { get; set; } = 30;
-    /// <summary>When true, only a qualified referred user's trades generate commission.</summary>
-    public static bool CommissionFromQualifiedOnly { get; set; } = true;
+    /// <summary>
+    /// When true, only a fully qualified referred user's trades generate commission.
+    ///
+    /// <para>Off by default: commission is meant to be immediate, so a referrer starts
+    /// earning as soon as the people they invited trade. Turning this back on delays every
+    /// payout by the qualification window.</para>
+    /// </summary>
+    public static bool CommissionFromQualifiedOnly { get; set; } = false;
     /// <summary>Minimum amount a user may request in one payout.</summary>
     public static decimal MinPayoutUsd { get; set; } = 20m;
     /// <summary>Base URL used to build the shareable referral link.</summary>

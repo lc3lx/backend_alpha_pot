@@ -278,9 +278,13 @@ public sealed class ReferralAccrualServiceTests : IClassFixture<ReferralSystemFi
     }
 
     [Fact]
-    public async Task An_unqualified_referred_users_trade_accrues_nothing_when_configured_that_way()
+    public async Task An_unqualified_referred_users_trade_still_pays_commission()
     {
-        ReferralConfig.CommissionFromQualifiedOnly.Should().BeTrue("this is the default the referral program was approved with");
+        // Commission is immediate by design: a referrer earns as soon as the people they
+        // invited are trading, instead of waiting out the 15-day qualification window.
+        // Rewards are the part that still waits for full qualification.
+        ReferralConfig.CommissionFromQualifiedOnly.Should().BeFalse(
+            "commission is paid on activity, not on qualification");
 
         var referrer = await _f.CreateUserAsync();
         await _f.GiveQualifiedReferralsAsync(referrer.Id, 5);
@@ -291,7 +295,33 @@ public sealed class ReferralAccrualServiceTests : IClassFixture<ReferralSystemFi
         var trade = _f.BuildRealTrade(referred.Id, 100m, TradeStatus.Profit);
         await _f.Accrual.OnTradeSettledAsync(trade, default);
 
-        (await _f.Referrals.SumCommissionsAsync(referrer.Id, default)).Should().Be(0m);
+        (await _f.Referrals.SumCommissionsAsync(referrer.Id, default)).Should().Be(0.15m);
+    }
+
+    [Fact]
+    public async Task The_qualified_only_switch_still_withholds_when_turned_on()
+    {
+        // The stricter mode remains available; this pins that turning it back on actually
+        // changes behaviour rather than being dead configuration.
+        var previous = ReferralConfig.CommissionFromQualifiedOnly;
+        ReferralConfig.CommissionFromQualifiedOnly = true;
+        try
+        {
+            var referrer = await _f.CreateUserAsync();
+            await _f.GiveQualifiedReferralsAsync(referrer.Id, 5);
+
+            var referred = await _f.CreateUserAsync();
+            await _f.AttachAsync(referrer.Id, referred.Id, DateTimeOffset.UtcNow);
+
+            var trade = _f.BuildRealTrade(referred.Id, 100m, TradeStatus.Profit);
+            await _f.Accrual.OnTradeSettledAsync(trade, default);
+
+            (await _f.Referrals.SumCommissionsAsync(referrer.Id, default)).Should().Be(0m);
+        }
+        finally
+        {
+            ReferralConfig.CommissionFromQualifiedOnly = previous;
+        }
     }
 
     [Fact]
