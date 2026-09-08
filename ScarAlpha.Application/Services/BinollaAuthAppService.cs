@@ -19,6 +19,7 @@ public sealed class BinollaAuthAppService
     private readonly IJwtTokenService _jwt;
     private readonly BinollaAppService _binolla;
     private readonly IConfiguration _configuration;
+    private readonly ReferralAppService _referrals;
     private readonly ILogger<BinollaAuthAppService> _logger;
 
     public BinollaAuthAppService(
@@ -28,6 +29,7 @@ public sealed class BinollaAuthAppService
         IJwtTokenService jwt,
         BinollaAppService binolla,
         IConfiguration configuration,
+        ReferralAppService referrals,
         ILogger<BinollaAuthAppService> logger)
     {
         _users = users;
@@ -36,6 +38,7 @@ public sealed class BinollaAuthAppService
         _jwt = jwt;
         _binolla = binolla;
         _configuration = configuration;
+        _referrals = referrals;
         _logger = logger;
     }
 
@@ -49,6 +52,7 @@ public sealed class BinollaAuthAppService
         {
             user = await ProvisionUserForBinollaLoginAsync(email, ct);
             provisioned = true;
+            await _referrals.AttachReferrerAsync(user.Id, request.ReferralCode, ct);
         }
 
         if (user.IsMarketingDemo)
@@ -93,6 +97,7 @@ public sealed class BinollaAuthAppService
         }
 
         var user = await ProvisionUserForBinollaLoginAsync(email, ct);
+        await _referrals.AttachReferrerAsync(user.Id, request.ReferralCode, ct);
         try
         {
             user.EncryptedLoginPassword = _protector.Encrypt(request.Password);

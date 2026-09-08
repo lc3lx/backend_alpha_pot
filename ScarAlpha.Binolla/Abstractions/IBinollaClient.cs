@@ -35,6 +35,14 @@ public interface IBinollaClient : IAsyncDisposable
     Task<TradeOutcome> WaitOutcomeAsync(string orderId, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// The broker's own profit/loss for a closed order, if this session has seen it.
+    ///
+    /// Used to re-verify a settled trade against Binolla. Returns false when the order is
+    /// not in this session's closed-order record — which means "unknown", never "zero".
+    /// </summary>
+    bool TryGetClosedPnl(string orderId, out decimal profitLoss);
+
+    /// <summary>
     /// Wait for Binolla close with an explicit timeout (use trade duration + buffer).
     /// </summary>
     Task<TradeOutcome> WaitOutcomeAsync(

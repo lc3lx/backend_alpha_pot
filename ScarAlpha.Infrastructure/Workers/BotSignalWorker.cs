@@ -207,7 +207,9 @@ public sealed class BotSignalWorker : IHostedService
         CancellationToken ct)
     {
         var timeframe = StrategyTimeframes.For(cohort.StrategyId);
-        var options = RsiStrategyOptions.FromBotDurationSeconds(cohort.DurationSeconds);
+        // The cohort key IS the derived expiry, so rebuild the options from it rather than
+        // from any one bot's raw duration — every member resolves to exactly these options.
+        var options = RsiStrategyOptions.Default60Seconds with { ExpiryCandles = cohort.ExpiryCandles };
 
         // This loop ticks every second, but the decision only changes once per bar. When
         // this bar has already been decided with nothing to trade there is nothing left
@@ -410,9 +412,13 @@ public sealed class BotSignalWorker : IHostedService
         // usable market data" — a session can be up and still return nothing — and a
         // cohort must not go blind for a whole bar because the first user in the list is
         // the degraded one. So fall through to the next user when a scan reaches no pair.
-        foreach (var scanUser in eligible.Take(MaxScanCandidates))
+        // The dedicated analysis account goes first when one is configured, so the fleet's
+        // market view does not depend on which customer happens to be online.
+        var scanOrder = AnalysisAccount.ScanOrder(eligible.Select(b => b.UserId));
+
+        foreach (var scanUserId in scanOrder.Take(MaxScanCandidates))
         {
-            var attempt = await ScanAsAsync(cohort, scanUser.UserId, ordered, options, timeframe, barTime, ct)
+            var attempt = await ScanAsAsync(cohort, scanUserId, ordered, options, timeframe, barTime, ct)
                 .ConfigureAwait(false);
             if (attempt.AssetsScanned > 0) return attempt;
 
@@ -424,7 +430,8 @@ public sealed class BotSignalWorker : IHostedService
                 new
                 {
                     cohort = cohort.ToString(),
-                    userId = scanUser.UserId.ToString("N")[..8],
+                    userId = scanUserId.ToString("N")[..8],
+                    dedicated = AnalysisAccount.IsConfigured,
                     assets = ordered.Count
                 },
                 runId: "missed-entry");

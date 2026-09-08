@@ -465,6 +465,17 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
 
         await ApplyStatusAsync(trades, trade, next, outcome.ProfitLoss, null, ct, finalOutcome: true);
 
+        try
+        {
+            var referralAccrual = scope.ServiceProvider.GetRequiredService<IReferralAccrualService>();
+            await referralAccrual.OnTradeSettledAsync(trade, ct);
+        }
+        catch (Exception ex)
+        {
+            // Referral bookkeeping must never break trade settlement.
+            _logger.LogWarning(ex, "Referral accrual failed for trade {TradeId}", trade.Id);
+        }
+
         // #region agent log
         ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
             "H1+H5",

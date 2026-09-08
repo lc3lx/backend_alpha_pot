@@ -61,6 +61,10 @@ public static class DependencyInjection
         services.AddScoped<INotificationRepository, NotificationRepository>();
         services.AddScoped<IAppSettingRepository, AppSettingRepository>();
         services.AddScoped<INotificationWriter, NotificationWriter>();
+        services.AddScoped<IReferralRepository, ReferralRepository>();
+        services.AddScoped<IReferralQualificationService, ReferralQualificationService>();
+        services.AddScoped<IReferralRewardService, ReferralRewardService>();
+        services.AddScoped<IReferralAccrualService, ReferralAccrualService>();
         services.AddScoped<ICurrentUser, HttpCurrentUser>();
         services.AddSingleton<ITelegramAuthService, TelegramAuthService>();
         services.AddSingleton<IJwtTokenService, JwtTokenService>();
@@ -86,6 +90,8 @@ public static class DependencyInjection
         services.AddScoped<AdminAppService>();
         services.AddScoped<NotificationAppService>();
         services.AddScoped<BotControlAppService>();
+        services.AddScoped<ReferralAppService>();
+        services.AddScoped<AdminReferralAppService>();
 
         services.AddSingleton<IBinollaCredentialAuth, NodeBinollaCredentialAuth>();
 
@@ -118,12 +124,27 @@ public static class DependencyInjection
         var calibLow = configuration.GetValue<decimal?>("Strategy:RsiCalibrationOffsetLow");
         if (calibLow is decimal calLo) Indicators.RsiCalibrationOffsetLow = calLo;
 
+        // Dedicated market-data account. Unset = borrow a user's session (previous
+        // behaviour); set = the whole fleet analyses through this one account.
+        var analysisUser = configuration["Strategy:AnalysisUserId"];
+        if (Guid.TryParse(analysisUser, out var analysisUserId))
+            AnalysisAccount.UserId = analysisUserId;
+
         // How long a pair sits out after the bot loses on it. 0 disables the rule.
         var pairCooldown = configuration.GetValue<int?>("Strategy:PairLossCooldownSeconds");
         if (pairCooldown is int pc) PairCooldownRegistry.CooldownSeconds = pc;
 
         var minPairPayout = configuration.GetValue<int?>("Strategy:MinPairPayoutPercent");
         if (minPairPayout is int mp) PairPayoutGate.MinPayoutPercent = mp;
+
+        // Referral program — tunable without a rebuild (see appsettings "Referral" section).
+        ReferralConfig.MinDepositUsd = configuration.GetValue("Referral:MinDepositUsd", ReferralConfig.MinDepositUsd);
+        ReferralConfig.QualificationDays = configuration.GetValue("Referral:QualificationDays", ReferralConfig.QualificationDays);
+        ReferralConfig.MinActiveDaysInWindow = configuration.GetValue("Referral:MinActiveDaysInWindow", ReferralConfig.MinActiveDaysInWindow);
+        ReferralConfig.BalancePollMinutes = configuration.GetValue("Referral:BalancePollMinutes", ReferralConfig.BalancePollMinutes);
+        ReferralConfig.CommissionFromQualifiedOnly = configuration.GetValue("Referral:CommissionFromQualifiedOnly", ReferralConfig.CommissionFromQualifiedOnly);
+        ReferralConfig.MinPayoutUsd = configuration.GetValue("Referral:MinPayoutUsd", ReferralConfig.MinPayoutUsd);
+        ReferralConfig.WebBaseUrl = configuration["Referral:WebBaseUrl"] ?? ReferralConfig.WebBaseUrl;
 
         services.AddSingleton<IRsiSignalService, RsiSignalService>();
         services.AddSingleton<IEmaRsiSignalService, EmaRsiSignalService>();
@@ -185,6 +206,10 @@ public static class DependencyInjection
         // Holds the pair history resident so the bar-close scan reads RAM instead of
         // re-fetching serially from the socket — see MarketWarmupWorker.
         services.AddHostedService<MarketWarmupWorker>();
+        // Re-checks settled trades against Binolla and corrects the ones that disagree.
+        services.AddHostedService<TradeReconciliationWorker>();
+        // Backstop for the referral deposit signal — see ReferralBalanceWatcher.
+        services.AddHostedService<ReferralBalanceWatcher>();
 
         services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             .AddJwtBearer();

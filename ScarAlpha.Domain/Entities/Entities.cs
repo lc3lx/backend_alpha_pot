@@ -34,6 +34,13 @@ public class User
     /// Persisted bot runtime (Running/Paused/Stopped + settings) so the bot survives API restarts.
     /// </summary>
     public string? BotRuntimeJson { get; set; }
+
+    /// <summary>Referral program: this user's own shareable code, generated lazily on first visit to the referral page.</summary>
+    public string? ReferralCode { get; set; }
+    /// <summary>Referral program: the user whose referral code brought this account in. Set once at signup, never moved.</summary>
+    public Guid? ReferredByUserId { get; set; }
+    public DateTimeOffset? ReferredAt { get; set; }
+
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
 
@@ -102,6 +109,11 @@ public class Trade
     public decimal? Pnl { get; set; }
     public string IdempotencyKey { get; set; } = string.Empty;
     public string? ErrorCode { get; set; }
+    /// <summary>
+    /// When this trade's outcome was last checked against Binolla's own record.
+    /// Null means never verified — the reconciliation worker picks those up first.
+    /// </summary>
+    public DateTimeOffset? VerifiedAt { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
 
@@ -148,4 +160,89 @@ public class AppSetting
     public string Key { get; set; } = string.Empty;
     public string? Value { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
+}
+
+/// <summary>
+/// Referral program: one row per referred user, created the moment a referral code is
+/// attached at signup. Tracks progress toward qualifying the referrer for commission and
+/// rewards — deposit reached, the 15-day window elapsed, and active trading throughout.
+/// Not an access gate; purely bookkeeping for the referral program.
+/// </summary>
+public class ReferralQualification
+{
+    public Guid Id { get; set; }
+    public Guid ReferredUserId { get; set; }
+    public Guid ReferrerUserId { get; set; }
+
+    /// <summary>Highest real-account balance ever observed for the referred user.</summary>
+    public decimal PeakRealBalance { get; set; }
+    public bool DepositMet { get; set; }
+    public DateTimeOffset? DepositMetAt { get; set; }
+    /// <summary>Admin override for the deposit requirement: null = follow the observed signal, true/false forces it.</summary>
+    public bool? AdminDepositOverride { get; set; }
+    public string? AdminDepositNote { get; set; }
+    public string? AdminDepositBy { get; set; }
+    public DateTimeOffset? AdminDepositAt { get; set; }
+
+    /// <summary>Start of the 15-day qualification window — the referral attach time.</summary>
+    public DateTimeOffset WindowStartedAt { get; set; }
+    public DateTimeOffset? FirstBotTradeAt { get; set; }
+    public DateTimeOffset? LastBotTradeAt { get; set; }
+    public int BotTradeCount { get; set; }
+    /// <summary>Count of distinct UTC days with at least one settled real-account bot trade.</summary>
+    public int ActiveDaysCount { get; set; }
+    /// <summary>Midnight UTC of the last day counted into ActiveDaysCount (dedupe key for same-day trades).</summary>
+    public DateTimeOffset? LastActiveDayUtc { get; set; }
+
+    public bool Qualified { get; set; }
+    public DateTimeOffset? QualifiedAt { get; set; }
+
+    public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; }
+}
+
+/// <summary>Referral program: one commission entry, accrued when a qualified referred user's real trade settles.</summary>
+public class ReferralCommission
+{
+    public Guid Id { get; set; }
+    public Guid ReferrerUserId { get; set; }
+    public Guid ReferredUserId { get; set; }
+    /// <summary>Unique — guarantees a settled trade accrues commission at most once.</summary>
+    public Guid TradeId { get; set; }
+    public decimal TradeAmount { get; set; }
+    public decimal RatePercent { get; set; }
+    public int Tier { get; set; }
+    public decimal Amount { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+}
+
+/// <summary>Referral program: a one-time tier gift or the iPhone milestone reward granted to a referrer.</summary>
+public class ReferralReward
+{
+    public Guid Id { get; set; }
+    public Guid UserId { get; set; }
+    public ReferralRewardKind Kind { get; set; }
+    /// <summary>Tier level (1-5) for a TierGift; 0 for the IPhone reward (kept non-null so the uniqueness index holds).</summary>
+    public int Tier { get; set; }
+    public decimal Amount { get; set; }
+    public ReferralRewardStatus Status { get; set; } = ReferralRewardStatus.Granted;
+    public DateTimeOffset GrantedAt { get; set; }
+    public DateTimeOffset? PaidAt { get; set; }
+    public string? PaidBy { get; set; }
+    public string? Note { get; set; }
+}
+
+/// <summary>Referral program: a user's request to withdraw accumulated referral commission/reward earnings.</summary>
+public class ReferralPayout
+{
+    public Guid Id { get; set; }
+    public Guid UserId { get; set; }
+    public decimal Amount { get; set; }
+    public ReferralPayoutStatus Status { get; set; } = ReferralPayoutStatus.Pending;
+    public string? Method { get; set; }
+    public string? Destination { get; set; }
+    public DateTimeOffset RequestedAt { get; set; }
+    public DateTimeOffset? DecidedAt { get; set; }
+    public string? DecidedBy { get; set; }
+    public string? AdminNote { get; set; }
 }

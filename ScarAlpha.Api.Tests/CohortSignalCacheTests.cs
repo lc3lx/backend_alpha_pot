@@ -69,27 +69,39 @@ public sealed class CohortSignalCacheTests
         emaDecision!.Candidates[0].Asset.Should().Be("USDJPY_otc");
     }
 
+    /// <summary>
+    /// 60s and 300s both derive 5 expiry candles, so they are the SAME analysis and must
+    /// share one scan. They used to be separate cohorts purely because the web app and the
+    /// admin panel send different raw durations — which split the fleet in two and had the
+    /// market scanned twice for an identical decision.
+    /// </summary>
     [Fact]
-    public async Task Same_strategy_with_different_durations_are_separate_cohorts()
+    public async Task Durations_that_derive_the_same_options_share_one_scan()
     {
         var cache = new CohortSignalCache();
         var now = BarClose.AddSeconds(2);
         var scans = 0;
 
-        await cache.GetOrAddAsync(SignalCohort.For("rsi", 300), 60, now, (bar, _) =>
+        Task<CohortDecision?> Produce(DateTimeOffset bar, CancellationToken _)
         {
             Interlocked.Increment(ref scans);
-            return Task.FromResult<CohortDecision?>(Decision(bar, ("EURUSD_otc", "Put"), SignalCohort.For("rsi", 300)));
-        });
-        await cache.GetOrAddAsync(SignalCohort.For("rsi", 60), 60, now, (bar, _) =>
-        {
-            Interlocked.Increment(ref scans);
-            return Task.FromResult<CohortDecision?>(Decision(bar, ("EURUSD_otc", "Put"), SignalCohort.For("rsi", 60)));
-        });
+            return Task.FromResult<CohortDecision?>(
+                Decision(bar, ("EURUSD_otc", "Put"), SignalCohort.For("rsi", 300)));
+        }
 
-        // Options are derived from the trade duration, so these genuinely are different
-        // decisions and must not share a cache slot.
-        scans.Should().Be(2);
+        await cache.GetOrAddAsync(SignalCohort.For("rsi", 300), 60, now, Produce);
+        await cache.GetOrAddAsync(SignalCohort.For("rsi", 60), 60, now, Produce);
+
+        scans.Should().Be(1);
+        SignalCohort.For("rsi", 60).Should().Be(SignalCohort.For("rsi", 300));
+    }
+
+    /// <summary>Durations that really do differ still decide independently.</summary>
+    [Fact]
+    public void Durations_that_derive_different_options_stay_separate()
+    {
+        // 180s -> 3 expiry candles, 300s -> 5. Different backtest, different decision.
+        SignalCohort.For("rsi", 180).Should().NotBe(SignalCohort.For("rsi", 300));
     }
 
     [Fact]

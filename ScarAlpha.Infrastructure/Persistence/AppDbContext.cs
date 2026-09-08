@@ -26,6 +26,10 @@ public sealed class AppDbContext : DbContext
     public DbSet<AuditEvent> AuditEvents => Set<AuditEvent>();
     public DbSet<UserNotification> UserNotifications => Set<UserNotification>();
     public DbSet<AppSetting> AppSettings => Set<AppSetting>();
+    public DbSet<ReferralQualification> ReferralQualifications => Set<ReferralQualification>();
+    public DbSet<ReferralCommission> ReferralCommissions => Set<ReferralCommission>();
+    public DbSet<ReferralReward> ReferralRewards => Set<ReferralReward>();
+    public DbSet<ReferralPayout> ReferralPayouts => Set<ReferralPayout>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -43,13 +47,19 @@ public sealed class AppDbContext : DbContext
             e.HasKey(x => x.Id);
             var telegramFilter = _useMySql ? "`TelegramUserId` IS NOT NULL" : "\"TelegramUserId\" IS NOT NULL";
             var emailFilter = _useMySql ? "`Email` IS NOT NULL" : "\"Email\" IS NOT NULL";
+            var referralCodeFilter = _useMySql ? "`ReferralCode` IS NOT NULL" : "\"ReferralCode\" IS NOT NULL";
             e.HasIndex(x => x.TelegramUserId)
                 .IsUnique()
                 .HasFilter(telegramFilter);
             e.HasIndex(x => x.Email)
                 .IsUnique()
                 .HasFilter(emailFilter);
+            e.HasIndex(x => x.ReferralCode)
+                .IsUnique()
+                .HasFilter(referralCodeFilter);
+            e.HasIndex(x => x.ReferredByUserId);
             e.Property(x => x.Email).HasMaxLength(256);
+            e.Property(x => x.ReferralCode).HasMaxLength(16);
             e.Property(x => x.PasswordHash).HasMaxLength(512);
             e.Property(x => x.EncryptedLoginPassword).HasColumnType("text");
             e.Property(x => x.Username).HasMaxLength(128);
@@ -129,6 +139,56 @@ public sealed class AppDbContext : DbContext
             e.Property(x => x.Description).HasMaxLength(1024).IsRequired();
             e.Property(x => x.ActionPath).HasMaxLength(256);
             e.HasOne(x => x.User).WithMany(x => x.Notifications).HasForeignKey(x => x.UserId);
+        });
+
+        modelBuilder.Entity<ReferralQualification>(e =>
+        {
+            e.ToTable("referral_qualifications");
+            e.HasKey(x => x.Id);
+            e.HasIndex(x => x.ReferredUserId).IsUnique();
+            e.HasIndex(x => x.ReferrerUserId);
+            e.HasIndex(x => x.Qualified);
+            e.Property(x => x.PeakRealBalance).HasPrecision(18, 8);
+            e.Property(x => x.AdminDepositNote).HasMaxLength(512);
+            e.Property(x => x.AdminDepositBy).HasMaxLength(256);
+        });
+
+        modelBuilder.Entity<ReferralCommission>(e =>
+        {
+            e.ToTable("referral_commissions");
+            e.HasKey(x => x.Id);
+            e.HasIndex(x => x.ReferrerUserId);
+            e.HasIndex(x => x.ReferredUserId);
+            e.HasIndex(x => x.TradeId).IsUnique();
+            e.Property(x => x.TradeAmount).HasPrecision(18, 8);
+            e.Property(x => x.RatePercent).HasPrecision(9, 4);
+            e.Property(x => x.Amount).HasPrecision(18, 8);
+        });
+
+        modelBuilder.Entity<ReferralReward>(e =>
+        {
+            e.ToTable("referral_rewards");
+            e.HasKey(x => x.Id);
+            e.HasIndex(x => new { x.UserId, x.Kind, x.Tier }).IsUnique();
+            e.Property(x => x.Amount).HasPrecision(18, 8);
+            e.Property(x => x.Kind).HasConversion<int>();
+            e.Property(x => x.Status).HasConversion<int>();
+            e.Property(x => x.PaidBy).HasMaxLength(256);
+            e.Property(x => x.Note).HasMaxLength(512);
+        });
+
+        modelBuilder.Entity<ReferralPayout>(e =>
+        {
+            e.ToTable("referral_payouts");
+            e.HasKey(x => x.Id);
+            e.HasIndex(x => x.UserId);
+            e.HasIndex(x => x.Status);
+            e.Property(x => x.Amount).HasPrecision(18, 8);
+            e.Property(x => x.Status).HasConversion<int>();
+            e.Property(x => x.Method).HasMaxLength(64);
+            e.Property(x => x.Destination).HasMaxLength(256);
+            e.Property(x => x.DecidedBy).HasMaxLength(256);
+            e.Property(x => x.AdminNote).HasMaxLength(512);
         });
     }
 }

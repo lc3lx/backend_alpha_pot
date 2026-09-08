@@ -18,6 +18,7 @@ public sealed class AuthAppService
     private readonly ISecretProtector _protector;
     private readonly ICurrentUser _currentUser;
     private readonly IConfiguration _configuration;
+    private readonly ReferralAppService _referrals;
     private readonly ILogger<AuthAppService> _logger;
 
     public AuthAppService(
@@ -29,6 +30,7 @@ public sealed class AuthAppService
         ISecretProtector protector,
         ICurrentUser currentUser,
         IConfiguration configuration,
+        ReferralAppService referrals,
         ILogger<AuthAppService> logger)
     {
         _telegramAuth = telegramAuth;
@@ -39,6 +41,7 @@ public sealed class AuthAppService
         _protector = protector;
         _currentUser = currentUser;
         _configuration = configuration;
+        _referrals = referrals;
         _logger = logger;
     }
 
@@ -80,6 +83,7 @@ public sealed class AuthAppService
             await _users.AddAsync(user, ct);
             _logger.LogInformation("Created user for telegram_user_id {TelegramUserId} role={Role}",
                 identity.TelegramUserId, user.Role);
+            await _referrals.AttachReferrerAsync(user.Id, request.ReferralCode, ct);
         }
         else
         {
@@ -201,6 +205,7 @@ public sealed class AuthAppService
         };
         await _users.AddAsync(user, ct);
         _logger.LogInformation("Created website user {UserId} email={Email} role={Role}", user.Id, email, user.Role);
+        await _referrals.AttachReferrerAsync(user.Id, request.ReferralCode, ct);
 
         return new AuthSessionResponse(_jwt.CreateToken(user), user.Id.ToString());
     }

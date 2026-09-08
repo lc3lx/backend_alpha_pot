@@ -398,6 +398,236 @@ public sealed class AppSettingRepository : IAppSettingRepository
     }
 }
 
+public sealed class ReferralRepository : IReferralRepository
+{
+    private readonly AppDbContext _db;
+    public ReferralRepository(AppDbContext db) => _db = db;
+
+    public Task<User?> GetUserByReferralCodeAsync(string code, CancellationToken ct = default) =>
+        _db.Users.FirstOrDefaultAsync(x => x.ReferralCode == code, ct);
+
+    public Task<bool> ReferralCodeExistsAsync(string code, CancellationToken ct = default) =>
+        _db.Users.AnyAsync(x => x.ReferralCode == code, ct);
+
+    public Task<ReferralQualification?> GetQualificationByReferredUserIdAsync(Guid referredUserId, CancellationToken ct = default) =>
+        _db.ReferralQualifications.FirstOrDefaultAsync(x => x.ReferredUserId == referredUserId, ct);
+
+    public async Task AddQualificationAsync(ReferralQualification qualification, CancellationToken ct = default)
+    {
+        _db.ReferralQualifications.Add(qualification);
+        await _db.SaveChangesAsync(ct);
+    }
+
+    public async Task UpdateQualificationAsync(ReferralQualification qualification, CancellationToken ct = default)
+    {
+        _db.ReferralQualifications.Update(qualification);
+        await _db.SaveChangesAsync(ct);
+    }
+
+    public Task<int> CountQualifiedAsync(Guid referrerUserId, CancellationToken ct = default) =>
+        _db.ReferralQualifications.CountAsync(x => x.ReferrerUserId == referrerUserId && x.Qualified, ct);
+
+    public Task<int> CountAllAsync(Guid referrerUserId, CancellationToken ct = default) =>
+        _db.ReferralQualifications.CountAsync(x => x.ReferrerUserId == referrerUserId, ct);
+
+    public async Task<(IReadOnlyList<ReferralQualification> Items, int Total)> ListByReferrerAsync(
+        Guid referrerUserId, int page, int pageSize, CancellationToken ct = default)
+    {
+        page = Math.Max(1, page);
+        pageSize = Math.Clamp(pageSize, 1, 100);
+        var query = _db.ReferralQualifications.Where(x => x.ReferrerUserId == referrerUserId);
+        var total = await query.CountAsync(ct);
+        var items = await query
+            .OrderByDescending(x => x.CreatedAt)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync(ct);
+        return (items, total);
+    }
+
+    public async Task<IReadOnlyList<ReferralQualification>> ListDepositWatchAsync(int take, CancellationToken ct = default) =>
+        await _db.ReferralQualifications
+            .Where(x => !x.Qualified)
+            .OrderBy(x => x.CreatedAt)
+            .Take(Math.Clamp(take, 1, 2000))
+            .ToListAsync(ct);
+
+    public async Task<(IReadOnlyList<Guid> ReferrerIds, int Total)> SearchReferrerIdsAsync(
+        string? q, int page, int pageSize, CancellationToken ct = default)
+    {
+        page = Math.Max(1, page);
+        pageSize = Math.Clamp(pageSize, 1, 100);
+        var query = _db.ReferralQualifications.Select(x => x.ReferrerUserId).Distinct();
+
+        if (!string.IsNullOrWhiteSpace(q))
+        {
+            var term = q.Trim().ToLowerInvariant();
+            var matchingUserIds = await _db.Users
+                .Where(u =>
+                    (u.Email != null && u.Email.Contains(term)) ||
+                    (u.FullName != null && u.FullName.ToLower().Contains(term)) ||
+                    (u.Username != null && u.Username.ToLower().Contains(term)) ||
+                    (u.ReferralCode != null && u.ReferralCode.ToLower() == term) ||
+                    u.Id.ToString().ToLower().Contains(term))
+                .Select(u => u.Id)
+                .ToListAsync(ct);
+            query = query.Where(id => matchingUserIds.Contains(id));
+        }
+
+        var total = await query.CountAsync(ct);
+        var ids = await query
+            .OrderBy(x => x)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync(ct);
+        return (ids, total);
+    }
+
+    public async Task<bool> AddCommissionAsync(ReferralCommission commission, CancellationToken ct = default)
+    {
+        // Checked up front (not just caught below) because the InMemory provider used in
+        // tests does not enforce the unique index — only a real relational DB does.
+        if (await _db.ReferralCommissions.AnyAsync(x => x.TradeId == commission.TradeId, ct))
+            return false;
+
+        _db.ReferralCommissions.Add(commission);
+        try
+        {
+            await _db.SaveChangesAsync(ct);
+            return true;
+        }
+        catch (Exception ex) when (IsUniqueViolation(ex, "referral_commissions"))
+        {
+            _db.Entry(commission).State = EntityState.Detached;
+            return false;
+        }
+    }
+
+    public Task<decimal> SumCommissionsAsync(Guid referrerUserId, CancellationToken ct = default) =>
+        SumOrZeroAsync(_db.ReferralCommissions.Where(x => x.ReferrerUserId == referrerUserId).Select(x => x.Amount), ct);
+
+    public async Task<(IReadOnlyList<ReferralCommission> Items, int Total)> ListCommissionsAsync(
+        Guid referrerUserId, int page, int pageSize, CancellationToken ct = default)
+    {
+        page = Math.Max(1, page);
+        pageSize = Math.Clamp(pageSize, 1, 100);
+        var query = _db.ReferralCommissions.Where(x => x.ReferrerUserId == referrerUserId);
+        var total = await query.CountAsync(ct);
+        var items = await query
+            .OrderByDescending(x => x.CreatedAt)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync(ct);
+        return (items, total);
+    }
+
+    public Task<bool> RewardExistsAsync(Guid userId, ReferralRewardKind kind, int tier, CancellationToken ct = default) =>
+        _db.ReferralRewards.AnyAsync(x => x.UserId == userId && x.Kind == kind && x.Tier == tier, ct);
+
+    public async Task<bool> AddRewardAsync(ReferralReward reward, CancellationToken ct = default)
+    {
+        if (await _db.ReferralRewards.AnyAsync(
+                x => x.UserId == reward.UserId && x.Kind == reward.Kind && x.Tier == reward.Tier, ct))
+            return false;
+
+        _db.ReferralRewards.Add(reward);
+        try
+        {
+            await _db.SaveChangesAsync(ct);
+            return true;
+        }
+        catch (Exception ex) when (IsUniqueViolation(ex, "referral_rewards"))
+        {
+            _db.Entry(reward).State = EntityState.Detached;
+            return false;
+        }
+    }
+
+    public Task<decimal> SumRewardsAsync(Guid userId, IReadOnlyCollection<ReferralRewardStatus> statuses, CancellationToken ct = default) =>
+        SumOrZeroAsync(
+            _db.ReferralRewards.Where(x => x.UserId == userId && statuses.Contains(x.Status)).Select(x => x.Amount), ct);
+
+    public async Task<IReadOnlyList<ReferralReward>> ListRewardsAsync(Guid userId, CancellationToken ct = default) =>
+        await _db.ReferralRewards
+            .Where(x => x.UserId == userId)
+            .OrderByDescending(x => x.GrantedAt)
+            .ToListAsync(ct);
+
+    public Task<ReferralReward?> GetRewardByIdAsync(Guid id, CancellationToken ct = default) =>
+        _db.ReferralRewards.FirstOrDefaultAsync(x => x.Id == id, ct);
+
+    public async Task UpdateRewardAsync(ReferralReward reward, CancellationToken ct = default)
+    {
+        _db.ReferralRewards.Update(reward);
+        await _db.SaveChangesAsync(ct);
+    }
+
+    public async Task AddPayoutAsync(ReferralPayout payout, CancellationToken ct = default)
+    {
+        _db.ReferralPayouts.Add(payout);
+        await _db.SaveChangesAsync(ct);
+    }
+
+    public Task<decimal> SumPayoutsAsync(Guid userId, IReadOnlyCollection<ReferralPayoutStatus> statuses, CancellationToken ct = default) =>
+        SumOrZeroAsync(
+            _db.ReferralPayouts.Where(x => x.UserId == userId && statuses.Contains(x.Status)).Select(x => x.Amount), ct);
+
+    public Task<bool> HasPendingPayoutAsync(Guid userId, CancellationToken ct = default) =>
+        _db.ReferralPayouts.AnyAsync(x => x.UserId == userId && x.Status == ReferralPayoutStatus.Pending, ct);
+
+    public async Task<(IReadOnlyList<ReferralPayout> Items, int Total)> ListPayoutsByUserAsync(
+        Guid userId, int page, int pageSize, CancellationToken ct = default)
+    {
+        page = Math.Max(1, page);
+        pageSize = Math.Clamp(pageSize, 1, 100);
+        var query = _db.ReferralPayouts.Where(x => x.UserId == userId);
+        var total = await query.CountAsync(ct);
+        var items = await query
+            .OrderByDescending(x => x.RequestedAt)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync(ct);
+        return (items, total);
+    }
+
+    public async Task<(IReadOnlyList<ReferralPayout> Items, int Total)> SearchPayoutsAsync(
+        ReferralPayoutStatus? status, int page, int pageSize, CancellationToken ct = default)
+    {
+        page = Math.Max(1, page);
+        pageSize = Math.Clamp(pageSize, 1, 100);
+        var query = _db.ReferralPayouts.AsQueryable();
+        if (status is ReferralPayoutStatus s)
+            query = query.Where(x => x.Status == s);
+        var total = await query.CountAsync(ct);
+        var items = await query
+            .OrderBy(x => x.Status == ReferralPayoutStatus.Pending ? 0 : 1)
+            .ThenByDescending(x => x.RequestedAt)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync(ct);
+        return (items, total);
+    }
+
+    public Task<ReferralPayout?> GetPayoutByIdAsync(Guid id, CancellationToken ct = default) =>
+        _db.ReferralPayouts.FirstOrDefaultAsync(x => x.Id == id, ct);
+
+    public async Task UpdatePayoutAsync(ReferralPayout payout, CancellationToken ct = default)
+    {
+        _db.ReferralPayouts.Update(payout);
+        await _db.SaveChangesAsync(ct);
+    }
+
+    private static async Task<decimal> SumOrZeroAsync(IQueryable<decimal> query, CancellationToken ct) =>
+        await query.AnyAsync(ct) ? await query.SumAsync(ct) : 0m;
+
+    private static bool IsUniqueViolation(Exception ex, string table)
+    {
+        var text = ex.ToString();
+        return text.Contains(table, StringComparison.OrdinalIgnoreCase)
+               || text.Contains("23505", StringComparison.Ordinal); // PostgreSQL unique_violation
+    }
+}
+
 /// <summary>
 /// Lets the singleton maintenance service reach the scoped DbContext.
 ///

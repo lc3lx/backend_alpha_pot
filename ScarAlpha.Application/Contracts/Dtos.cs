@@ -2,14 +2,15 @@ using ScarAlpha.Domain.Enums;
 
 namespace ScarAlpha.Application.Contracts;
 
-public sealed record TelegramAuthRequest(string InitData);
+public sealed record TelegramAuthRequest(string InitData, string? ReferralCode = null);
 
 public sealed record EmailAuthRequest(
     string Email,
     string Password,
     string? FullName = null,
     string? Country = null,
-    string? Username = null);
+    string? Username = null,
+    string? ReferralCode = null);
 
 public sealed record ChangePasswordRequest(string CurrentPassword, string NewPassword);
 
@@ -47,7 +48,11 @@ public sealed record MeResponse(
 // asking for the locked balance and got refused.
 public sealed record BinollaConnectRequest(string Ssid, string AccountType = "Real");
 
-public sealed record BinollaCredentialRequest(string Email, string Password, string AccountType = "Real");
+public sealed record BinollaCredentialRequest(
+    string Email,
+    string Password,
+    string AccountType = "Real",
+    string? ReferralCode = null);
 
 public sealed record BinollaAccountTypeRequest(string AccountType);
 
@@ -201,6 +206,129 @@ public sealed record TradeDto(
     DateTimeOffset CreatedAt,
     DateTimeOffset UpdatedAt,
     string AccountType = "Demo");
+
+// ---- Referral program ----
+
+public sealed record ReferralTierDto(
+    int Level,
+    int MinReferrals,
+    decimal RatePercent,
+    decimal GiftUsd,
+    bool Reached,
+    bool IsCurrent);
+
+public sealed record ReferralSummaryResponse(
+    string ReferralCode,
+    string ReferralLink,
+    string TelegramShareLink,
+    int QualifiedReferrals,
+    int TotalReferrals,
+    int PendingReferrals,
+    int CurrentTier,
+    decimal CurrentRatePercent,
+    ReferralTierDto? NextTier,
+    int ReferralsToNextTier,
+    decimal TotalCommissionEarned,
+    decimal TotalRewardsEarned,
+    decimal TotalPaidOut,
+    decimal AvailableBalance,
+    decimal MinPayoutUsd,
+    int IPhoneQualifiedReferrals,
+    int IPhoneTarget,
+    bool IPhoneEligible,
+    IReadOnlyList<ReferralTierDto> Tiers);
+
+public sealed record ReferralMemberDto(
+    string UserId,
+    string? DisplayName,
+    DateTimeOffset ReferredAt,
+    bool DepositMet,
+    int ActiveDaysCount,
+    int RequiredActiveDays,
+    int QualificationDays,
+    DateTimeOffset WindowEndsAt,
+    bool Qualified,
+    DateTimeOffset? QualifiedAt);
+
+public sealed record ReferralMembersResponse(IReadOnlyList<ReferralMemberDto> Items, int Total, int Page, int PageSize);
+
+public sealed record ReferralCommissionDto(
+    string Id,
+    string ReferredUserId,
+    string? ReferredDisplayName,
+    decimal TradeAmount,
+    decimal RatePercent,
+    int Tier,
+    decimal Amount,
+    DateTimeOffset CreatedAt);
+
+public sealed record ReferralCommissionsResponse(IReadOnlyList<ReferralCommissionDto> Items, int Total, int Page, int PageSize);
+
+public sealed record ReferralRewardDto(
+    string Id,
+    string Kind,
+    int? Tier,
+    decimal Amount,
+    string Status,
+    DateTimeOffset GrantedAt,
+    DateTimeOffset? PaidAt,
+    string? Note);
+
+public sealed record ReferralRewardsResponse(IReadOnlyList<ReferralRewardDto> Items);
+
+public sealed record ReferralPayoutRequest(decimal Amount, string Method, string Destination);
+
+public sealed record ReferralPayoutDto(
+    string Id,
+    decimal Amount,
+    string Status,
+    string? Method,
+    string? Destination,
+    DateTimeOffset RequestedAt,
+    DateTimeOffset? DecidedAt,
+    string? AdminNote);
+
+public sealed record ReferralPayoutsResponse(IReadOnlyList<ReferralPayoutDto> Items, int Total, int Page, int PageSize);
+
+public sealed record AdminReferralOverviewDto(
+    string ReferrerUserId,
+    string? DisplayName,
+    string? Email,
+    int QualifiedReferrals,
+    int TotalReferrals,
+    int CurrentTier,
+    decimal TotalCommissionEarned,
+    decimal TotalRewardsEarned,
+    decimal AvailableBalance);
+
+public sealed record AdminReferralOverviewListResponse(IReadOnlyList<AdminReferralOverviewDto> Items, int Total, int Page, int PageSize);
+
+public sealed record AdminReferralDetailResponse(
+    AdminReferralOverviewDto Referrer,
+    IReadOnlyList<ReferralMemberDto> Members,
+    IReadOnlyList<ReferralCommissionDto> RecentCommissions,
+    IReadOnlyList<ReferralRewardDto> Rewards);
+
+public sealed record AdminDepositOverrideRequest(bool? Met, string? Note);
+
+/// <summary>Decision: "approve" | "reject" | "paid".</summary>
+public sealed record AdminPayoutDecisionRequest(string Decision, string? Note);
+
+public sealed record AdminReferralPayoutDto(
+    string Id,
+    string UserId,
+    string? UserDisplayName,
+    decimal Amount,
+    string Status,
+    string? Method,
+    string? Destination,
+    DateTimeOffset RequestedAt,
+    DateTimeOffset? DecidedAt,
+    string? AdminNote);
+
+public sealed record AdminReferralPayoutsResponse(IReadOnlyList<AdminReferralPayoutDto> Items, int Total, int Page, int PageSize);
+
+public sealed record AdminRewardPaidRequest(string? Note);
 
 public sealed record TradeListResponse(
     IReadOnlyList<TradeDto> Items,

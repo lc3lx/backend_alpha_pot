@@ -61,6 +61,35 @@ public static class TradeStateMachine
     }
 
     /// <summary>
+    /// Overwrites an already-final outcome with the broker's own record.
+    ///
+    /// <para>Every other path treats Profit/Loss/Tie as permanent, and that is right: a
+    /// settled trade must not drift because of a late or duplicate frame. But it also made
+    /// a WRONG outcome permanent — a trade that won on Binolla and was recorded as a loss
+    /// stayed a loss forever, and the user's balance and history disagreed with their
+    /// broker account with no way back.</para>
+    ///
+    /// <para>This is the one path allowed to correct that, and only the reconciliation
+    /// worker uses it, only with a value read back from Binolla, and only with an audit
+    /// entry. It is deliberately separate from <see cref="TryApplyFinalOutcome"/> so no
+    /// ordinary code path can reach it by accident.</para>
+    /// </summary>
+    public static bool TryApplyBrokerCorrection(ref TradeStatus current, TradeStatus next)
+    {
+        if (next is not (TradeStatus.Profit or TradeStatus.Loss or TradeStatus.Tie))
+            return false;
+        if (current == next)
+            return false;
+
+        // Cancelled trades never reached the broker, so it has nothing to correct.
+        if (current == TradeStatus.Cancelled)
+            return false;
+
+        current = next;
+        return true;
+    }
+
+    /// <summary>
     /// Apply Win/Loss/Tie from Binolla — allowed from Running/Pending and from Unknown/Failed
     /// after a timed-out wait (late close).
     /// </summary>

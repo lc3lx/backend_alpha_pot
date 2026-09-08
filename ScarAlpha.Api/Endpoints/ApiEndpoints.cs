@@ -486,6 +486,50 @@ public static class AdminEndpoints
             [FromQuery] int pageSize = 50) =>
             Results.Ok(await svc.ListTradesAsync(userId, status, asset, page, pageSize, ct)));
 
+        var referrals = app.MapGroup("/api/admin/referrals")
+            .WithTags("Admin")
+            .RequireAuthorization("AdminOnly");
+
+        referrals.MapGet("/", async (
+            AdminReferralAppService svc,
+            CancellationToken ct,
+            [FromQuery] string? q = null,
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 50) =>
+            Results.Ok(await svc.ListReferrersAsync(q, page, pageSize, ct)));
+
+        referrals.MapGet("/{referrerUserId:guid}", async (Guid referrerUserId, AdminReferralAppService svc, CancellationToken ct) =>
+            Results.Ok(await svc.GetDetailAsync(referrerUserId, ct)));
+
+        referrals.MapPost("/{referredUserId:guid}/deposit", async (
+            Guid referredUserId,
+            [FromBody] AdminDepositOverrideRequest request,
+            AdminReferralAppService svc,
+            CancellationToken ct) =>
+            Results.Ok(await svc.SetDepositOverrideAsync(referredUserId, request, ct)));
+
+        referrals.MapGet("/payouts", async (
+            AdminReferralAppService svc,
+            CancellationToken ct,
+            [FromQuery] string? status = null,
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 50) =>
+            Results.Ok(await svc.ListPayoutsAsync(status, page, pageSize, ct)));
+
+        referrals.MapPost("/payouts/{payoutId:guid}/decide", async (
+            Guid payoutId,
+            [FromBody] AdminPayoutDecisionRequest request,
+            AdminReferralAppService svc,
+            CancellationToken ct) =>
+            Results.Ok(await svc.DecidePayoutAsync(payoutId, request, ct)));
+
+        referrals.MapPost("/rewards/{rewardId:guid}/pay", async (
+            Guid rewardId,
+            [FromBody] AdminRewardPaidRequest request,
+            AdminReferralAppService svc,
+            CancellationToken ct) =>
+            Results.Ok(await svc.MarkRewardPaidAsync(rewardId, request, ct)));
+
         return group;
     }
 }
@@ -507,6 +551,49 @@ public static class NotificationEndpoints
 
         group.MapPost("/read-all", async (NotificationAppService svc, CancellationToken ct) =>
             Results.Ok(await svc.MarkAllReadAsync(ct)));
+
+        return group;
+    }
+}
+
+public static class ReferralEndpoints
+{
+    public static RouteGroupBuilder MapReferralEndpoints(this IEndpointRouteBuilder app)
+    {
+        var group = app.MapGroup("/api/referral").WithTags("Referral").RequireAuthorization();
+
+        group.MapGet("/summary", async (ReferralAppService svc, CancellationToken ct) =>
+            Results.Ok(await svc.GetSummaryAsync(ct)));
+
+        group.MapGet("/members", async (
+            ReferralAppService svc,
+            CancellationToken ct,
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 50) =>
+            Results.Ok(await svc.GetMembersAsync(page, pageSize, ct)));
+
+        group.MapGet("/commissions", async (
+            ReferralAppService svc,
+            CancellationToken ct,
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 50) =>
+            Results.Ok(await svc.GetCommissionsAsync(page, pageSize, ct)));
+
+        group.MapGet("/rewards", async (ReferralAppService svc, CancellationToken ct) =>
+            Results.Ok(await svc.GetRewardsAsync(ct)));
+
+        group.MapGet("/payouts", async (
+            ReferralAppService svc,
+            CancellationToken ct,
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 50) =>
+            Results.Ok(await svc.GetPayoutsAsync(page, pageSize, ct)));
+
+        group.MapPost("/payouts", async (
+            [FromBody] ReferralPayoutRequest request,
+            ReferralAppService svc,
+            CancellationToken ct) =>
+            Results.Ok(await svc.RequestPayoutAsync(request, ct)));
 
         return group;
     }

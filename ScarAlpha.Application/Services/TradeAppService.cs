@@ -24,6 +24,7 @@ public sealed class TradeAppService
     private readonly StrategyAppService _strategies;
     private readonly INotificationWriter _notifications;
     private readonly IMarketingDemoService _demo;
+    private readonly IReferralQualificationService _referralQualification;
     private readonly ILogger<TradeAppService> _logger;
 
     public TradeAppService(
@@ -37,6 +38,7 @@ public sealed class TradeAppService
         StrategyAppService strategies,
         INotificationWriter notifications,
         IMarketingDemoService demo,
+        IReferralQualificationService referralQualification,
         ILogger<TradeAppService> logger)
     {
         _currentUser = currentUser;
@@ -49,6 +51,7 @@ public sealed class TradeAppService
         _strategies = strategies;
         _notifications = notifications;
         _demo = demo;
+        _referralQualification = referralQualification;
         _logger = logger;
     }
 
@@ -111,6 +114,17 @@ public sealed class TradeAppService
         {
             _logger.LogWarning(ex, "Balance check failed for user {UserId}", userId);
             throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Unable to verify Binolla balance.", 409);
+        }
+
+        try
+        {
+            // Free ride on the balance we just fetched — the referral deposit signal is the
+            // real-account balance regardless of which book the user is currently trading.
+            await _referralQualification.ObserveRealBalanceAsync(userId, balance.RealBalance, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Referral balance observation failed for user {UserId}", userId);
         }
 
         var tradeAccountType = balance.CurrentType == EngineAccount.Real

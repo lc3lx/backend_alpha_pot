@@ -169,6 +169,7 @@ try
     app.MapBotEndpoints();
     app.MapAdminEndpoints();
     app.MapNotificationEndpoints();
+    app.MapReferralEndpoints();
     app.MapTradeEndpoints().RequireRateLimiting("trades");
 
     app.Run();

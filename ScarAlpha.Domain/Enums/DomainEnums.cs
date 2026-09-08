@@ -70,3 +70,25 @@ public enum TradeStatus
     Unknown = 6,
     Cancelled = 7
 }
+
+/// <summary>Kind of one-time referral reward — a tier gift or the iPhone milestone.</summary>
+public enum ReferralRewardKind
+{
+    TierGift = 0,
+    IPhone = 1
+}
+
+public enum ReferralRewardStatus
+{
+    Granted = 0,
+    Paid = 1,
+    Cancelled = 2
+}
+
+public enum ReferralPayoutStatus
+{
+    Pending = 0,
+    Approved = 1,
+    Rejected = 2,
+    Paid = 3
+}

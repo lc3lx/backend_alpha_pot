@@ -31,6 +31,9 @@ public static class ApiErrorCodes
     public const string BotAccessDenied = "BOT_ACCESS_DENIED";
     public const string StrategyDisabled = "STRATEGY_DISABLED";
     public const string StrategyNotFound = "STRATEGY_NOT_FOUND";
+    public const string PayoutBelowMinimum = "PAYOUT_BELOW_MINIMUM";
+    public const string PayoutInsufficientBalance = "PAYOUT_INSUFFICIENT_BALANCE";
+    public const string PayoutPendingExists = "PAYOUT_PENDING_EXISTS";
 }
 
 public sealed class ApiException : Exception

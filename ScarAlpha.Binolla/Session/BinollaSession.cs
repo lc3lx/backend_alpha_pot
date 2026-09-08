@@ -252,6 +252,14 @@ public sealed class BinollaSession : IBinollaClient
         return State.GetBalanceInfo();
     }
 
+    /// <inheritdoc />
+    public bool TryGetClosedPnl(string orderId, out decimal profitLoss)
+    {
+        profitLoss = 0m;
+        if (string.IsNullOrWhiteSpace(orderId)) return false;
+        return State.ClosedOrderPnL.TryGetValue(orderId, out profitLoss);
+    }
+
     public async Task ChangeAccountAsync(AccountType accountType, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();

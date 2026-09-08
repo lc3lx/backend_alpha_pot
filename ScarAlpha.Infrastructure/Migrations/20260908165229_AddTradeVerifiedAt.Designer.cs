@@ -3,6 +3,7 @@ using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using ScarAlpha.Infrastructure.Persistence;
 
@@ -11,9 +12,11 @@ using ScarAlpha.Infrastructure.Persistence;
 namespace ScarAlpha.Infrastructure.Migrations
 {
     [DbContext(typeof(AppDbContext))]
-    partial class AppDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260908165229_AddTradeVerifiedAt")]
+    partial class AddTradeVerifiedAt
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -152,220 +155,6 @@ namespace ScarAlpha.Infrastructure.Migrations
                         .IsUnique();
 
                     b.ToTable("binolla_links", (string)null);
-                });
-
-            modelBuilder.Entity("ScarAlpha.Domain.Entities.ReferralCommission", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("char(36)");
-
-                    b.Property<decimal>("Amount")
-                        .HasPrecision(18, 8)
-                        .HasColumnType("decimal(18,8)");
-
-                    b.Property<DateTimeOffset>("CreatedAt")
-                        .HasColumnType("datetime(6)");
-
-                    b.Property<decimal>("RatePercent")
-                        .HasPrecision(9, 4)
-                        .HasColumnType("decimal(9,4)");
-
-                    b.Property<Guid>("ReferredUserId")
-                        .HasColumnType("char(36)");
-
-                    b.Property<Guid>("ReferrerUserId")
-                        .HasColumnType("char(36)");
-
-                    b.Property<int>("Tier")
-                        .HasColumnType("int");
-
-                    b.Property<decimal>("TradeAmount")
-                        .HasPrecision(18, 8)
-                        .HasColumnType("decimal(18,8)");
-
-                    b.Property<Guid>("TradeId")
-                        .HasColumnType("char(36)");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("ReferredUserId");
-
-                    b.HasIndex("ReferrerUserId");
-
-                    b.HasIndex("TradeId")
-                        .IsUnique();
-
-                    b.ToTable("referral_commissions", (string)null);
-                });
-
-            modelBuilder.Entity("ScarAlpha.Domain.Entities.ReferralPayout", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("char(36)");
-
-                    b.Property<string>("AdminNote")
-                        .HasMaxLength(512)
-                        .HasColumnType("varchar(512)");
-
-                    b.Property<decimal>("Amount")
-                        .HasPrecision(18, 8)
-                        .HasColumnType("decimal(18,8)");
-
-                    b.Property<DateTimeOffset?>("DecidedAt")
-                        .HasColumnType("datetime(6)");
-
-                    b.Property<string>("DecidedBy")
-                        .HasMaxLength(256)
-                        .HasColumnType("varchar(256)");
-
-                    b.Property<string>("Destination")
-                        .HasMaxLength(256)
-                        .HasColumnType("varchar(256)");
-
-                    b.Property<string>("Method")
-                        .HasMaxLength(64)
-                        .HasColumnType("varchar(64)");
-
-                    b.Property<DateTimeOffset>("RequestedAt")
-                        .HasColumnType("datetime(6)");
-
-                    b.Property<int>("Status")
-                        .HasColumnType("int");
-
-                    b.Property<Guid>("UserId")
-                        .HasColumnType("char(36)");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("Status");
-
-                    b.HasIndex("UserId");
-
-                    b.ToTable("referral_payouts", (string)null);
-                });
-
-            modelBuilder.Entity("ScarAlpha.Domain.Entities.ReferralQualification", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("char(36)");
-
-                    b.Property<int>("ActiveDaysCount")
-                        .HasColumnType("int");
-
-                    b.Property<DateTimeOffset?>("AdminDepositAt")
-                        .HasColumnType("datetime(6)");
-
-                    b.Property<string>("AdminDepositBy")
-                        .HasMaxLength(256)
-                        .HasColumnType("varchar(256)");
-
-                    b.Property<string>("AdminDepositNote")
-                        .HasMaxLength(512)
-                        .HasColumnType("varchar(512)");
-
-                    b.Property<bool?>("AdminDepositOverride")
-                        .HasColumnType("tinyint(1)");
-
-                    b.Property<int>("BotTradeCount")
-                        .HasColumnType("int");
-
-                    b.Property<DateTimeOffset>("CreatedAt")
-                        .HasColumnType("datetime(6)");
-
-                    b.Property<bool>("DepositMet")
-                        .HasColumnType("tinyint(1)");
-
-                    b.Property<DateTimeOffset?>("DepositMetAt")
-                        .HasColumnType("datetime(6)");
-
-                    b.Property<DateTimeOffset?>("FirstBotTradeAt")
-                        .HasColumnType("datetime(6)");
-
-                    b.Property<DateTimeOffset?>("LastActiveDayUtc")
-                        .HasColumnType("datetime(6)");
-
-                    b.Property<DateTimeOffset?>("LastBotTradeAt")
-                        .HasColumnType("datetime(6)");
-
-                    b.Property<decimal>("PeakRealBalance")
-                        .HasPrecision(18, 8)
-                        .HasColumnType("decimal(18,8)");
-
-                    b.Property<bool>("Qualified")
-                        .HasColumnType("tinyint(1)");
-
-                    b.Property<DateTimeOffset?>("QualifiedAt")
-                        .HasColumnType("datetime(6)");
-
-                    b.Property<Guid>("ReferredUserId")
-                        .HasColumnType("char(36)");
-
-                    b.Property<Guid>("ReferrerUserId")
-                        .HasColumnType("char(36)");
-
-                    b.Property<DateTimeOffset>("UpdatedAt")
-                        .HasColumnType("datetime(6)");
-
-                    b.Property<DateTimeOffset>("WindowStartedAt")
-                        .HasColumnType("datetime(6)");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("Qualified");
-
-                    b.HasIndex("ReferredUserId")
-                        .IsUnique();
-
-                    b.HasIndex("ReferrerUserId");
-
-                    b.ToTable("referral_qualifications", (string)null);
-                });
-
-            modelBuilder.Entity("ScarAlpha.Domain.Entities.ReferralReward", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("char(36)");
-
-                    b.Property<decimal>("Amount")
-                        .HasPrecision(18, 8)
-                        .HasColumnType("decimal(18,8)");
-
-                    b.Property<DateTimeOffset>("GrantedAt")
-                        .HasColumnType("datetime(6)");
-
-                    b.Property<int>("Kind")
-                        .HasColumnType("int");
-
-                    b.Property<string>("Note")
-                        .HasMaxLength(512)
-                        .HasColumnType("varchar(512)");
-
-                    b.Property<DateTimeOffset?>("PaidAt")
-                        .HasColumnType("datetime(6)");
-
-                    b.Property<string>("PaidBy")
-                        .HasMaxLength(256)
-                        .HasColumnType("varchar(256)");
-
-                    b.Property<int>("Status")
-                        .HasColumnType("int");
-
-                    b.Property<int>("Tier")
-                        .HasColumnType("int");
-
-                    b.Property<Guid>("UserId")
-                        .HasColumnType("char(36)");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("UserId", "Kind", "Tier")
-                        .IsUnique();
-
-                    b.ToTable("referral_rewards", (string)null);
                 });
 
             modelBuilder.Entity("ScarAlpha.Domain.Entities.Subscription", b =>
@@ -511,16 +300,6 @@ namespace ScarAlpha.Infrastructure.Migrations
                         .HasMaxLength(512)
                         .HasColumnType("varchar(512)");
 
-                    b.Property<string>("ReferralCode")
-                        .HasMaxLength(16)
-                        .HasColumnType("varchar(16)");
-
-                    b.Property<DateTimeOffset?>("ReferredAt")
-                        .HasColumnType("datetime(6)");
-
-                    b.Property<Guid?>("ReferredByUserId")
-                        .HasColumnType("char(36)");
-
                     b.Property<int>("Role")
                         .HasColumnType("int");
 
@@ -541,12 +320,6 @@ namespace ScarAlpha.Infrastructure.Migrations
                         .HasFilter("`Email` IS NOT NULL");
 
                     b.HasIndex("IsMarketingDemo");
-
-                    b.HasIndex("ReferralCode")
-                        .IsUnique()
-                        .HasFilter("`ReferralCode` IS NOT NULL");
-
-                    b.HasIndex("ReferredByUserId");
 
                     b.HasIndex("TelegramUserId")
                         .IsUnique()

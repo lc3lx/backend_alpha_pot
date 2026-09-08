@@ -11,12 +11,26 @@ namespace ScarAlpha.Application.Common;
 /// reason for them to reach different conclusions — and every observed divergence came
 /// from WHEN each user happened to be scanned, not from what the market did.
 /// </summary>
-public readonly record struct SignalCohort(string StrategyId, int DurationSeconds)
+public readonly record struct SignalCohort(string StrategyId, int ExpiryCandles)
 {
-    public static SignalCohort For(string? strategyId, int durationSeconds) =>
-        new((strategyId ?? "rsi").Trim().ToLowerInvariant(), durationSeconds);
+    /// <summary>
+    /// Groups bots by what actually changes the decision.
+    ///
+    /// <para>This used to key on the bot's raw <c>DurationSeconds</c>, which fragmented the
+    /// fleet for no reason: the web app sends 60 and the admin panel sends 300, yet
+    /// <see cref="RsiStrategyOptions.FromBotDurationSeconds"/> maps BOTH to 5 expiry
+    /// candles — identical options. The two groups therefore scanned the whole market
+    /// separately and acted on two different decision objects taken moments apart, which
+    /// is exactly the split this cohort exists to prevent. Keying on the derived options
+    /// collapses them into one analysis shared by everyone on that strategy.</para>
+    /// </summary>
+    public static SignalCohort For(string? strategyId, int durationSeconds)
+    {
+        var id = (strategyId ?? "rsi").Trim().ToLowerInvariant();
+        return new SignalCohort(id, RsiStrategyOptions.FromBotDurationSeconds(durationSeconds).ExpiryCandles);
+    }
 
-    public override string ToString() => $"{StrategyId}:{DurationSeconds}";
+    public override string ToString() => $"{StrategyId}:x{ExpiryCandles}";
 }
 
 /// <summary>
