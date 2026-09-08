@@ -91,6 +91,12 @@ public sealed class BinollaAppService
         {
             captured = await _credentialAuth.LoginAsync(request.Email, request.Password, workCt);
         }
+        catch (ApiException ex) when (IsBrokerIpBlock(ex))
+        {
+            // The broker rejected the server itself. Pause everyone, not just this user.
+            _restorer.MarkCredentialLoginFailed(userId, blockedByBroker: true);
+            throw;
+        }
         catch (ApiException)
         {
             _restorer.MarkCredentialLoginFailed(userId);
@@ -599,6 +605,15 @@ public sealed class BinollaAppService
     /// Silent re-login using encrypted Binolla email/password saved on the link.
     /// Used when SSID/session expires so the user is not forced to type credentials again.
     /// </summary>
+    /// <summary>
+    /// Whether the failure was the broker refusing this SERVER rather than the account —
+    /// an HTTP 403 / geo block. Those are IP-wide, so they must pause every user.
+    /// </summary>
+    private static bool IsBrokerIpBlock(ApiException ex) =>
+        ex.Message.Contains("HTTP 403", StringComparison.OrdinalIgnoreCase)
+        || ex.Message.Contains("blocked this server IP", StringComparison.OrdinalIgnoreCase)
+        || ex.Message.Contains("geo-restriction", StringComparison.OrdinalIgnoreCase);
+
     public async Task<BinollaConnectResponse?> TryReloginFromStoredCredentialsAsync(CancellationToken ct)
     {
         await EnsureNotMarketingDemoAsync(ct);

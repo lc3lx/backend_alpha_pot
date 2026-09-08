@@ -357,6 +357,50 @@ async function tryInPageAuthApi(page, { isSignup, email, password, lid }) {
   );
 }
 
+/**
+ * Accepts either shape and returns Playwright's { server, username, password }:
+ *
+ *   http://user:pass@host:port      (URL form)
+ *   host:port:user:pass             (the colon-separated form proxy vendors hand out)
+ *
+ * Playwright ignores credentials embedded in the server URL, so they must be split out
+ * here. Getting that wrong makes the proxy reject every request, which looks identical to
+ * the block being worked around.
+ *
+ * Returns null when nothing is configured, so the caller launches without a proxy.
+ */
+function parseProxy(raw) {
+  const value = String(raw || '').trim();
+  if (!value) return null;
+
+  if (/^[a-z0-9+.-]+:\/\//i.test(value)) {
+    try {
+      const u = new URL(value);
+      const server = `${u.protocol}//${u.host}`;
+      const username = decodeURIComponent(u.username || '');
+      const password = decodeURIComponent(u.password || '');
+      return username ? { server, username, password } : { server };
+    } catch {
+      return { server: value };
+    }
+  }
+
+  // host:port:user:pass — take host/port from the left, then keep the rest as the
+  // password so one containing ':' still survives.
+  const parts = value.split(':');
+  if (parts.length >= 4) {
+    const [host, port, username, ...passwordParts] = parts;
+    return {
+      server: `http://${host}:${port}`,
+      username,
+      password: passwordParts.join(':'),
+    };
+  }
+
+  if (parts.length === 2) return { server: `http://${value}` };
+  return { server: value };
+}
+
 async function main() {
   const mode = arg('mode', 'login');
   const email = arg('email') || process.env.BINOLLA_AUTH_EMAIL || '';
@@ -386,8 +430,9 @@ async function main() {
       }),
     }).catch(() => {});
   };
-  const proxyServer =
+  const proxyRaw =
     arg('proxy') || process.env.BINOLLA_AUTH_PROXY || process.env.Binolla__CredentialLogin__ProxyServer || '';
+  const proxyConfig = parseProxy(proxyRaw);
 
   if (!email || !password) {
     process.stdout.write(JSON.stringify({ ok: false, error: 'email and password are required' }));
@@ -422,8 +467,11 @@ async function main() {
         '--ignore-certificate-errors',
       ],
     };
-    if (proxyServer) {
-      launchOpts.proxy = { server: proxyServer };
+    if (proxyConfig) {
+      // Playwright needs the credentials as SEPARATE fields. Passing them inside the
+      // server URL (http://user:pass@host:port) is silently ignored and the proxy then
+      // rejects every request — which looks exactly like the block we are working around.
+      launchOpts.proxy = proxyConfig;
     }
     browser = await chromium.launch(launchOpts);
   } catch (launchErr) {

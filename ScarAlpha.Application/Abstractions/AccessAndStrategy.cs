@@ -71,6 +71,13 @@ public interface IBinollaSessionRestorer
     /// the same rate only deepens the hole.
     /// </summary>
     void MarkCredentialLoginFailed(Guid userId);
+
+    /// <summary>
+    /// Same, but states whether the broker refused the SERVER (an IP/WAF block) rather
+    /// than the account. An IP-level refusal pauses every user: the block is not
+    /// per-account, so retrying on behalf of someone else only deepens it.
+    /// </summary>
+    void MarkCredentialLoginFailed(Guid userId, bool blockedByBroker);
 }
 
 public enum StrategyCatalogStatus

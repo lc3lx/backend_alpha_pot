@@ -162,6 +162,20 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
         _authFailed.TryRemove(userId, out _);
         _retryAfterUtc.TryRemove(userId, out _);
         _credentialFailures.TryRemove(userId, out _);
+        _credentialInFlight.TryRemove(userId, out _);
+        ReleaseGlobalSlot(userId);
+
+        lock (_globalGate)
+        {
+            // A capture that succeeded proves the IP is fine again.
+            _globalFailures = 0;
+            _globalRetryAfterUtc = DateTimeOffset.MinValue;
+
+            // The spacing floor exists to throttle FAILED attempts against a broker that
+            // is refusing us. After a success it would only delay other users onboarding
+            // for no benefit — and they are still serialised by the single capture slot.
+            _lastCaptureStartedUtc = DateTimeOffset.MinValue;
+        }
     }
 
     /// <summary>Consecutive failed credential logins, for the backoff below.</summary>
@@ -170,19 +184,64 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
     /// <summary>One in-flight credential login per user; a second would just queue browsers.</summary>
     private readonly ConcurrentDictionary<Guid, byte> _credentialInFlight = new();
 
+    /// <summary>
+    /// Who currently holds the single global capture slot, if anyone.
+    ///
+    /// <para>A credential capture drives a headless browser and, more importantly, hits
+    /// Binolla from the server's ONE public IP. Per-user backoff protects each account but
+    /// does nothing about the shared resource: with five bots holding dead sessions, five
+    /// independent 30-second cooldowns still produced a login attempt roughly every six
+    /// seconds, which is what the broker sees and blocks.</para>
+    /// </summary>
+    private Guid? _globalCaptureHolder;
+    private readonly object _globalGate = new();
+
+    /// <summary>Set when the broker refuses the IP itself; applies to every user.</summary>
+    private DateTimeOffset _globalRetryAfterUtc = DateTimeOffset.MinValue;
+
+    private int _globalFailures;
+
+    /// <summary>Never start a second capture while one is running.</summary>
+    private DateTimeOffset _lastCaptureStartedUtc = DateTimeOffset.MinValue;
+
+    /// <summary>Floor between captures regardless of how many users want one.</summary>
+    private static readonly TimeSpan MinGlobalCaptureInterval = TimeSpan.FromSeconds(20);
+
     public bool CanAttemptCredentialLogin(Guid userId)
     {
         if (IsCoolingDown(userId))
             return false;
 
-        // Claim the slot. Released by MarkCredentialLoginFailed or ClearAuthFailure, so a
-        // caller that never reports back cannot leak it past the cooldown either.
-        return _credentialInFlight.TryAdd(userId, 1);
+        lock (_globalGate)
+        {
+            var now = DateTimeOffset.UtcNow;
+
+            // The broker is refusing this IP — trying again on behalf of a different user
+            // changes nothing and only deepens the block.
+            if (now < _globalRetryAfterUtc)
+                return false;
+
+            if (_globalCaptureHolder is not null)
+                return false;
+
+            if (now - _lastCaptureStartedUtc < MinGlobalCaptureInterval)
+                return false;
+
+            if (!_credentialInFlight.TryAdd(userId, 1))
+                return false;
+
+            _globalCaptureHolder = userId;
+            _lastCaptureStartedUtc = now;
+            return true;
+        }
     }
 
-    public void MarkCredentialLoginFailed(Guid userId)
+    public void MarkCredentialLoginFailed(Guid userId) => MarkCredentialLoginFailed(userId, false);
+
+    public void MarkCredentialLoginFailed(Guid userId, bool blockedByBroker)
     {
         _credentialInFlight.TryRemove(userId, out _);
+        ReleaseGlobalSlot(userId);
 
         var failures = _credentialFailures.AddOrUpdate(userId, 1, (_, n) => n + 1);
 
@@ -192,8 +251,28 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
         var baseSeconds = Math.Max(1, _options.FailureCooldownSeconds);
         var factor = Math.Min(1 << Math.Min(failures - 1, 6), 32);
         var delay = Math.Min(baseSeconds * factor, 900);
-
         _retryAfterUtc[userId] = DateTimeOffset.UtcNow.AddSeconds(delay);
+
+        if (!blockedByBroker)
+            return;
+
+        lock (_globalGate)
+        {
+            // An IP-level refusal is not per-account, so pause EVERY user. Escalates the
+            // same way: 1, 2, 4 … up to 15 minutes.
+            _globalFailures = Math.Min(_globalFailures + 1, 8);
+            var globalDelay = Math.Min(60 * (1 << Math.Min(_globalFailures - 1, 4)), 900);
+            _globalRetryAfterUtc = DateTimeOffset.UtcNow.AddSeconds(globalDelay);
+        }
+    }
+
+    private void ReleaseGlobalSlot(Guid userId)
+    {
+        lock (_globalGate)
+        {
+            if (_globalCaptureHolder == userId)
+                _globalCaptureHolder = null;
+        }
     }
 
     public void EnsureBackgroundRestore(Guid userId)

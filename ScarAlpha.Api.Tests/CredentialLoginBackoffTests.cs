@@ -87,17 +87,63 @@ public sealed class CredentialLoginBackoffTests
     }
 
     [Fact]
-    public void Users_back_off_independently()
+    public void Only_one_capture_runs_at_a_time_across_all_users()
     {
         var svc = NewService();
+
+        // A capture drives a headless browser and hits Binolla from the server's single
+        // public IP. Five bots with dead sessions each holding their own 30s cooldown
+        // still produced an attempt every ~6 seconds, which is what the broker blocks.
+        svc.CanAttemptCredentialLogin(Guid.NewGuid()).Should().BeTrue();
+        svc.CanAttemptCredentialLogin(Guid.NewGuid()).Should().BeFalse();
+        svc.CanAttemptCredentialLogin(Guid.NewGuid()).Should().BeFalse();
+    }
+
+    [Fact]
+    public void An_account_failure_leaves_other_users_free_after_the_slot_is_released()
+    {
+        var svc = NewService(cooldownSeconds: 30);
         var failing = Guid.NewGuid();
-        var healthy = Guid.NewGuid();
 
         svc.CanAttemptCredentialLogin(failing).Should().BeTrue();
-        svc.MarkCredentialLoginFailed(failing);
 
-        // One account with bad credentials must not stop everyone else reconnecting.
-        svc.CanAttemptCredentialLogin(healthy).Should().BeTrue();
+        // Account-level failure: the global slot is released, but the per-user cooldown
+        // keeps THIS user out.
+        svc.MarkCredentialLoginFailed(failing, blockedByBroker: false);
+
+        svc.CanAttemptCredentialLogin(failing).Should().BeFalse("this user is cooling down");
+    }
+
+    [Fact]
+    public void A_broker_ip_block_pauses_every_user()
+    {
+        var svc = NewService();
+        var first = Guid.NewGuid();
+
+        svc.CanAttemptCredentialLogin(first).Should().BeTrue();
+
+        // HTTP 403 is the broker refusing the SERVER. Retrying for a different account
+        // cannot succeed and only deepens the block.
+        svc.MarkCredentialLoginFailed(first, blockedByBroker: true);
+
+        svc.CanAttemptCredentialLogin(Guid.NewGuid())
+            .Should().BeFalse("the block is IP-wide, not per-account");
+    }
+
+    [Fact]
+    public void A_successful_capture_clears_the_global_pause()
+    {
+        var svc = NewService();
+        var blocked = Guid.NewGuid();
+
+        svc.CanAttemptCredentialLogin(blocked).Should().BeTrue();
+        svc.MarkCredentialLoginFailed(blocked, blockedByBroker: true);
+        svc.CanAttemptCredentialLogin(Guid.NewGuid()).Should().BeFalse();
+
+        // A capture that works proves the IP is acceptable again.
+        svc.ClearAuthFailure(blocked);
+
+        svc.CanAttemptCredentialLogin(Guid.NewGuid()).Should().BeTrue();
     }
 
     [Fact]
