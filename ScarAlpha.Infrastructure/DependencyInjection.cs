@@ -14,6 +14,7 @@ using ScarAlpha.Domain.Enums;
 using ScarAlpha.Infrastructure.Access;
 using ScarAlpha.Infrastructure.Auth;
 using ScarAlpha.Infrastructure.Binolla;
+using ScarAlpha.Infrastructure.BrokerGateway;
 using ScarAlpha.Infrastructure.Persistence;
 using ScarAlpha.Infrastructure.Security;
 using ScarAlpha.Infrastructure.Strategies;
@@ -181,6 +182,24 @@ public static class DependencyInjection
         services.AddSingleton(binollaOptions);
         services.AddSingleton<IBinollaSessionManager>(sp =>
             new BinollaSessionManager(sp.GetRequiredService<BinollaSessionManagerOptions>()));
+
+        // Broker-neutral routing. Binolla keeps its own C# session manager underneath;
+        // every other venue is served by the Python gateway in backend/brokers.
+        var gatewayUrl = configuration["BROKER_GATEWAY_URL"]
+                         ?? configuration["Brokers:GatewayUrl"]
+                         ?? BrokerGatewayDefaults.DefaultBaseUrl;
+        var gatewayToken = configuration["BROKER_GATEWAY_TOKEN"] ?? string.Empty;
+
+        services.AddHttpClient(BrokerGatewayDefaults.HttpClientName, http =>
+        {
+            http.BaseAddress = new Uri(gatewayUrl);
+            // A broker call must not hang a worker tick; the gateway has its own timeouts.
+            http.Timeout = TimeSpan.FromSeconds(45);
+            if (!string.IsNullOrWhiteSpace(gatewayToken))
+                http.DefaultRequestHeaders.Add("X-Gateway-Token", gatewayToken);
+        });
+
+        services.AddSingleton<IBrokerSessionManager, BrokerSessionManager>();
 
         services.Configure<BinollaSessionRestoreOptions>(options =>
         {

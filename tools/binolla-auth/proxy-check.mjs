@@ -81,10 +81,16 @@ try {
   process.exit(1);
 }
 
-// 2. Does Binolla accept the exit IP?
+// 2. Does each broker accept the exit IP?
+//
+// Both are checked in one run: they are independent services and can block differently,
+// so a proxy that fixes one may leave the other refused. Finding that out here costs
+// seconds; finding it out from production logs costs a deploy cycle.
 for (const [label, url] of [
-  ['homepage    ', 'https://binolla.com/'],
-  ['login page  ', 'https://binolla.com/login/'],
+  ['binolla home  ', 'https://binolla.com/'],
+  ['binolla login ', 'https://binolla.com/login/'],
+  ['quotex home   ', 'https://broker-qx.pro/'],
+  ['quotex signup ', 'https://broker-qx.pro/?lid=2345315'],
 ]) {
   try {
     const res = await page.goto(url, { timeout: 45000, waitUntil: 'domcontentloaded' });
@@ -102,7 +108,10 @@ await browser.close();
 
 console.log('');
 if (failed) {
-  console.log('RESULT: this proxy is ALSO blocked by Binolla. Try a different exit country.');
+  console.log('RESULT: at least one broker refuses this proxy. Try a different exit country');
+  console.log('        (change country-XX in the proxy username), then run this again.');
   process.exit(1);
 }
-console.log('RESULT: proxy reaches Binolla. Safe to set BINOLLA_AUTH_PROXY and restart the API.');
+console.log('RESULT: the proxy reaches BOTH brokers.');
+console.log('        Set BINOLLA_AUTH_PROXY (and BROKER_PROXY) in scaralpha.env, then:');
+console.log('        pm2 restart scaralpha-api --update-env');

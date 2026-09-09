@@ -19,6 +19,7 @@ public sealed class BinollaAppService
     private readonly IBinollaSessionManager _sessions;
     private readonly IBotAccessService _access;
     private readonly IBinollaCredentialAuth _credentialAuth;
+    private readonly IBrokerSessionManager _brokers;
     private readonly IBinollaSessionRestorer _restorer;
     private readonly IMarketingDemoService _demo;
     private readonly IUserRepository _users;
@@ -31,6 +32,7 @@ public sealed class BinollaAppService
         IBinollaSessionManager sessions,
         IBotAccessService access,
         IBinollaCredentialAuth credentialAuth,
+        IBrokerSessionManager brokers,
         IBinollaSessionRestorer restorer,
         IMarketingDemoService demo,
         IUserRepository users,
@@ -42,6 +44,7 @@ public sealed class BinollaAppService
         _sessions = sessions;
         _access = access;
         _credentialAuth = credentialAuth;
+        _brokers = brokers;
         _restorer = restorer;
         _demo = demo;
         _users = users;
@@ -67,6 +70,13 @@ public sealed class BinollaAppService
         if (request is null)
             throw new ApiException(ApiErrorCodes.ValidationError, "Request body is required.");
         ValidateCredentialRequest(request);
+
+        // Venues other than Binolla are served by the broker gateway, which owns their
+        // protocol. Binolla keeps the credential-capture path below because it is live and
+        // carries fixes that would be reopened by moving it.
+        var broker = Brokers.Normalize(request.Broker);
+        if (broker != Brokers.Binolla)
+            return await ConnectViaGatewayAsync(userId, broker, request, ct);
 
         // The throttle lives HERE, at the choke point every login funnels through, rather
         // than only on the background relogin. A client retrying POST /api/binolla/login
@@ -609,6 +619,75 @@ public sealed class BinollaAppService
     /// Whether the failure was the broker refusing this SERVER rather than the account —
     /// an HTTP 403 / geo block. Those are IP-wide, so they must pause every user.
     /// </summary>
+    /// <summary>
+    /// Opens a session on a gateway-backed broker and records the link, mirroring what the
+    /// Binolla path does once its capture succeeds.
+    /// </summary>
+    private async Task<BinollaConnectResponse> ConnectViaGatewayAsync(
+        Guid userId,
+        string broker,
+        BinollaCredentialRequest request,
+        CancellationToken ct)
+    {
+        var accountType = ParseAccountType(request.AccountType);
+        await EnsureAccountTypeAllowedAsync(userId, accountType, ct);
+
+        var engineType = accountType == DomainAccount.Demo ? EngineAccount.Demo : EngineAccount.Real;
+        var client = await _brokers.GetOrCreateAsync(
+            userId,
+            broker,
+            new BrokerCredentials(
+                Email: request.Email.Trim(),
+                Password: request.Password,
+                AccountType: engineType),
+            ct);
+
+        var now = DateTimeOffset.UtcNow;
+        var link = await _links.GetByUserIdAsync(userId, ct) ?? new BinollaLink
+        {
+            Id = Guid.NewGuid(),
+            UserId = userId,
+            CreatedAt = now,
+            AdminApproved = false,
+            ApprovalStatus = AdminApprovalStatus.Pending
+        };
+
+        link.Broker = broker;
+        link.AccountType = accountType;
+        link.Status = BinollaLinkStatus.Connected;
+        link.LastConnectedAt = now;
+        link.UpdatedAt = now;
+        link.EncryptedBinollaEmail = _protector.Encrypt(request.Email.Trim());
+        link.EncryptedBinollaPassword = _protector.Encrypt(request.Password);
+        await _links.UpsertAsync(link, ct);
+
+        decimal? balance = null;
+        try
+        {
+            balance = (await client.GetBalanceAsync(ct)).CurrentBalance;
+        }
+        catch
+        {
+            // Balance is optional on connect; the next market call fetches it.
+        }
+
+        _logger.LogInformation(
+            "Broker {Broker} connected for user {UserId}", broker, userId);
+
+        // Access/approval come from the same gate as the Binolla path, so a Quotex user is
+        // held to identical admin approval rules.
+        var access = await _access.CheckAsync(userId, ct);
+
+        return new BinollaConnectResponse(
+            Connected: true,
+            AccountType: accountType.ToString(),
+            Access: AccountAppService.MapAccess(access.Access),
+            AdminApproved: access.AdminApproved,
+            ApprovalStatus: access.ApprovalStatus,
+            LastConnectedAt: link.LastConnectedAt,
+            Balance: balance);
+    }
+
     private static bool IsBrokerIpBlock(ApiException ex) =>
         ex.Message.Contains("HTTP 403", StringComparison.OrdinalIgnoreCase)
         || ex.Message.Contains("blocked this server IP", StringComparison.OrdinalIgnoreCase)

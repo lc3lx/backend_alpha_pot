@@ -35,12 +35,18 @@ public sealed class AccountAppService
             return _demo.BuildAccountStatus();
 
         var result = await _access.CheckAsync(_currentUser.UserId, ct);
+
+        // The link is the record of which venue this account belongs to; the app needs it
+        // to show the right signup/login links.
+        var link = await _links.GetByUserIdAsync(_currentUser.UserId, ct);
+
         return new AccountStatusResponse(
             BinollaConnected: result.BinollaConnected,
             AccountType: result.AccountType,
             AdminApproved: result.AdminApproved,
             ApprovalStatus: result.ApprovalStatus,
-            BotAccess: MapAccess(result.Access));
+            BotAccess: MapAccess(result.Access),
+            Broker: Brokers.Normalize(link?.Broker));
     }
 
     public async Task<AccountSubscriptionResponse> GetSubscriptionAsync(CancellationToken ct)

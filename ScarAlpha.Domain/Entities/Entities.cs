@@ -54,6 +54,12 @@ public class BinollaLink
 {
     public Guid Id { get; set; }
     public Guid UserId { get; set; }
+
+    /// <summary>
+    /// Which venue this link is for — see <c>Brokers</c>. Defaults to Binolla so every
+    /// account that predates the broker choice keeps working untouched.
+    /// </summary>
+    public string Broker { get; set; } = "binolla";
     public string EncryptedSsid { get; set; } = string.Empty;
     /// <summary>Optional Playwright cookies (encrypted) — required for reliable WS restore after API restart.</summary>
     public string? EncryptedCookieHeader { get; set; }

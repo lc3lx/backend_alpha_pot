@@ -46,13 +46,22 @@ public sealed record MeResponse(
 // Default is Real: live is the product's normal state and demo is an admin-granted
 // privilege. Leaving these at "Demo" meant a caller that simply omitted the field was
 // asking for the locked balance and got refused.
-public sealed record BinollaConnectRequest(string Ssid, string AccountType = "Real");
+public sealed record BinollaConnectRequest(
+    string Ssid,
+    string AccountType = "Real",
+    /// <summary>Venue the SSID belongs to. Omitted means Binolla.</summary>
+    string? Broker = null);
 
 public sealed record BinollaCredentialRequest(
     string Email,
     string Password,
     string AccountType = "Real",
-    string? ReferralCode = null);
+    string? ReferralCode = null,
+    /// <summary>
+    /// Which venue to sign in to — "binolla" or "quotex". Omitted means Binolla, so every
+    /// client that predates the choice keeps working unchanged.
+    /// </summary>
+    string? Broker = null);
 
 public sealed record BinollaAccountTypeRequest(string AccountType);
 
@@ -70,7 +79,13 @@ public sealed record AccountStatusResponse(
     string AccountType,
     bool AdminApproved,
     string ApprovalStatus,
-    string BotAccess);
+    string BotAccess,
+    /// <summary>
+    /// Venue this account is linked to. Drives which signup/login links the app shows —
+    /// pointing a Quotex user at Binolla loses the referral attribution as well as
+    /// confusing them. Defaults to Binolla for links created before the choice existed.
+    /// </summary>
+    string Broker = "binolla");
 
 public sealed record AccountSubscriptionResponse(
     string PlanName,

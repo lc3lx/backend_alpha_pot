@@ -77,6 +77,7 @@ public sealed class AppDbContext : DbContext
 
         modelBuilder.Entity<BinollaLink>(e =>
         {
+            e.Property(x => x.Broker).HasMaxLength(32).HasDefaultValue("binolla");
             e.ToTable("binolla_links");
             e.HasKey(x => x.Id);
             e.HasIndex(x => x.UserId).IsUnique();
