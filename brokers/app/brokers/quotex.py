@@ -35,15 +35,44 @@ from app.models import (
 )
 
 
+#: Where the client class has been found to live, newest layout first.
+#:
+#: The library is vendored from git rather than PyPI, so its import path is whatever that
+#: repository happens to use on the day it is cloned — and it does not match the
+#: distribution name (`pip install` reports `quotex-api`, while the package directory is
+#: `QuotexAPI`). Pinning one path turned a rename into a 409 on every Quotex login with
+#: nothing in the message naming the real cause, so every known layout is tried and the
+#: failure says exactly what was attempted.
+_CLIENT_PATHS: tuple[tuple[str, str], ...] = (
+    ("QuotexAPI.stable_api", "Quotex"),
+    ("QuotexAPI", "Quotex"),
+    ("QuotexAPI.api", "Quotex"),
+    ("QuotexAPI.client", "QuotexClient"),
+    ("quotexapi.stable_api", "Quotex"),
+    ("quotex_api.stable_api", "Quotex"),
+    ("pyquotex.stable_api", "Quotex"),
+)
+
+
 def _load_client_cls() -> Any:
-    try:
-        from quotexapi.stable_api import Quotex  # type: ignore
-    except ImportError as exc:  # pragma: no cover - depends on deployment
-        raise NotConnected(
-            "QuotexAPI is not installed in this environment. "
-            "Install it with: pip install -e ./vendor/QuotexAPI"
-        ) from exc
-    return Quotex
+    import importlib
+
+    attempted: list[str] = []
+    for module_name, attr in _CLIENT_PATHS:
+        attempted.append(f"{module_name}.{attr}")
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        client = getattr(module, attr, None)
+        if client is not None:
+            return client
+
+    raise NotConnected(
+        "The Quotex client library was not found. Tried: "
+        + ", ".join(attempted)
+        + ". Install it with: pip install -e ./vendor/QuotexAPI"
+    )
 
 
 class QuotexSession(BrokerSession):
