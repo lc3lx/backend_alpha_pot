@@ -10,3 +10,12 @@ run/
 scaralpha.env
 .env
 *.log
+
+# Broker gateway (Python): virtualenv, vendored library, and the streamed candle cache.
+# The cache is per-server state, not source — committing it would ship one machine's
+# price history to every other.
+brokers/.venv/
+brokers/vendor/
+brokers/var/
+brokers/**/__pycache__/
+brokers/*.egg-info/

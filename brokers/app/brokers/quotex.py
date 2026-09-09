@@ -9,10 +9,13 @@ Everything Quotex-specific stops here. The rest of the service, and all of .NET,
 the neutral types in `app.models`.
 
 **On candles.** This library has no history call. Its `DataService` streams candles and
-quotes and nothing more, so bars are accumulated here as they arrive. The consequence is
-load-bearing and must not be papered over: a pair that has just been subscribed has no
-history, so it cannot be analysed until enough bars have streamed in. `has_fresh_candles`
-answers honestly, and `get_candles` returns only what genuinely closed.
+quotes and nothing more, so bars are accumulated here as they arrive and persisted by
+`app.candle_store` so a restart does not throw the series away — without that, every
+deploy left each pair untradeable for hours while the warm-up re-accumulated.
+
+What remains true is that a pair subscribed for the FIRST time has no past, and cannot be
+analysed until enough bars have streamed in. `has_fresh_candles` answers honestly, and
+`get_candles` returns only bars that genuinely closed.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ import os
 import time
 from typing import Any
 
+from app.candle_store import CandleStore, trim
 from app.brokers.base import (
     AuthError,
     BlockedError,
@@ -59,11 +63,6 @@ _CLIENT_PATHS: tuple[tuple[str, str], ...] = (
     ("quotex_api.stable_api", "Quotex"),
     ("pyquotex.stable_api", "Quotex"),
 )
-
-#: How many bars to keep per (asset, timeframe). The RSI warm-up floor upstream is 150
-#: bars; this leaves room above it without holding a pointless amount per pair.
-_MAX_BARS = 400
-
 
 def _load_client_cls() -> Any:
     import importlib
@@ -137,6 +136,7 @@ class QuotexSession(BrokerSession):
         super().__init__(user_id)
         self._client: Any = None
         self._data: Any = None
+        self._store = CandleStore(self.broker)
         #: (asset, timeframe) -> {bar_start: [open, high, low, close, volume]}
         self._bars: dict[tuple[str, int], dict[int, list[float]]] = {}
         #: (asset, timeframe) -> monotonic time of the last bar update actually received.
@@ -219,6 +219,11 @@ class QuotexSession(BrokerSession):
         return False
 
     async def disconnect(self) -> None:
+        # Persist before tearing down: a clean shutdown is exactly when the newest bars
+        # are worth keeping, and the debounce may have skipped the last minute of them.
+        for (asset, period_seconds), bucket in self._bars.items():
+            self._store.save(asset, period_seconds, bucket, force=True)
+
         client, self._client = self._client, None
         self._data = None
         self.lifecycle = LifecycleState.DISCONNECTED
@@ -382,7 +387,10 @@ class QuotexSession(BrokerSession):
                 "built. The bot cannot analyse Quotex pairs without it."
             )
         self._data = data
-        self._bars[key] = {}
+        # Start from what survived the last run. This is the whole point of persisting:
+        # a pair with history on disk is analysable immediately instead of after hours
+        # of re-accumulation.
+        self._bars[key] = self._store.load(asset, period_seconds)
 
         try:
             await _maybe_await(data.subscribe_candles(asset, period_seconds))
@@ -435,11 +443,13 @@ class QuotexSession(BrokerSession):
                 existing[3] = close
                 existing[4] = max(existing[4], volume)
 
-            if len(bucket) > _MAX_BARS:
-                for old in sorted(bucket)[: len(bucket) - _MAX_BARS]:
-                    bucket.pop(old, None)
-
+            # Rolling window: whatever no longer fits drops off the far end, so the
+            # series holds its size instead of growing for ever.
+            trim(bucket, period_seconds)
             self._last_tick[key] = time.monotonic()
+            # Debounced inside the store — this fires per streamed tick, and writing
+            # each one would be hundreds of writes a minute per pair.
+            self._store.save(asset, period_seconds, bucket)
 
         return handle
 
