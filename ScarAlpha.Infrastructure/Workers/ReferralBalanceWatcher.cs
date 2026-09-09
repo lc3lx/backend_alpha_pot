@@ -18,16 +18,19 @@ namespace ScarAlpha.Infrastructure.Workers;
 public sealed class ReferralBalanceWatcher : BackgroundService
 {
     private readonly IServiceScopeFactory _scopeFactory;
-    private readonly IBinollaSessionManager _sessions;
+    private readonly IBrokerSessionManager _sessions;
+    private readonly IBrokerResolver _brokers;
     private readonly ILogger<ReferralBalanceWatcher> _logger;
 
     public ReferralBalanceWatcher(
         IServiceScopeFactory scopeFactory,
-        IBinollaSessionManager sessions,
+        IBrokerSessionManager sessions,
+        IBrokerResolver brokers,
         ILogger<ReferralBalanceWatcher> logger)
     {
         _scopeFactory = scopeFactory;
         _sessions = sessions;
+        _brokers = brokers;
         _logger = logger;
     }
 
@@ -64,7 +67,8 @@ public sealed class ReferralBalanceWatcher : BackgroundService
         {
             ct.ThrowIfCancellationRequested();
 
-            var client = _sessions.Get(q.ReferredUserId.ToString());
+            var broker = await _brokers.GetAsync(q.ReferredUserId, ct).ConfigureAwait(false);
+            var client = _sessions.Get(q.ReferredUserId, broker);
             if (client is null ||
                 client.Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected))
                 continue;

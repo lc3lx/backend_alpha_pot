@@ -11,7 +11,8 @@ namespace ScarAlpha.Application.Services;
 public sealed class MarketAppService
 {
     private readonly ICurrentUser _currentUser;
-    private readonly IBinollaSessionManager _sessions;
+    private readonly IBrokerSessionManager _sessions;
+    private readonly IBrokerResolver _brokers;
     private readonly IBotAccessService _botAccess;
     private readonly IBinollaSessionRestorer _restorer;
     private readonly IMarketingDemoService _demo;
@@ -19,7 +20,8 @@ public sealed class MarketAppService
 
     public MarketAppService(
         ICurrentUser currentUser,
-        IBinollaSessionManager sessions,
+        IBrokerSessionManager sessions,
+        IBrokerResolver brokers,
         IBotAccessService botAccess,
         IBinollaSessionRestorer restorer,
         IMarketingDemoService demo,
@@ -27,6 +29,7 @@ public sealed class MarketAppService
     {
         _currentUser = currentUser;
         _sessions = sessions;
+        _brokers = brokers;
         _botAccess = botAccess;
         _restorer = restorer;
         _demo = demo;
@@ -271,7 +274,7 @@ public sealed class MarketAppService
         catch (BinollaTimeoutException)
         {
             // Soft empty — FE retries; hard 500 blocked the chart shell after assets already worked.
-            var wire = client.DescribeMarketWireState();
+            var wire = client.DescribeState();
             _logger.LogInformation(
                 "Market candles not ready for user {UserId} asset={Asset} period={Period}; returning empty; wire={Wire}",
                 _currentUser.UserId, symbol, wirePeriod, wire);
@@ -325,19 +328,20 @@ public sealed class MarketAppService
     /// Prefer a live in-memory session. Restore is background-only so a rejected upstream
     /// credential never turns browser polling into a socket-handshake wait.
     /// </summary>
-    private Task<IBinollaClient?> EnsureLiveClientAsync(CancellationToken ct)
+    private async Task<IBrokerClient?> EnsureLiveClientAsync(CancellationToken ct)
     {
-        var live = FindLiveClient();
+        var live = await FindLiveClientAsync(ct).ConfigureAwait(false);
         if (live is not null)
-            return Task.FromResult<IBinollaClient?>(live);
+            return live;
 
         _restorer.EnsureBackgroundRestore(_currentUser.UserId);
-        return Task.FromResult<IBinollaClient?>(null);
+        return null;
     }
 
-    private IBinollaClient? FindLiveClient()
+    private async Task<IBrokerClient?> FindLiveClientAsync(CancellationToken ct)
     {
-        var client = _sessions.Get(_currentUser.UserId.ToString());
+        var broker = await _brokers.GetAsync(_currentUser.UserId, ct).ConfigureAwait(false);
+        var client = _sessions.Get(_currentUser.UserId, broker);
         if (client is not null &&
             client.IsTransportConnected &&
             client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)

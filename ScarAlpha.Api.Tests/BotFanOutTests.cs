@@ -95,7 +95,7 @@ public sealed class BotFanOutTests
     public void An_empty_decision_produces_no_entry()
     {
         var empty = new CohortDecision(
-            SignalCohort.For("rsi", 300), BarClose, Array.Empty<CohortCandidate>(), AssetsScanned: 12);
+            SignalCohort.For(Brokers.Binolla, "rsi", 300), BarClose, Array.Empty<CohortCandidate>(), AssetsScanned: 12);
 
         BotSignalWorker.SelectForBot(new[] { "AUDCHF_otc" }, empty).Should().BeNull();
     }
@@ -173,7 +173,7 @@ public sealed class BotFanOutTests
 
     private static CohortDecision Decision(params (string Asset, string Direction)[] candidates) =>
         new(
-            SignalCohort.For("rsi", 300),
+            SignalCohort.For(Brokers.Binolla, "rsi", 300),
             BarClose,
             candidates
                 .Select(c => new CohortCandidate(

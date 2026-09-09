@@ -29,6 +29,7 @@ public sealed class CredentialLoginBackoffTests
         return new BinollaSessionRestoreService(
             services.GetRequiredService<IServiceScopeFactory>(),
             new Mock<IBinollaSessionManager>(MockBehavior.Loose).Object,
+            new Mock<IBrokerSessionManager>(MockBehavior.Loose).Object,
             new Mock<ISecretProtector>(MockBehavior.Loose).Object,
             Options.Create(new BinollaSessionRestoreOptions
             {

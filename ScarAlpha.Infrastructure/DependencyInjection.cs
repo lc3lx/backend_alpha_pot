@@ -193,13 +193,21 @@ public static class DependencyInjection
         services.AddHttpClient(BrokerGatewayDefaults.HttpClientName, http =>
         {
             http.BaseAddress = new Uri(gatewayUrl);
-            // A broker call must not hang a worker tick; the gateway has its own timeouts.
-            http.Timeout = TimeSpan.FromSeconds(45);
+            // No single ceiling fits both kinds of call: a quote must not hang a worker
+            // tick, while waiting for a 15-minute expiry to close legitimately takes
+            // longer than any sane socket timeout. BrokerGatewayClient therefore gives
+            // every request its own deadline, and this one is disabled rather than
+            // silently cutting a long outcome wait short.
+            http.Timeout = Timeout.InfiniteTimeSpan;
             if (!string.IsNullOrWhiteSpace(gatewayToken))
                 http.DefaultRequestHeaders.Add("X-Gateway-Token", gatewayToken);
         });
 
         services.AddSingleton<IBrokerSessionManager, BrokerSessionManager>();
+
+        // Singleton so the venue lookup is one cached read on the hot signal path rather
+        // than a query per pair per scan.
+        services.AddSingleton<IBrokerResolver, BrokerResolver>();
 
         services.Configure<BinollaSessionRestoreOptions>(options =>
         {

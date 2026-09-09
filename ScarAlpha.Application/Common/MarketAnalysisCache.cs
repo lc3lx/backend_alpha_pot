@@ -41,6 +41,7 @@ public sealed class MarketAnalysisCache
     /// account through will retry.
     /// </summary>
     public async Task<MarketAnalysis?> GetOrAddAsync(
+        string broker,
         string asset,
         int timeframeSeconds,
         DateTimeOffset now,
@@ -52,7 +53,7 @@ public sealed class MarketAnalysisCache
         if (timeframeSeconds <= 0)
             throw new ArgumentOutOfRangeException(nameof(timeframeSeconds));
 
-        var key = Key(asset, timeframeSeconds);
+        var key = Key(broker, asset, timeframeSeconds);
         var expectedBar = CurrentClosedBarTime(now, timeframeSeconds);
         var entry = _entries.GetOrAdd(key, _ => new Entry());
 
@@ -85,10 +86,10 @@ public sealed class MarketAnalysisCache
     }
 
     /// <summary>Latest published analysis for a pair, if it is still current.</summary>
-    public MarketAnalysis? TryGet(string asset, int timeframeSeconds, DateTimeOffset now)
+    public MarketAnalysis? TryGet(string broker, string asset, int timeframeSeconds, DateTimeOffset now)
     {
         if (string.IsNullOrWhiteSpace(asset)) return null;
-        if (!_entries.TryGetValue(Key(asset, timeframeSeconds), out var entry)) return null;
+        if (!_entries.TryGetValue(Key(broker, asset, timeframeSeconds), out var entry)) return null;
         var expected = CurrentClosedBarTime(now, timeframeSeconds);
         return IsFresh(entry.Value, expected) ? entry.Value : null;
     }
@@ -120,8 +121,14 @@ public sealed class MarketAnalysisCache
         }
     }
 
-    private static string Key(string asset, int timeframeSeconds) =>
-        $"{asset.Trim().ToUpperInvariant()}:{timeframeSeconds}";
+    /// <summary>
+    /// Cache key. The BROKER is part of it: EURUSD on Binolla and EURUSD on Quotex are
+    /// different price series from different venues. Sharing one entry between them would
+    /// hand a Quotex user Binolla's candles and place their trade on a price that never
+    /// existed on their own account.
+    /// </summary>
+    private static string Key(string broker, string asset, int timeframeSeconds) =>
+        $"{broker.Trim().ToLowerInvariant()}:{asset.Trim().ToUpperInvariant()}:{timeframeSeconds}";
 }
 
 /// <summary>

@@ -88,7 +88,20 @@ public interface IBrokerClient
 
     Task<TradeOutcome> WaitOutcomeAsync(string orderId, CancellationToken ct = default);
 
+    /// <summary>
+    /// Waits for the close of one order, giving up after <paramref name="timeout"/>.
+    ///
+    /// <para>The budget is the caller's, not the broker's: the outcome worker sizes it from
+    /// the trade's own duration so its wait always ends BEFORE the stuck-trade sweep's
+    /// deadline. When the two race, the sweep stamps Unknown over a waiter that was still
+    /// legitimately waiting.</para>
+    /// </summary>
+    Task<TradeOutcome> WaitOutcomeAsync(string orderId, TimeSpan timeout, CancellationToken ct = default);
+
     bool TryGetClosedPnl(string orderId, out decimal profitLoss);
+
+    /// <summary>One-line connection state, for logs only. Never parsed.</summary>
+    string DescribeState();
 
     Task DisconnectAsync(CancellationToken ct = default);
 }
@@ -135,3 +148,20 @@ public sealed record BrokerCredentials(
     string? Email = null,
     string? Password = null,
     AccountType AccountType = AccountType.Real);
+
+/// <summary>
+/// Which broker a user is linked to, cached.
+///
+/// <para>The signal path asks this for every pair in every scan — dozens of times a bar
+/// per user — so it cannot be a database read each time. The value only changes when a
+/// user re-links their account, which is rare and explicit, so a short TTL plus a direct
+/// invalidation on connect keeps it correct without the query cost.</para>
+/// </summary>
+public interface IBrokerResolver
+{
+    /// <summary>The user's broker, falling back to Binolla for links that predate the choice.</summary>
+    Task<string> GetAsync(Guid userId, CancellationToken ct = default);
+
+    /// <summary>Drops a cached value. Call after a user connects or switches venue.</summary>
+    void Invalidate(Guid userId);
+}

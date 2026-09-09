@@ -11,7 +11,7 @@ namespace ScarAlpha.Application.Common;
 /// reason for them to reach different conclusions — and every observed divergence came
 /// from WHEN each user happened to be scanned, not from what the market did.
 /// </summary>
-public readonly record struct SignalCohort(string StrategyId, int ExpiryCandles)
+public readonly record struct SignalCohort(string Broker, string StrategyId, int ExpiryCandles)
 {
     /// <summary>
     /// Groups bots by what actually changes the decision.
@@ -24,13 +24,16 @@ public readonly record struct SignalCohort(string StrategyId, int ExpiryCandles)
     /// is exactly the split this cohort exists to prevent. Keying on the derived options
     /// collapses them into one analysis shared by everyone on that strategy.</para>
     /// </summary>
-    public static SignalCohort For(string? strategyId, int durationSeconds)
+    public static SignalCohort For(string? broker, string? strategyId, int durationSeconds)
     {
         var id = (strategyId ?? "rsi").Trim().ToLowerInvariant();
-        return new SignalCohort(id, RsiStrategyOptions.FromBotDurationSeconds(durationSeconds).ExpiryCandles);
+        return new SignalCohort(
+            Brokers.Normalize(broker),
+            id,
+            RsiStrategyOptions.FromBotDurationSeconds(durationSeconds).ExpiryCandles);
     }
 
-    public override string ToString() => $"{StrategyId}:x{ExpiryCandles}";
+    public override string ToString() => $"{Broker}:{StrategyId}:x{ExpiryCandles}";
 }
 
 /// <summary>

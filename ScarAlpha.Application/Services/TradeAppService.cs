@@ -18,6 +18,7 @@ public sealed class TradeAppService
     private readonly ITradeRepository _trades;
     private readonly IBinollaLinkRepository _links;
     private readonly IBinollaSessionManager _sessions;
+    private readonly IBrokerSessionManager _brokers;
     private readonly ITradeOutcomeWorker _outcomeWorker;
     private readonly IIdempotencyGate _idempotencyGate;
     private readonly IBotAccessService _botAccess;
@@ -32,6 +33,7 @@ public sealed class TradeAppService
         ITradeRepository trades,
         IBinollaLinkRepository links,
         IBinollaSessionManager sessions,
+        IBrokerSessionManager brokers,
         ITradeOutcomeWorker outcomeWorker,
         IIdempotencyGate idempotencyGate,
         IBotAccessService botAccess,
@@ -45,6 +47,7 @@ public sealed class TradeAppService
         _trades = trades;
         _links = links;
         _sessions = sessions;
+        _brokers = brokers;
         _outcomeWorker = outcomeWorker;
         _idempotencyGate = idempotencyGate;
         _botAccess = botAccess;
@@ -90,11 +93,16 @@ public sealed class TradeAppService
         if (link is null || link.Status != BinollaLinkStatus.Connected)
             throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Connect Binolla before trading.", 409);
 
-        var client = _sessions.Get(userId.ToString());
+        // Trade on whichever venue this user is linked to — the link is the record of it.
+        var broker = Brokers.Normalize(link.Broker);
+        var client = _brokers.Get(userId, broker);
         if (client is null ||
             client.Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected))
         {
-            throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Binolla session is not connected.", 409);
+            throw new ApiException(
+                ApiErrorCodes.BinollaNotConnected,
+                $"{broker} session is not connected.",
+                409);
         }
 
         // Authoritative balance check from live Binolla session (not a local wallet).

@@ -65,8 +65,14 @@ public sealed class BinollaBrokerAdapter : IBrokerClient
     public Task<TradeOutcome> WaitOutcomeAsync(string orderId, CancellationToken ct = default) =>
         _inner.WaitOutcomeAsync(orderId, ct);
 
+    public Task<TradeOutcome> WaitOutcomeAsync(
+        string orderId, TimeSpan timeout, CancellationToken ct = default) =>
+        _inner.WaitOutcomeAsync(orderId, timeout, ct);
+
     public bool TryGetClosedPnl(string orderId, out decimal profitLoss) =>
         _inner.TryGetClosedPnl(orderId, out profitLoss);
+
+    public string DescribeState() => _inner.DescribeMarketWireState();
 
     public Task DisconnectAsync(CancellationToken ct = default) =>
         _inner.DisconnectAsync(ct);

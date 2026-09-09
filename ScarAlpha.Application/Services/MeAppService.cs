@@ -11,14 +11,14 @@ public sealed class MeAppService
     private readonly ICurrentUser _currentUser;
     private readonly IUserRepository _users;
     private readonly IBinollaLinkRepository _links;
-    private readonly IBinollaSessionManager _sessions;
+    private readonly IBrokerSessionManager _sessions;
     private readonly IMarketingDemoService _demo;
 
     public MeAppService(
         ICurrentUser currentUser,
         IUserRepository users,
         IBinollaLinkRepository links,
-        IBinollaSessionManager sessions,
+        IBrokerSessionManager sessions,
         IMarketingDemoService demo)
     {
         _currentUser = currentUser;
@@ -51,7 +51,7 @@ public sealed class MeAppService
         }
 
         var link = await _links.GetByUserIdAsync(user.Id, ct);
-        var client = _sessions.Get(user.Id.ToString());
+        var client = _sessions.Get(user.Id, Brokers.Normalize(link?.Broker));
         var liveConnected = client is not null &&
                             client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected;
 

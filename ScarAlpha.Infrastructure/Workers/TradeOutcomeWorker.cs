@@ -13,7 +13,8 @@ namespace ScarAlpha.Infrastructure.Workers;
 public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
 {
     private readonly IServiceScopeFactory _scopeFactory;
-    private readonly IBinollaSessionManager _sessions;
+    private readonly IBrokerSessionManager _sessions;
+    private readonly IBrokerResolver _brokers;
     private readonly IBinollaSessionRestorer _sessionRestorer;
     private readonly ILogger<TradeOutcomeWorker> _logger;
     /// <summary>
@@ -36,12 +37,14 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
 
     public TradeOutcomeWorker(
         IServiceScopeFactory scopeFactory,
-        IBinollaSessionManager sessions,
+        IBrokerSessionManager sessions,
+        IBrokerResolver brokers,
         IBinollaSessionRestorer sessionRestorer,
         ILogger<TradeOutcomeWorker> logger)
     {
         _scopeFactory = scopeFactory;
         _sessions = sessions;
+        _brokers = brokers;
         _sessionRestorer = sessionRestorer;
         _logger = logger;
     }
@@ -150,7 +153,7 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
                     // After expected expiry, keep trying to attach outcome waiter.
                     if (now >= expectedEnd)
                     {
-                        var client = _sessions.Get(trade.UserId.ToString());
+                        var client = await ClientForAsync(trade.UserId, ct).ConfigureAwait(false);
                         if (client is not null &&
                             client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
                         {
@@ -234,7 +237,7 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
                     continue;
                 }
 
-                var client = _sessions.Get(trade.UserId.ToString());
+                var client = await ClientForAsync(trade.UserId, ct).ConfigureAwait(false);
                 if (client is not null &&
                     client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
                 {
@@ -296,7 +299,7 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
     private async Task ProcessAsync(WorkItem item, CancellationToken ct)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var client = _sessions.Get(item.UserId.ToString());
+        var client = await ClientForAsync(item.UserId, ct).ConfigureAwait(false);
         if (client is null)
         {
             await using var orphanScope = _scopeFactory.CreateAsyncScope();
@@ -365,7 +368,7 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
             _logger.LogWarning(ex, "WaitOutcome failed for trade {TradeId}", item.TradeId);
 
             // Close may already be buffered — peek cache once.
-            if (ex is BinollaTimeoutException)
+            if (IsTimeout(ex, ct))
             {
                 try
                 {
@@ -388,7 +391,7 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
 
                 var deadline = createdAt.AddSeconds(durationSeconds + 900);
                 var canRetry = DateTimeOffset.UtcNow < deadline && item.Attempt < 4;
-                if (ex is BinollaTimeoutException && canRetry)
+                if (IsTimeout(ex, ct) && canRetry)
                 {
                     if (failTrade.Status == TradeStatus.Unknown)
                         await ApplyStatusAsync(failTrades, failTrade, TradeStatus.Running, null, null, ct);
@@ -410,8 +413,9 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
 
                 if (!TradeStateMachine.IsHardTerminal(failTrade.Status))
                 {
-                    var nextFail = ex is BinollaTimeoutException ? TradeStatus.Unknown : TradeStatus.Failed;
-                    var code = ex is BinollaTimeoutException ? "OUTCOME_TIMEOUT" : "BINOLLA_CONNECTION_FAILED";
+                    var timedOut = IsTimeout(ex, ct);
+                    var nextFail = timedOut ? TradeStatus.Unknown : TradeStatus.Failed;
+                    var code = timedOut ? "OUTCOME_TIMEOUT" : "BROKER_CONNECTION_FAILED";
                     await ApplyStatusAsync(failTrades, failTrade, nextFail, null, code, ct);
                     // #region agent log
                     ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
@@ -569,6 +573,29 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
         status = TradeStatus.Running;
         return true;
     }
+
+    /// <summary>
+    /// The user's live client on whichever venue they trade. Resolved per trade rather
+    /// than assumed: a Quotex order can only be settled by asking Quotex, and handing it
+    /// to Binolla's session would leave it open until the sweep gave up on it.
+    /// </summary>
+    private async Task<IBrokerClient?> ClientForAsync(Guid userId, CancellationToken ct)
+    {
+        var broker = await _brokers.GetAsync(userId, ct).ConfigureAwait(false);
+        return _sessions.Get(userId, broker);
+    }
+
+    /// <summary>
+    /// "The close did not arrive in time" — which is a retry, not a failure.
+    ///
+    /// <para>Each broker signals it differently: Binolla raises its own timeout type, while
+    /// the gateway bounds the request itself and surfaces a cancellation. Only the caller's
+    /// own token means a genuine shutdown.</para>
+    /// </summary>
+    private static bool IsTimeout(Exception ex, CancellationToken ct) =>
+        ex is BinollaTimeoutException
+        || ex is TimeoutException
+        || (ex is OperationCanceledException && !ct.IsCancellationRequested);
 
     private sealed record WorkItem(Guid TradeId, Guid UserId, string BinollaOrderId, int Attempt);
 

@@ -395,13 +395,17 @@ public sealed class Phase3TradingHardeningTests : IClassFixture<ApiFactory>
         db.Trades.Add(trade);
         await db.SaveChangesAsync();
 
-        var sessions = new Mock<IBinollaSessionManager>(MockBehavior.Loose);
-        sessions.Setup(s => s.Get(It.IsAny<string>())).Returns((IBinollaClient?)null);
+        var sessions = new Mock<IBrokerSessionManager>(MockBehavior.Loose);
+        sessions.Setup(s => s.Get(It.IsAny<Guid>(), It.IsAny<string>())).Returns((IBrokerClient?)null);
+        var brokers = new Mock<IBrokerResolver>(MockBehavior.Loose);
+        brokers.Setup(b => b.GetAsync(It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Brokers.Binolla);
         var restorer = new Mock<IBinollaSessionRestorer>(MockBehavior.Loose);
         restorer.SetupGet(r => r.WhenInitialRestoreCompleted).Returns(Task.CompletedTask);
         var worker = new TradeOutcomeWorker(
             _factory.Services.GetRequiredService<IServiceScopeFactory>(),
             sessions.Object,
+            brokers.Object,
             restorer.Object,
             NullLogger<TradeOutcomeWorker>.Instance);
 

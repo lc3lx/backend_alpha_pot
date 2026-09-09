@@ -59,6 +59,7 @@ public sealed class BotSignalWorker : IHostedService
     private readonly IBotRuntimeService _botRuntime;
     private readonly CohortSignalCache _decisions;
     private readonly IBotMaintenanceService _maintenance;
+    private readonly IBrokerResolver _brokerResolver;
     private readonly ILogger<BotSignalWorker> _logger;
     private CancellationTokenSource? _cts;
     private Task? _loop;
@@ -68,12 +69,14 @@ public sealed class BotSignalWorker : IHostedService
         IBotRuntimeService botRuntime,
         CohortSignalCache decisions,
         IBotMaintenanceService maintenance,
+        IBrokerResolver brokerResolver,
         ILogger<BotSignalWorker> logger)
     {
         _scopeFactory = scopeFactory;
         _botRuntime = botRuntime;
         _decisions = decisions;
         _maintenance = maintenance;
+        _brokerResolver = brokerResolver;
         _logger = logger;
     }
 
@@ -162,8 +165,19 @@ public sealed class BotSignalWorker : IHostedService
             .ToList();
         if (running.Count == 0) return;
 
-        var cohorts = running
-            .GroupBy(b => SignalCohort.For(b.StrategyId, b.DurationSeconds))
+        // Group by venue as well as strategy. Two users on the same strategy but different
+        // brokers are looking at different price series, so they cannot share one decision —
+        // pooling them would hand a Quotex user an entry priced on Binolla's book.
+        var withBroker = new List<(BotRuntimeConfig Bot, string Broker)>(running.Count);
+        foreach (var bot in running)
+        {
+            var broker = await _brokerResolver.GetAsync(bot.UserId, ct).ConfigureAwait(false);
+            withBroker.Add((bot, broker));
+        }
+
+        var cohorts = withBroker
+            .GroupBy(x => SignalCohort.For(x.Broker, x.Bot.StrategyId, x.Bot.DurationSeconds))
+            .Select(g => (Key: g.Key, Bots: g.Select(x => x.Bot).ToList()))
             .ToList();
 
         await Parallel.ForEachAsync(
@@ -173,7 +187,7 @@ public sealed class BotSignalWorker : IHostedService
             {
                 try
                 {
-                    await ProcessCohortAsync(group.Key, group.ToList(), token).ConfigureAwait(false);
+                    await ProcessCohortAsync(group.Key, group.Bots, token).ConfigureAwait(false);
                 }
                 catch (ObjectDisposedException ex)
                 {
@@ -305,11 +319,11 @@ public sealed class BotSignalWorker : IHostedService
         {
             await using var scope = _scopeFactory.CreateAsyncScope();
             var trades = scope.ServiceProvider.GetRequiredService<ITradeRepository>();
-            var sessions = scope.ServiceProvider.GetRequiredService<IBinollaSessionManager>();
+            var sessions = scope.ServiceProvider.GetRequiredService<IBrokerSessionManager>();
             var restorer = scope.ServiceProvider.GetRequiredService<IBinollaSessionRestorer>();
 
             // Auto-heal Binolla session so Running bots keep trading without manual Start.
-            var client = sessions.Get(bot.UserId.ToString());
+            var client = sessions.Get(bot.UserId, await _brokerResolver.GetAsync(bot.UserId, ct).ConfigureAwait(false));
             if (client is null ||
                 !client.IsTransportConnected ||
                 client.Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected))
@@ -404,7 +418,7 @@ public sealed class BotSignalWorker : IHostedService
             .ToList();
         if (ordered.Count == 0) return null;
 
-        ordered = (await FilterTradableByPayoutAsync(eligible, ordered, ct).ConfigureAwait(false)).ToList();
+        ordered = (await FilterTradableByPayoutAsync(cohort.Broker, eligible, ordered, ct).ConfigureAwait(false)).ToList();
         if (ordered.Count == 0) return null;
         var timeframe = StrategyTimeframes.For(cohort.StrategyId);
 
@@ -510,6 +524,7 @@ public sealed class BotSignalWorker : IHostedService
     /// unchanged so the scan can still proceed once assets arrive.
     /// </summary>
     private async Task<IReadOnlyList<string>> FilterTradableByPayoutAsync(
+        string broker,
         IReadOnlyList<BotRuntimeConfig> eligible,
         IReadOnlyList<string> assets,
         CancellationToken ct)
@@ -521,8 +536,8 @@ public sealed class BotSignalWorker : IHostedService
             try
             {
                 await using var scope = _scopeFactory.CreateAsyncScope();
-                var sessions = scope.ServiceProvider.GetRequiredService<IBinollaSessionManager>();
-                var client = sessions.Get(scanUser.UserId.ToString());
+                var sessions = scope.ServiceProvider.GetRequiredService<IBrokerSessionManager>();
+                var client = sessions.Get(scanUser.UserId, broker);
                 if (client is null ||
                     !client.IsTransportConnected ||
                     client.Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected))

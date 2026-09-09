@@ -68,6 +68,7 @@ public sealed class BrokerGatewayClient : IBrokerClient
     {
         Lifecycle = SessionLifecycleState.Connecting;
 
+        using var deadline = Deadline(ct, TimeSpan.FromSeconds(90));
         var response = await _http.PostAsJsonAsync(
             "/sessions/connect",
             new
@@ -80,7 +81,7 @@ public sealed class BrokerGatewayClient : IBrokerClient
                 account_type = credentials.AccountType.ToString()
             },
             Json,
-            ct).ConfigureAwait(false);
+            deadline.Token).ConfigureAwait(false);
 
         if (!response.IsSuccessStatusCode)
         {
@@ -111,11 +112,12 @@ public sealed class BrokerGatewayClient : IBrokerClient
         // Re-connecting is how the balance is switched: the gateway applies the account
         // type during the handshake, because switching afterwards races the broker's own
         // setup and can leave the socket on the other balance.
+        using var deadline = Deadline(ct, TimeSpan.FromSeconds(90));
         var response = await _http.PostAsync(
             $"/sessions/connect?user_id={Uri.EscapeDataString(UserId)}&broker={Broker}"
             + $"&account_type={accountType}",
             content: null,
-            ct).ConfigureAwait(false);
+            deadline.Token).ConfigureAwait(false);
 
         if (!response.IsSuccessStatusCode)
             throw await TranslateAsync(response, ct).ConfigureAwait(false);
@@ -193,7 +195,9 @@ public sealed class BrokerGatewayClient : IBrokerClient
     {
         var query = $"user_id={Uri.EscapeDataString(UserId)}&broker={Broker}"
                     + $"&asset={Uri.EscapeDataString(asset)}&period_seconds={periodSeconds}";
-        var response = await _http.PostAsync($"/market/subscribe?{query}", content: null, ct)
+        using var deadline = Deadline(ct);
+        var response = await _http
+            .PostAsync($"/market/subscribe?{query}", content: null, deadline.Token)
             .ConfigureAwait(false);
 
         if (response.IsSuccessStatusCode)
@@ -236,6 +240,9 @@ public sealed class BrokerGatewayClient : IBrokerClient
         int durationSeconds,
         CancellationToken ct = default)
     {
+        // An order is time-critical: if it cannot go out promptly it must fail, not sit
+        // in a socket while the bar it was priced on passes.
+        using var deadline = Deadline(ct, TimeSpan.FromSeconds(20));
         var response = await _http.PostAsJsonAsync(
             "/orders",
             new
@@ -248,7 +255,7 @@ public sealed class BrokerGatewayClient : IBrokerClient
                 direction = direction == TradeDirection.Call ? "CALL" : "PUT"
             },
             Json,
-            ct).ConfigureAwait(false);
+            deadline.Token).ConfigureAwait(false);
 
         if (!response.IsSuccessStatusCode)
             throw await TranslateAsync(response, ct).ConfigureAwait(false);
@@ -271,10 +278,21 @@ public sealed class BrokerGatewayClient : IBrokerClient
         };
     }
 
-    public async Task<TradeOutcome> WaitOutcomeAsync(string orderId, CancellationToken ct = default)
+    public Task<TradeOutcome> WaitOutcomeAsync(string orderId, CancellationToken ct = default) =>
+        WaitOutcomeAsync(orderId, TimeSpan.FromSeconds(120), ct);
+
+    public async Task<TradeOutcome> WaitOutcomeAsync(
+        string orderId, TimeSpan timeout, CancellationToken ct = default)
     {
-        var query = $"order_id={Uri.EscapeDataString(orderId)}&timeout_seconds=120";
-        var dto = await GetAsync<OutcomeDto>("/orders/outcome", query, ct).ConfigureAwait(false);
+        // Kept under the HttpClient's own 45s ceiling would be wrong the other way: the
+        // gateway holds the request open for the whole wait, so the socket timeout has to
+        // be the larger of the two or a long expiry is cut off mid-wait.
+        var seconds = (int)Math.Clamp(timeout.TotalSeconds, 5, 3600);
+        var query = $"order_id={Uri.EscapeDataString(orderId)}&timeout_seconds={seconds}";
+        // Slack over the gateway's own wait, so it is the gateway that decides the answer
+        // is not coming rather than the socket giving up first.
+        var dto = await GetAsync<OutcomeDto>(
+            "/orders/outcome", query, ct, TimeSpan.FromSeconds(seconds + 15)).ConfigureAwait(false);
 
         var result = dto.Result switch
         {
@@ -303,6 +321,10 @@ public sealed class BrokerGatewayClient : IBrokerClient
     public bool TryGetClosedPnl(string orderId, out decimal profitLoss) =>
         _closedPnl.TryGetValue(orderId, out profitLoss);
 
+    public string DescribeState() =>
+        $"{Broker} gateway lifecycle={Lifecycle} transport={IsTransportConnected} "
+        + $"warmKeys={_warm.Count} quotes={_quotes.Count}";
+
     public async Task DisconnectAsync(CancellationToken ct = default)
     {
         IsTransportConnected = false;
@@ -310,7 +332,9 @@ public sealed class BrokerGatewayClient : IBrokerClient
         try
         {
             var query = $"user_id={Uri.EscapeDataString(UserId)}&broker={Broker}";
-            await _http.PostAsync($"/sessions/disconnect?{query}", content: null, ct)
+            using var deadline = Deadline(ct, TimeSpan.FromSeconds(15));
+            await _http
+                .PostAsync($"/sessions/disconnect?{query}", content: null, deadline.Token)
                 .ConfigureAwait(false);
         }
         catch (Exception ex)
@@ -321,12 +345,33 @@ public sealed class BrokerGatewayClient : IBrokerClient
         }
     }
 
-    private async Task<T> GetAsync<T>(string path, string? query, CancellationToken ct)
+    /// <summary>
+    /// Default budget for an ordinary call. Long enough for the gateway's own retries,
+    /// short enough that a stalled broker cannot hold a worker tick open.
+    /// </summary>
+    private static readonly TimeSpan CallBudget = TimeSpan.FromSeconds(45);
+
+    /// <summary>
+    /// Bounds one request. The HttpClient's own timeout is disabled precisely so that
+    /// each call can choose, so every request must pass through one of these.
+    /// </summary>
+    private static CancellationTokenSource Deadline(CancellationToken ct, TimeSpan? budget = null)
+    {
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cts.CancelAfter(budget ?? CallBudget);
+        return cts;
+    }
+
+    private async Task<T> GetAsync<T>(
+        string path, string? query, CancellationToken ct, TimeSpan? budget = null)
     {
         var url = $"{path}?user_id={Uri.EscapeDataString(UserId)}&broker={Broker}"
                   + (string.IsNullOrEmpty(query) ? string.Empty : "&" + query);
 
-        var response = await _http.GetAsync(url, ct).ConfigureAwait(false);
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(budget ?? CallBudget);
+
+        var response = await _http.GetAsync(url, deadline.Token).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
             throw await TranslateAsync(response, ct).ConfigureAwait(false);
 

@@ -21,6 +21,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
 {
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IBinollaSessionManager _sessions;
+    private readonly IBrokerSessionManager _brokerSessions;
     private readonly ISecretProtector _protector;
     private readonly BinollaSessionRestoreOptions _options;
     private readonly ILogger<BinollaSessionRestoreService> _logger;
@@ -34,12 +35,14 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
     public BinollaSessionRestoreService(
         IServiceScopeFactory scopeFactory,
         IBinollaSessionManager sessions,
+        IBrokerSessionManager brokerSessions,
         ISecretProtector protector,
         IOptions<BinollaSessionRestoreOptions> options,
         ILogger<BinollaSessionRestoreService> logger)
     {
         _scopeFactory = scopeFactory;
         _sessions = sessions;
+        _brokerSessions = brokerSessions;
         _protector = protector;
         _options = options.Value;
         _logger = logger;
@@ -101,7 +104,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
             targets = all
                 .Where(l =>
                     l.Status == BinollaLinkStatus.Connected &&
-                    !string.IsNullOrWhiteSpace(l.EncryptedSsid) &&
+                    HasRestorableSecret(l) &&
                     (l.ApprovalStatus == AdminApprovalStatus.Approved ||
                      l.ApprovalStatus == AdminApprovalStatus.Pending) &&
                     l.ApprovalStatus != AdminApprovalStatus.Rejected)
@@ -312,6 +315,88 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
         });
     }
 
+    /// <summary>
+    /// Whether a link can be brought back up without the user typing anything: an SSID for
+    /// Binolla, a stored credential pair for a gateway broker.
+    /// </summary>
+    private static bool HasRestorableSecret(Domain.Entities.BinollaLink link) =>
+        Brokers.Normalize(link.Broker) == Brokers.Binolla
+            ? !string.IsNullOrWhiteSpace(link.EncryptedSsid)
+            : !string.IsNullOrWhiteSpace(link.EncryptedBinollaEmail)
+              && !string.IsNullOrWhiteSpace(link.EncryptedBinollaPassword);
+
+    /// <summary>
+    /// Reconnects one gateway-backed broker session. Single attempt on purpose: the gateway
+    /// runs its own throttle and backoff, and a second layer of retries stacked on top is
+    /// what turned a refused login into sustained hammering of the broker.
+    /// </summary>
+    private async Task<bool> RestoreGatewayLinkAsync(
+        Guid userId,
+        Guid linkId,
+        string broker,
+        string? emailCipher,
+        string? passwordCipher,
+        EngineAccount accountType)
+    {
+        var existing = _brokerSessions.Get(userId, broker);
+        if (existing is not null &&
+            existing.IsTransportConnected &&
+            existing.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
+        {
+            return true;
+        }
+
+        if (string.IsNullOrWhiteSpace(emailCipher) || string.IsNullOrWhiteSpace(passwordCipher))
+            return false;
+
+        string email, password;
+        try
+        {
+            email = _protector.Decrypt(emailCipher);
+            password = _protector.Decrypt(passwordCipher);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex, "Session restore: {Broker} credential decrypt failed for user {UserId}", broker, userId);
+            await MarkLinkDisconnectedAsync(userId, "DECRYPT_FAILED", CancellationToken.None)
+                .ConfigureAwait(false);
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(password))
+            return false;
+
+        try
+        {
+            await _brokerSessions.GetOrCreateAsync(
+                    userId,
+                    broker,
+                    new BrokerCredentials(
+                        Email: email, Password: password, AccountType: accountType),
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+
+            await TouchLastConnectedAsync(userId, CancellationToken.None).ConfigureAwait(false);
+            _authFailed.TryRemove(userId, out _);
+            _retryAfterUtc.TryRemove(userId, out _);
+
+            _logger.LogInformation(
+                "Session restore: connected user {UserId} on {Broker} link={LinkId}",
+                userId, broker, linkId);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            // Left Connected deliberately: the link is still valid and the next sweep or the
+            // next page load retries. Marking it Disconnected on a transient gateway failure
+            // would push a working account back to the login screen.
+            _logger.LogWarning(
+                ex, "Session restore: {Broker} reconnect failed for user {UserId}", broker, userId);
+            return false;
+        }
+    }
+
     private bool IsLive(Guid userId)
     {
         var client = _sessions.Get(userId.ToString());
@@ -353,6 +438,10 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
 
             string? ciphertext = null;
             string? cookieCipher = null;
+            string broker = Brokers.Binolla;
+            string? emailCipher = null;
+            string? passwordCipher = null;
+            EngineAccount gatewayAccountType = EngineAccount.Real;
             Guid linkId = Guid.Empty;
             BinollaLinkStatus linkStatus = BinollaLinkStatus.Disconnected;
             bool approved = false;
@@ -372,6 +461,12 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                 pending = link.ApprovalStatus == AdminApprovalStatus.Pending;
                 ciphertext = link.EncryptedSsid;
                 cookieCipher = link.EncryptedCookieHeader;
+                broker = Brokers.Normalize(link.Broker);
+                emailCipher = link.EncryptedBinollaEmail;
+                passwordCipher = link.EncryptedBinollaPassword;
+                gatewayAccountType = link.AccountType == BinollaAccountType.Demo
+                    ? EngineAccount.Demo
+                    : EngineAccount.Real;
             }
             catch (Exception ex)
             {
@@ -381,10 +476,22 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
 
             // Restore previously-connected links for approved OR pending (market browse).
             // Rejected accounts stay offline.
-            var eligible = linkStatus == BinollaLinkStatus.Connected &&
-                           !string.IsNullOrWhiteSpace(ciphertext) &&
-                           (approved || pending);
-            if (!eligible)
+            var connectedLink = linkStatus == BinollaLinkStatus.Connected && (approved || pending);
+            if (!connectedLink)
+                return false;
+
+            // Gateway brokers reconnect on their stored credentials, not on an SSID, so they
+            // branch off before every check below - all of which are about a captured Binolla
+            // session. Without this a Quotex user is logged out by every API restart, holding
+            // a link that still says Connected.
+            if (broker != Brokers.Binolla)
+            {
+                return await RestoreGatewayLinkAsync(
+                    userId, linkId, broker, emailCipher, passwordCipher, gatewayAccountType)
+                    .ConfigureAwait(false);
+            }
+
+            if (string.IsNullOrWhiteSpace(ciphertext))
                 return false;
 
             string ssid;

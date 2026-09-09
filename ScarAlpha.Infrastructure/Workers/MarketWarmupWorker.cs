@@ -114,22 +114,35 @@ public sealed class MarketWarmupWorker : IHostedService
             .ToList();
         if (running.Count == 0) return;
 
-        // (pair, timeframe) pairs the bots will actually ask for at the next bar close.
-        var wanted = running
-            .SelectMany(b => FxCurrencyAssets
-                .FilterSymbols(b.ResolvedAssets)
-                .Select(a => (Asset: a, Timeframe: StrategyTimeframes.For(b.StrategyId))))
-            .Distinct()
-            .OrderBy(x => x.Asset, StringComparer.OrdinalIgnoreCase)
-            .ToList();
-        if (wanted.Count == 0) return;
-
         await using var scope = _scopeFactory.CreateAsyncScope();
-        var sessions = scope.ServiceProvider.GetRequiredService<IBinollaSessionManager>();
+        var sessions = scope.ServiceProvider.GetRequiredService<IBrokerSessionManager>();
+        var brokers = scope.ServiceProvider.GetRequiredService<IBrokerResolver>();
+
+        var userIds = running.Select(b => b.UserId).Distinct().ToList();
+        var brokerByUser = new Dictionary<Guid, string>();
+        foreach (var userId in userIds)
+            brokerByUser[userId] = await brokers.GetAsync(userId, ct).ConfigureAwait(false);
+
+        // (pair, timeframe) the bots will actually ask for at the next bar close, kept
+        // PER VENUE: a symbol is only meaningful on the broker whose bot asked for it, and
+        // warming a Binolla-only pair on a Quotex socket just burns subscribe slots the
+        // pairs that pair's own users need.
+        var wantedByBroker = running
+            .GroupBy(b => brokerByUser[b.UserId])
+            .ToDictionary(
+                g => g.Key,
+                g => g
+                    .SelectMany(b => FxCurrencyAssets
+                        .FilterSymbols(b.ResolvedAssets)
+                        .Select(a => (Asset: a, Timeframe: StrategyTimeframes.For(b.StrategyId))))
+                    .Distinct()
+                    .OrderBy(x => x.Asset, StringComparer.OrdinalIgnoreCase)
+                    .ToList());
+
+        if (wantedByBroker.Values.All(v => v.Count == 0)) return;
 
         // Warming is per session: each user's socket has its own cache, and a pair is
         // only free at bar close for the sessions that were actually holding it.
-        var userIds = running.Select(b => b.UserId).Distinct().ToList();
         var warmedCount = 0;
         var alreadyHot = 0;
 
@@ -137,7 +150,10 @@ public sealed class MarketWarmupWorker : IHostedService
         {
             if (ct.IsCancellationRequested) return;
 
-            var client = sessions.Get(userId.ToString());
+            if (!wantedByBroker.TryGetValue(brokerByUser[userId], out var wanted) || wanted.Count == 0)
+                continue;
+
+            var client = sessions.Get(userId, brokerByUser[userId]);
             if (client is null ||
                 !client.IsTransportConnected ||
                 client.Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected))
@@ -183,7 +199,7 @@ public sealed class MarketWarmupWorker : IHostedService
                 new
                 {
                     sessions = userIds.Count,
-                    wanted = wanted.Count,
+                    wanted = wantedByBroker.Values.Sum(v => v.Count),
                     warmed = warmedCount,
                     alreadyHot
                 },

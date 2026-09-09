@@ -20,6 +20,7 @@ public sealed class BinollaAppService
     private readonly IBotAccessService _access;
     private readonly IBinollaCredentialAuth _credentialAuth;
     private readonly IBrokerSessionManager _brokers;
+    private readonly IBrokerResolver _brokerResolver;
     private readonly IBinollaSessionRestorer _restorer;
     private readonly IMarketingDemoService _demo;
     private readonly IUserRepository _users;
@@ -33,6 +34,7 @@ public sealed class BinollaAppService
         IBotAccessService access,
         IBinollaCredentialAuth credentialAuth,
         IBrokerSessionManager brokers,
+        IBrokerResolver brokerResolver,
         IBinollaSessionRestorer restorer,
         IMarketingDemoService demo,
         IUserRepository users,
@@ -45,6 +47,7 @@ public sealed class BinollaAppService
         _access = access;
         _credentialAuth = credentialAuth;
         _brokers = brokers;
+        _brokerResolver = brokerResolver;
         _restorer = restorer;
         _demo = demo;
         _users = users;
@@ -348,6 +351,10 @@ public sealed class BinollaAppService
             // Honour what was actually requested (and validated above). This used to be
             // pinned to Demo, which is why live was unreachable whatever the caller sent.
             link.AccountType = accountType;
+            // Stamped on every connect, not only on the gateway path: a user coming BACK
+            // from Quotex would otherwise keep "quotex" on their link, and every worker
+            // would then look for their session on a venue they are no longer using.
+            link.Broker = Brokers.Binolla;
             link.Status = BinollaLinkStatus.Connected;
             link.LastConnectedAt = now;
             link.UpdatedAt = now;
@@ -359,6 +366,7 @@ public sealed class BinollaAppService
             }
 
             await _links.UpsertAsync(link, workCt);
+            _brokerResolver.Invalidate(userId);
 
             var access = await _access.CheckAsync(userId, workCt);
             _logger.LogInformation(
@@ -410,10 +418,12 @@ public sealed class BinollaAppService
                 if (!string.IsNullOrWhiteSpace(cookieHeader))
                     link.EncryptedCookieHeader = _protector.Encrypt(cookieHeader.Trim());
                 link.AccountType = accountType;
+                link.Broker = Brokers.Binolla;
                 link.Status = BinollaLinkStatus.Connected;
                 link.LastConnectedAt = now;
                 link.UpdatedAt = now;
                 await _links.UpsertAsync(link, CancellationToken.None);
+                _brokerResolver.Invalidate(userId);
                 var access = await _access.CheckAsync(userId, CancellationToken.None);
                 return new BinollaConnectResponse(
                     Connected: true,
@@ -660,6 +670,9 @@ public sealed class BinollaAppService
         link.EncryptedBinollaEmail = _protector.Encrypt(request.Email.Trim());
         link.EncryptedBinollaPassword = _protector.Encrypt(request.Password);
         await _links.UpsertAsync(link, ct);
+        // The routing cache must see the new venue immediately — a bot reading a stale
+        // value would place this user's next trade through the wrong broker's client.
+        _brokerResolver.Invalidate(userId);
 
         decimal? balance = null;
         try

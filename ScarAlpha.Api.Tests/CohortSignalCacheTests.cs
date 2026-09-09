@@ -13,7 +13,7 @@ namespace ScarAlpha.Api.Tests;
 public sealed class CohortSignalCacheTests
 {
     private static readonly DateTimeOffset BarClose = new(2026, 8, 26, 10, 7, 0, TimeSpan.Zero);
-    private static readonly SignalCohort Rsi5m = SignalCohort.For("rsi", 300);
+    private static readonly SignalCohort Rsi5m = SignalCohort.For(Brokers.Binolla, "rsi", 300);
 
     [Fact]
     public async Task Hundred_users_in_one_cohort_share_a_single_scan()
@@ -58,7 +58,7 @@ public sealed class CohortSignalCacheTests
     {
         var cache = new CohortSignalCache();
         var now = BarClose.AddSeconds(2);
-        var ema = SignalCohort.For("ema", 300);
+        var ema = SignalCohort.For(Brokers.Binolla, "ema", 300);
 
         var rsiDecision = await cache.GetOrAddAsync(Rsi5m, 60, now, (bar, _) =>
             Task.FromResult<CohortDecision?>(Decision(bar, ("EURUSD_otc", "Put"))));
@@ -86,14 +86,14 @@ public sealed class CohortSignalCacheTests
         {
             Interlocked.Increment(ref scans);
             return Task.FromResult<CohortDecision?>(
-                Decision(bar, ("EURUSD_otc", "Put"), SignalCohort.For("rsi", 300)));
+                Decision(bar, ("EURUSD_otc", "Put"), SignalCohort.For(Brokers.Binolla, "rsi", 300)));
         }
 
-        await cache.GetOrAddAsync(SignalCohort.For("rsi", 300), 60, now, Produce);
-        await cache.GetOrAddAsync(SignalCohort.For("rsi", 60), 60, now, Produce);
+        await cache.GetOrAddAsync(SignalCohort.For(Brokers.Binolla, "rsi", 300), 60, now, Produce);
+        await cache.GetOrAddAsync(SignalCohort.For(Brokers.Binolla, "rsi", 60), 60, now, Produce);
 
         scans.Should().Be(1);
-        SignalCohort.For("rsi", 60).Should().Be(SignalCohort.For("rsi", 300));
+        SignalCohort.For(Brokers.Binolla, "rsi", 60).Should().Be(SignalCohort.For(Brokers.Binolla, "rsi", 300));
     }
 
     /// <summary>Durations that really do differ still decide independently.</summary>
@@ -101,7 +101,7 @@ public sealed class CohortSignalCacheTests
     public void Durations_that_derive_different_options_stay_separate()
     {
         // 180s -> 3 expiry candles, 300s -> 5. Different backtest, different decision.
-        SignalCohort.For("rsi", 180).Should().NotBe(SignalCohort.For("rsi", 300));
+        SignalCohort.For(Brokers.Binolla, "rsi", 180).Should().NotBe(SignalCohort.For(Brokers.Binolla, "rsi", 300));
     }
 
     [Fact]
@@ -131,7 +131,7 @@ public sealed class CohortSignalCacheTests
         cache.TryGet(Rsi5m, 60, now).Should().NotBeNull();
 
         // Reached no pair at all (session down) — must not pin "no trades" for the bar.
-        var other = SignalCohort.For("ema", 300);
+        var other = SignalCohort.For(Brokers.Binolla, "ema", 300);
         await cache.GetOrAddAsync(other, 60, now, (bar, _) =>
             Task.FromResult<CohortDecision?>(
                 new CohortDecision(other, bar, Array.Empty<CohortCandidate>(), AssetsScanned: 0)));
@@ -166,11 +166,46 @@ public sealed class CohortSignalCacheTests
         cache.TryGet(Rsi5m, 60, now).Should().BeNull();
     }
 
+    /// <summary>
+    /// Two venues never share a decision.
+    ///
+    /// <para>EURUSD on Binolla and EURUSD on Quotex are different price series from
+    /// different books. Pooling them would hand a Quotex user an entry priced on Binolla's
+    /// feed — a trade taken at a price that never existed on their own account.</para>
+    /// </summary>
+    [Fact]
+    public async Task Brokers_never_share_a_decision()
+    {
+        var cache = new CohortSignalCache();
+        var now = BarClose.AddSeconds(2);
+        var scans = 0;
+
+        var binolla = SignalCohort.For(Brokers.Binolla, "rsi", 300);
+        var quotex = SignalCohort.For(Brokers.Quotex, "rsi", 300);
+
+        binolla.Should().NotBe(quotex);
+
+        await cache.GetOrAddAsync(binolla, 60, now, (bar, _) =>
+        {
+            Interlocked.Increment(ref scans);
+            return Task.FromResult<CohortDecision?>(Decision(bar, ("EURUSD_otc", "Put"), binolla));
+        });
+        await cache.GetOrAddAsync(quotex, 60, now, (bar, _) =>
+        {
+            Interlocked.Increment(ref scans);
+            return Task.FromResult<CohortDecision?>(Decision(bar, ("EURUSD_otc", "Call"), quotex));
+        });
+
+        scans.Should().Be(2, "each venue must be scanned on its own book");
+        cache.TryGet(binolla, 60, now)!.Candidates[0].Signal.Signal.Should().Be("Put");
+        cache.TryGet(quotex, 60, now)!.Candidates[0].Signal.Signal.Should().Be("Call");
+    }
+
     [Fact]
     public void Cohort_key_is_case_insensitive_on_strategy()
     {
-        SignalCohort.For("RSI", 300).Should().Be(SignalCohort.For("rsi", 300));
-        SignalCohort.For(null, 300).Should().Be(SignalCohort.For("rsi", 300));
+        SignalCohort.For(Brokers.Binolla, "RSI", 300).Should().Be(SignalCohort.For(Brokers.Binolla, "rsi", 300));
+        SignalCohort.For(Brokers.Binolla, null, 300).Should().Be(SignalCohort.For(Brokers.Binolla, "rsi", 300));
     }
 
     private static CohortDecision Decision(

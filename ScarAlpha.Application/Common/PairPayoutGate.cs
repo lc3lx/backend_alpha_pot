@@ -1,5 +1,6 @@
 using ScarAlpha.Binolla.Abstractions;
 
+using ScarAlpha.Application.Abstractions;
 namespace ScarAlpha.Application.Common;
 
 /// <summary>
@@ -40,7 +41,7 @@ public static class PairPayoutGate
     }
 
     public static async Task<int?> TryGetPayoutAsync(
-        IBinollaClient client,
+        IBrokerClient client,
         string asset,
         CancellationToken ct = default)
     {
@@ -50,7 +51,7 @@ public static class PairPayoutGate
     }
 
     public static async Task<IReadOnlyDictionary<string, int>> BuildPayoutMapAsync(
-        IBinollaClient client,
+        IBrokerClient client,
         CancellationToken ct = default)
     {
         var assets = await client.GetTradingAssetsAsync(ct).ConfigureAwait(false);

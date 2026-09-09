@@ -4,6 +4,7 @@ using ScarAlpha.Binolla.Abstractions;
 using ScarAlpha.Binolla.Models;
 using ScarAlpha.Binolla.Session;
 using ScarAlpha.Domain.Enums;
+using ScarAlpha.Infrastructure.BrokerGateway;
 
 namespace ScarAlpha.Infrastructure.Access;
 
@@ -13,13 +14,13 @@ public sealed class BotAccessService : IBotAccessService
     private static readonly ConcurrentDictionary<Guid, SemaphoreSlim> UserGates = new();
 
     private readonly IBinollaLinkRepository _links;
-    private readonly IBinollaSessionManager _sessions;
+    private readonly IBrokerSessionManager _sessions;
     private readonly IBinollaSessionRestorer _restorer;
     private readonly IUserRepository _users;
 
     public BotAccessService(
         IBinollaLinkRepository links,
-        IBinollaSessionManager sessions,
+        IBrokerSessionManager sessions,
         IBinollaSessionRestorer restorer,
         IUserRepository users)
     {
@@ -78,11 +79,14 @@ public sealed class BotAccessService : IBotAccessService
         }
 
         var link = await _links.GetByUserIdAsync(userId, ct);
-        var client = _sessions.Get(userId.ToString());
+        // The link is the record of which venue this user chose, so it answers the routing
+        // question directly — no resolver lookup, and no second read of the same row.
+        var broker = Brokers.Normalize(link?.Broker);
+        var client = _sessions.Get(userId, broker);
 
         // Brief wait only if a connect is already in flight — never start a competing 35s restore
         // on every page's /api/account/status (PM2: status 6–9s + assets 30s per navigation).
-        if (client is BinollaSession connectingSession &&
+        if (client is BinollaBrokerAdapter { Inner: BinollaSession connectingSession } &&
             connectingSession.Lifecycle is SessionLifecycleState.Connecting or SessionLifecycleState.Reconnecting)
         {
             try
@@ -95,7 +99,7 @@ public sealed class BotAccessService : IBotAccessService
                 /* fall through */
             }
 
-            client = _sessions.Get(userId.ToString());
+            client = _sessions.Get(userId, broker);
         }
 
         var connected = IsLive(client);
@@ -110,7 +114,7 @@ public sealed class BotAccessService : IBotAccessService
         var linkReady = link is not null &&
                         link.Status == BinollaLinkStatus.Connected &&
                         link.ApprovalStatus != AdminApprovalStatus.Rejected &&
-                        !string.IsNullOrWhiteSpace(link.EncryptedSsid);
+                        HasReconnectSecret(link, broker);
 
         // Non-blocking: keep the socket warm in the background. Status must stay fast.
         if (linkReady && (!connected || deadSession))
@@ -158,7 +162,7 @@ public sealed class BotAccessService : IBotAccessService
 
         if (link.Status == BinollaLinkStatus.Disconnected &&
             link.ApprovalStatus != AdminApprovalStatus.Rejected &&
-            !string.IsNullOrWhiteSpace(link.EncryptedSsid) &&
+            HasReconnectSecret(link, broker) &&
             !connected)
         {
             return new BotAccessResult(
@@ -211,7 +215,22 @@ public sealed class BotAccessService : IBotAccessService
 
     private readonly record struct CacheEntry(DateTimeOffset At, BotAccessResult Result);
 
-    private static bool IsLive(IBinollaClient? client) =>
+    /// <summary>
+    /// Whether the link holds enough to get back onto the broker without the user typing
+    /// anything again.
+    ///
+    /// <para>Which secret that is differs by venue: Binolla reconnects on a captured SSID,
+    /// while a gateway broker logs in with the stored credential pair. Testing only for an
+    /// SSID — as this did — reads a perfectly usable Quotex link as unconnectable and drops
+    /// the user back to the login screen.</para>
+    /// </summary>
+    private static bool HasReconnectSecret(Domain.Entities.BinollaLink link, string broker) =>
+        broker == Brokers.Binolla
+            ? !string.IsNullOrWhiteSpace(link.EncryptedSsid)
+            : !string.IsNullOrWhiteSpace(link.EncryptedBinollaEmail)
+              && !string.IsNullOrWhiteSpace(link.EncryptedBinollaPassword);
+
+    private static bool IsLive(IBrokerClient? client) =>
         client is not null &&
         client.IsTransportConnected &&
         client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected;

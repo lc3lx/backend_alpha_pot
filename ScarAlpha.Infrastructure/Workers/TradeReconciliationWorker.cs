@@ -11,7 +11,7 @@ using ScarAlpha.Infrastructure.Persistence;
 namespace ScarAlpha.Infrastructure.Workers;
 
 /// <summary>
-/// Checks settled trades against Binolla's own record and corrects the ones that disagree.
+/// Checks settled trades against the broker's own record and corrects the ones that disagree.
 ///
 /// <para><b>Why this is needed.</b> A trade's outcome is decided from the first closed-deal
 /// frame that arrives for its order id, and that decision is final — Profit/Loss/Tie are
@@ -49,18 +49,21 @@ public sealed class TradeReconciliationWorker : IHostedService
     private const int BatchSize = 60;
 
     private readonly IServiceScopeFactory _scopeFactory;
-    private readonly IBinollaSessionManager _sessions;
+    private readonly IBrokerSessionManager _sessions;
+    private readonly IBrokerResolver _brokers;
     private readonly ILogger<TradeReconciliationWorker> _logger;
     private CancellationTokenSource? _cts;
     private Task? _loop;
 
     public TradeReconciliationWorker(
         IServiceScopeFactory scopeFactory,
-        IBinollaSessionManager sessions,
+        IBrokerSessionManager sessions,
+        IBrokerResolver brokers,
         ILogger<TradeReconciliationWorker> logger)
     {
         _scopeFactory = scopeFactory;
         _sessions = sessions;
+        _brokers = brokers;
         _logger = logger;
     }
 
@@ -138,7 +141,9 @@ public sealed class TradeReconciliationWorker : IHostedService
         {
             if (ct.IsCancellationRequested) return;
 
-            var client = _sessions.Get(trade.UserId.ToString());
+            // The authority is the venue the trade was actually placed on.
+            var broker = await _brokers.GetAsync(trade.UserId, ct).ConfigureAwait(false);
+            var client = _sessions.Get(trade.UserId, broker);
             if (client is null || !client.TryGetClosedPnl(trade.BinollaOrderId!, out var brokerPnl))
             {
                 // No session, or the broker has no record in this session's cache. Say
@@ -178,11 +183,11 @@ public sealed class TradeReconciliationWorker : IHostedService
             corrected++;
 
             _logger.LogWarning(
-                "Trade corrected from Binolla: trade={TradeId} user={UserId} {Prior}({PriorPnl}) → {Next}({Pnl})",
-                trade.Id, trade.UserId, priorStatus, priorPnl, status, brokerPnl);
+                "Trade corrected from {Broker}: trade={TradeId} user={UserId} {Prior}({PriorPnl}) → {Next}({Pnl})",
+                broker, trade.Id, trade.UserId, priorStatus, priorPnl, status, brokerPnl);
 
-            await NotifyCorrectionAsync(scope, trade, priorStatus, ct).ConfigureAwait(false);
-            await AuditCorrectionAsync(scope, trade, priorStatus, priorPnl, ct).ConfigureAwait(false);
+            await NotifyCorrectionAsync(scope, trade, priorStatus, broker, ct).ConfigureAwait(false);
+            await AuditCorrectionAsync(scope, trade, priorStatus, priorPnl, broker, ct).ConfigureAwait(false);
         }
 
         await db.SaveChangesAsync(ct);
@@ -199,6 +204,7 @@ public sealed class TradeReconciliationWorker : IHostedService
         IServiceScope scope,
         Domain.Entities.Trade trade,
         TradeStatus priorStatus,
+        string broker,
         CancellationToken ct)
     {
         try
@@ -210,7 +216,7 @@ public sealed class TradeReconciliationWorker : IHostedService
                 variant,
                 "Trade result corrected",
                 $"{trade.Asset} was recorded as {priorStatus} and has been corrected to "
-                + $"{trade.Status} to match Binolla.",
+                + $"{trade.Status} to match {broker}.",
                 trade.Id,
                 $"/trading/{trade.Id}",
                 ct);
@@ -226,6 +232,7 @@ public sealed class TradeReconciliationWorker : IHostedService
         Domain.Entities.Trade trade,
         TradeStatus priorStatus,
         decimal? priorPnl,
+        string broker,
         CancellationToken ct)
     {
         try
@@ -239,7 +246,7 @@ public sealed class TradeReconciliationWorker : IHostedService
                 targetBinollaLinkId: null,
                 previousState: $"{priorStatus}:{priorPnl}",
                 newState: $"{trade.Status}:{trade.Pnl}",
-                detail: $"tradeId={trade.Id};orderId={trade.BinollaOrderId};source=binolla",
+                detail: $"tradeId={trade.Id};orderId={trade.BinollaOrderId};source={broker}",
                 ct: ct);
         }
         catch

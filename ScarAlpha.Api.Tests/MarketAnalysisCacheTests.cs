@@ -21,13 +21,13 @@ public sealed class MarketAnalysisCacheTests
         var computed = 0;
         var now = BarClose.AddSeconds(2);
 
-        var accountA = await cache.GetOrAddAsync(Asset, 60, now, _ =>
+        var accountA = await cache.GetOrAddAsync(Brokers.Binolla, Asset, 60, now, _ =>
         {
             Interlocked.Increment(ref computed);
             return Task.FromResult<MarketAnalysis?>(Analysis(BarClose, rsi: 71.42m));
         });
 
-        var accountB = await cache.GetOrAddAsync(Asset, 60, now, _ =>
+        var accountB = await cache.GetOrAddAsync(Brokers.Binolla, Asset, 60, now, _ =>
         {
             Interlocked.Increment(ref computed);
             return Task.FromResult<MarketAnalysis?>(Analysis(BarClose, rsi: 99m));
@@ -46,7 +46,7 @@ public sealed class MarketAnalysisCacheTests
         var now = BarClose.AddSeconds(1);
 
         var results = await Task.WhenAll(Enumerable.Range(0, 100).Select(_ =>
-            cache.GetOrAddAsync(Asset, 60, now, async _ =>
+            cache.GetOrAddAsync(Brokers.Binolla, Asset, 60, now, async _ =>
             {
                 Interlocked.Increment(ref computed);
                 await Task.Delay(15);
@@ -65,7 +65,7 @@ public sealed class MarketAnalysisCacheTests
         var computed = 0;
 
         Task<MarketAnalysis?> Produce(DateTimeOffset bar) =>
-            cache.GetOrAddAsync(Asset, 60, bar.AddSeconds(3), _ =>
+            cache.GetOrAddAsync(Brokers.Binolla, Asset, 60, bar.AddSeconds(3), _ =>
             {
                 Interlocked.Increment(ref computed);
                 return Task.FromResult<MarketAnalysis?>(Analysis(bar, rsi: 50m));
@@ -85,11 +85,11 @@ public sealed class MarketAnalysisCacheTests
         var now = BarClose.AddSeconds(2);
 
         // Producer hands back an analysis for an older bar (lagging history feed).
-        var stale = await cache.GetOrAddAsync(Asset, 60, now, _ =>
+        var stale = await cache.GetOrAddAsync(Brokers.Binolla, Asset, 60, now, _ =>
             Task.FromResult<MarketAnalysis?>(Analysis(BarClose.AddMinutes(-2), rsi: 12m)));
 
         stale.Should().NotBeNull();
-        cache.TryGet(Asset, 60, now).Should().BeNull();
+        cache.TryGet(Brokers.Binolla, Asset, 60, now).Should().BeNull();
     }
 
     [Fact]
@@ -100,7 +100,7 @@ public sealed class MarketAnalysisCacheTests
         var now = BarClose.AddSeconds(2);
 
         Task<MarketAnalysis?> Attempt(bool succeed) =>
-            cache.GetOrAddAsync(Asset, 60, now, _ =>
+            cache.GetOrAddAsync(Brokers.Binolla, Asset, 60, now, _ =>
             {
                 Interlocked.Increment(ref attempts);
                 return Task.FromResult(succeed ? Analysis(BarClose, rsi: 33m) : null);
@@ -132,5 +132,25 @@ public sealed class MarketAnalysisCacheTests
             Rsi: rsi,
             CallBacktest: stats,
             PutBacktest: stats);
+
+}
+    
+    /// <summary>
+    /// The same symbol on two venues is two different price series, and the cache must not
+    /// serve one to the other.
+    /// </summary>
+    [Fact]
+    public async Task Brokers_do_not_share_a_cache_entry()
+    {
+        var cache = new MarketAnalysisCache();
+        var now = BarClose.AddSeconds(2);
+
+        await cache.GetOrAddAsync(Brokers.Binolla, Asset, 60, now, _ =>
+            Task.FromResult<MarketAnalysis?>(Analysis(BarClose, rsi: 71m)));
+        await cache.GetOrAddAsync(Brokers.Quotex, Asset, 60, now, _ =>
+            Task.FromResult<MarketAnalysis?>(Analysis(BarClose, rsi: 29m)));
+
+        cache.TryGet(Brokers.Binolla, Asset, 60, now)!.Rsi.Should().Be(71m);
+        cache.TryGet(Brokers.Quotex, Asset, 60, now)!.Rsi.Should().Be(29m);
     }
 }

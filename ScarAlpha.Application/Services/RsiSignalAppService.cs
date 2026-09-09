@@ -20,6 +20,8 @@ public sealed class RsiSignalAppService
     private readonly IEmaRsiSignalService _emaSignalService;
     private readonly IAlternatingSignalService _alternatingSignalService;
     private readonly MarketAnalysisCache _analysisCache;
+    private readonly IBrokerSessionManager _brokers;
+    private readonly IBrokerResolver _brokerResolver;
     private readonly EmaRsiTradeTracker _emaTracker;
     private readonly IBinollaSessionRestorer _restorer;
     private readonly IMarketingDemoService _demo;
@@ -37,6 +39,8 @@ public sealed class RsiSignalAppService
         IEmaRsiSignalService emaSignalService,
         IAlternatingSignalService alternatingSignalService,
         MarketAnalysisCache analysisCache,
+        IBrokerSessionManager brokers,
+        IBrokerResolver brokerResolver,
         EmaRsiTradeTracker emaTracker,
         IBinollaSessionRestorer restorer,
         IMarketingDemoService demo,
@@ -53,6 +57,8 @@ public sealed class RsiSignalAppService
         _emaSignalService = emaSignalService;
         _alternatingSignalService = alternatingSignalService;
         _analysisCache = analysisCache;
+        _brokers = brokers;
+        _brokerResolver = brokerResolver;
         _emaTracker = emaTracker;
         _restorer = restorer;
         _demo = demo;
@@ -325,7 +331,7 @@ public sealed class RsiSignalAppService
     /// rather than assuming the trend agrees.
     /// </summary>
     private async Task<IReadOnlyList<decimal>> GetTrendClosesAsync(
-        IBinollaClient client,
+        IBrokerClient client,
         string symbol,
         EmaRsiOptions emaOptions,
         DateTimeOffset now,
@@ -338,7 +344,7 @@ public sealed class RsiSignalAppService
 
         try
         {
-            var trend = await _analysisCache.GetOrAddAsync(symbol, tf, now, async _ =>
+            var trend = await _analysisCache.GetOrAddAsync(client.Broker, symbol, tf, now, async _ =>
             {
                 var history = await client.GetHistoryAsync(symbol, tf, CancellationToken.None);
                 var period = TimeSpan.FromSeconds(tf);
@@ -423,14 +429,14 @@ public sealed class RsiSignalAppService
     /// signal is correct there; emitting an RSI the broker chart disagrees with is not.
     /// </summary>
     private Task<MarketAnalysis?> GetSharedAnalysisAsync(
-        IBinollaClient client,
+        IBrokerClient client,
         string symbol,
         int wirePeriod,
         RsiStrategyOptions options,
         DateTimeOffset now,
         CancellationToken ct,
         int? minCandles = null) =>
-        _analysisCache.GetOrAddAsync(symbol, wirePeriod, now, async _ =>
+        _analysisCache.GetOrAddAsync(client.Broker, symbol, wirePeriod, now, async _ =>
         {
             var history = await client.GetHistoryAsync(symbol, wirePeriod, CancellationToken.None);
             var period = TimeSpan.FromSeconds(wirePeriod);
@@ -719,7 +725,11 @@ public sealed class RsiSignalAppService
 
                     // Pine scores from the close of the signal bar, which is where we entered.
                     var entryClose = _analysisCache
-                        .TryGet(signal.Asset, options.TimeframeSeconds, DateTimeOffset.UtcNow)?
+                        .TryGet(
+                            await CurrentBrokerAsync(ct).ConfigureAwait(false),
+                            signal.Asset,
+                            options.TimeframeSeconds,
+                            DateTimeOffset.UtcNow)?
                         .ClosedCandles[^1].Close;
                     if (entryClose is decimal price)
                     {
@@ -812,29 +822,36 @@ public sealed class RsiSignalAppService
         return null;
     }
 
-    private Task<IBinollaClient?> EnsureLiveClientAsync(CancellationToken ct)
+    /// <summary>
+    /// The caller's live client on whichever venue they are linked to.
+    ///
+    /// <para>Resolving the broker here — rather than assuming Binolla — is what lets one
+    /// strategy implementation serve both venues.</para>
+    /// </summary>
+    private async Task<IBrokerClient?> EnsureLiveClientAsync(CancellationToken ct)
     {
-        var client = _sessions.Get(_currentUser.UserId.ToString());
-        if (client is not null &&
-            client.IsTransportConnected &&
-            client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
-        {
-            return Task.FromResult<IBinollaClient?>(client);
-        }
+        var userId = _currentUser.UserId;
+        var broker = await _brokerResolver.GetAsync(userId, ct).ConfigureAwait(false);
+
+        if (AsLiveClient(_brokers.Get(userId, broker)) is { } live)
+            return live;
 
         // Signal polling is latency-sensitive; reconnect without blocking this request.
-        _restorer.EnsureBackgroundRestore(_currentUser.UserId);
+        _restorer.EnsureBackgroundRestore(userId);
 
-        client = _sessions.Get(_currentUser.UserId.ToString());
-        if (client is not null &&
-            client.IsTransportConnected &&
-            client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
-        {
-            return Task.FromResult<IBinollaClient?>(client);
-        }
-
-        return Task.FromResult<IBinollaClient?>(null);
+        return AsLiveClient(_brokers.Get(userId, broker));
     }
+
+    private static IBrokerClient? AsLiveClient(IBrokerClient? client) =>
+        client is not null
+        && client.IsTransportConnected
+        && client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected
+            ? client
+            : null;
+
+    /// <summary>The venue the current caller trades on. Cached; see IBrokerResolver.</summary>
+    private Task<string> CurrentBrokerAsync(CancellationToken ct) =>
+        _brokerResolver.GetAsync(_currentUser.UserId, ct);
 
     private async Task<bool> IsAnalysisPausedAsync(CancellationToken ct)
     {
@@ -908,7 +925,7 @@ public sealed class RsiSignalAppService
     /// same tick we just subscribed.
     /// </summary>
     private static async Task<bool> WaitForFreshQuoteAsync(
-        IBinollaClient client,
+        IBrokerClient client,
         string symbol,
         int maxQuoteAgeSeconds,
         CancellationToken ct)
@@ -939,7 +956,7 @@ public sealed class RsiSignalAppService
     /// Entry decisions use closed bars only — forming RSI never places a trade.
     /// </summary>
     private static bool ApplyLiveQuoteToCandles(
-        IBinollaClient client,
+        IBrokerClient client,
         string symbol,
         List<RsiCandle> candles,
         int wirePeriod,

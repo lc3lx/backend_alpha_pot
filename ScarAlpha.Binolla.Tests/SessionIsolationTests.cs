@@ -41,9 +41,13 @@ public class SessionIsolationTests
         Assert.Equal(TradeDirection.Call, orderA.Direction);
         Assert.Equal(TradeDirection.Put, orderB.Direction);
 
-        await sessionA.ChangeAccountAsync(AccountType.Real);
-        Assert.Equal(AccountType.Real, sessionA.State.AccountType);
-        Assert.Equal(AccountType.Demo, sessionB.State.AccountType);
+        // Both sessions open on Real (the default since demo became admin-unlocked), so
+        // switching A to Demo is what makes this an isolation check at all: asserting B is
+        // still Real only means something when A has moved OFF it.
+        Assert.Equal(AccountType.Real, sessionB.State.AccountType);
+        await sessionA.ChangeAccountAsync(AccountType.Demo);
+        Assert.Equal(AccountType.Demo, sessionA.State.AccountType);
+        Assert.Equal(AccountType.Real, sessionB.State.AccountType);
     }
 
     [Fact]
