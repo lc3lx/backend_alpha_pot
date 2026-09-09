@@ -90,7 +90,24 @@ install_deps() {
   fi
   info "Installing QuotexAPI"
   "$VENV/bin/pip" install -e "$VENDOR/QuotexAPI" >/dev/null || die "QuotexAPI install failed"
-  ok "QuotexAPI installed"
+
+  # Its pyproject under-declares: the code imports curl_cffi, which nothing in
+  # [project.dependencies] mentions, so a clean install ends in ModuleNotFoundError at
+  # the first Quotex login. requirements.txt is the complete list — install it too.
+  if [[ -f "$VENDOR/QuotexAPI/requirements.txt" ]]; then
+    info "Installing QuotexAPI runtime requirements"
+    "$VENV/bin/pip" install -r "$VENDOR/QuotexAPI/requirements.txt" >/dev/null \
+      || die "QuotexAPI requirements install failed"
+  fi
+
+  # Proof the library actually imports. Without this the failure surfaces later as a 409
+  # on a login, with nothing naming the real cause.
+  if "$VENV/bin/python" -c "from app.brokers.quotex import _load_client_cls; _load_client_cls()" 2>/dev/null; then
+    ok "QuotexAPI installed and importable"
+  else
+    echo "WARN: QuotexAPI installed but does not import — Quotex logins will fail. Details:"
+    "$VENV/bin/python" -c "from app.brokers.quotex import _load_client_cls; _load_client_cls()" || true
+  fi
 }
 
 ensure_pm2() {

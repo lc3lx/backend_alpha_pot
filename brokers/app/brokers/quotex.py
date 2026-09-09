@@ -44,10 +44,12 @@ from app.models import (
 #: nothing in the message naming the real cause, so every known layout is tried and the
 #: failure says exactly what was attempted.
 _CLIENT_PATHS: tuple[tuple[str, str], ...] = (
+    # What the vendored ChipaDevTeam repo actually exports today: package `QuotexAPI`,
+    # class `QuotexAPI`, re-exported from `QuotexAPI.client`.
+    ("QuotexAPI.client", "QuotexAPI"),
+    ("QuotexAPI", "QuotexAPI"),
     ("QuotexAPI.stable_api", "Quotex"),
     ("QuotexAPI", "Quotex"),
-    ("QuotexAPI.api", "Quotex"),
-    ("QuotexAPI.client", "QuotexClient"),
     ("quotexapi.stable_api", "Quotex"),
     ("quotex_api.stable_api", "Quotex"),
     ("pyquotex.stable_api", "Quotex"),
