@@ -315,6 +315,14 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
             || blob.Contains("(GB)", StringComparison.OrdinalIgnoreCase)
             || blob.Contains("geo-restriction", StringComparison.OrdinalIgnoreCase))
             return "geo-blocked";
+        // Binolla asked for a CAPTCHA. This arrives as HTTP 200 with captchaRequired in
+        // the body — the request reached the auth logic and was answered, so it is not a
+        // block and must not be reported as one. It is also intermittent: the next attempt
+        // a minute later usually goes through.
+        if (blob.Contains("captchaRequired\":true", StringComparison.OrdinalIgnoreCase)
+            || blob.Contains("captcharequired\": true", StringComparison.OrdinalIgnoreCase))
+            return "captcha-required";
+
         // A 403 on Binolla's auth endpoint is an edge/WAF refusal — the request was
         // rejected before the password was ever checked. Wrong credentials come back as
         // 401 with a message, so these two must not read the same to an operator.
@@ -335,6 +343,13 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         {
             return "Binolla browser failed to start on the server (missing Chromium OS libraries). "
                    + "On the VPS run: cd /home/web/backend/tools/binolla-auth && chmod +x install-deps.sh && ./install-deps.sh";
+        }
+
+        if (kind == "captcha-required")
+        {
+            return "Binolla asked for a CAPTCHA on this login. It is intermittent — the "
+                   + "next automatic attempt usually succeeds. To connect right now, sign in "
+                   + "at binolla.com yourself and paste your SSID from Edit Profile.";
         }
 
         if (kind == "edge-blocked")
