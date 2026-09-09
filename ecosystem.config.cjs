@@ -55,6 +55,12 @@ module.exports = {
         CORS_ORIGINS: process.env.CORS_ORIGINS || '',
         ADMIN_TELEGRAM_USER_IDS: process.env.ADMIN_TELEGRAM_USER_IDS || '',
         BINOLLA_AUTH_PROXY: process.env.BINOLLA_AUTH_PROXY || '',
+        // Where the Python broker gateway (backend/brokers) listens. Localhost only —
+        // it holds live trading sessions. Listed here because this env block is a
+        // whitelist: a value in scaralpha.env that is not named here never reaches
+        // the process, which is why Quotex logins failed with "Connection refused".
+        BROKER_GATEWAY_URL: process.env.BROKER_GATEWAY_URL || 'http://127.0.0.1:8100',
+        BROKER_GATEWAY_TOKEN: process.env.BROKER_GATEWAY_TOKEN || '',
         // Debug NDJSON (debug-*.log) — leave unset/0 in production
         SCARALPHA_AGENT_DEBUG: process.env.SCARALPHA_AGENT_DEBUG || '0',
         DOTNET_ROOT: process.env.DOTNET_ROOT || '',

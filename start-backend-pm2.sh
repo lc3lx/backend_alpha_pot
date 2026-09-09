@@ -139,6 +139,9 @@ load_env() {
   export ADMIN_TELEGRAM_USER_IDS="${ADMIN_TELEGRAM_USER_IDS:-}"
   export DATABASE_CONNECTION_STRING="${DATABASE_CONNECTION_STRING:-}"
   export BINOLLA_AUTH_PROXY="${BINOLLA_AUTH_PROXY:-}"
+  # The Python broker gateway (backend/brokers) serves every non-Binolla venue.
+  export BROKER_GATEWAY_URL="${BROKER_GATEWAY_URL:-http://127.0.0.1:8100}"
+  export BROKER_GATEWAY_TOKEN="${BROKER_GATEWAY_TOKEN:-}"
 }
 
 ensure_pm2() {

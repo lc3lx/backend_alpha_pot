@@ -68,20 +68,20 @@ public sealed class BrokerGatewayClient : IBrokerClient
     {
         Lifecycle = SessionLifecycleState.Connecting;
 
-        using var deadline = Deadline(ct, TimeSpan.FromSeconds(90));
-        var response = await _http.PostAsJsonAsync(
-            "/sessions/connect",
-            new
-            {
-                user_id = UserId,
-                broker = Broker,
-                ssid = credentials.Ssid,
-                email = credentials.Email,
-                password = credentials.Password,
-                account_type = credentials.AccountType.ToString()
-            },
-            Json,
-            deadline.Token).ConfigureAwait(false);
+        var payload = new
+        {
+            user_id = UserId,
+            broker = Broker,
+            ssid = credentials.Ssid,
+            email = credentials.Email,
+            password = credentials.Password,
+            account_type = credentials.AccountType.ToString()
+        };
+        var response = await SendAsync(
+                token => _http.PostAsJsonAsync("/sessions/connect", payload, Json, token),
+                ct,
+                TimeSpan.FromSeconds(90))
+            .ConfigureAwait(false);
 
         if (!response.IsSuccessStatusCode)
         {
@@ -112,12 +112,11 @@ public sealed class BrokerGatewayClient : IBrokerClient
         // Re-connecting is how the balance is switched: the gateway applies the account
         // type during the handshake, because switching afterwards races the broker's own
         // setup and can leave the socket on the other balance.
-        using var deadline = Deadline(ct, TimeSpan.FromSeconds(90));
-        var response = await _http.PostAsync(
-            $"/sessions/connect?user_id={Uri.EscapeDataString(UserId)}&broker={Broker}"
-            + $"&account_type={accountType}",
-            content: null,
-            deadline.Token).ConfigureAwait(false);
+        var url = $"/sessions/connect?user_id={Uri.EscapeDataString(UserId)}&broker={Broker}"
+                  + $"&account_type={accountType}";
+        var response = await SendAsync(
+                token => _http.PostAsync(url, content: null, token), ct, TimeSpan.FromSeconds(90))
+            .ConfigureAwait(false);
 
         if (!response.IsSuccessStatusCode)
             throw await TranslateAsync(response, ct).ConfigureAwait(false);
@@ -195,9 +194,8 @@ public sealed class BrokerGatewayClient : IBrokerClient
     {
         var query = $"user_id={Uri.EscapeDataString(UserId)}&broker={Broker}"
                     + $"&asset={Uri.EscapeDataString(asset)}&period_seconds={periodSeconds}";
-        using var deadline = Deadline(ct);
-        var response = await _http
-            .PostAsync($"/market/subscribe?{query}", content: null, deadline.Token)
+        var response = await SendAsync(
+                token => _http.PostAsync($"/market/subscribe?{query}", content: null, token), ct)
             .ConfigureAwait(false);
 
         if (response.IsSuccessStatusCode)
@@ -240,22 +238,22 @@ public sealed class BrokerGatewayClient : IBrokerClient
         int durationSeconds,
         CancellationToken ct = default)
     {
+        var payload = new
+        {
+            user_id = UserId,
+            broker = Broker,
+            asset,
+            amount = (double)amount,
+            duration_seconds = durationSeconds,
+            direction = direction == TradeDirection.Call ? "CALL" : "PUT"
+        };
         // An order is time-critical: if it cannot go out promptly it must fail, not sit
         // in a socket while the bar it was priced on passes.
-        using var deadline = Deadline(ct, TimeSpan.FromSeconds(20));
-        var response = await _http.PostAsJsonAsync(
-            "/orders",
-            new
-            {
-                user_id = UserId,
-                broker = Broker,
-                asset,
-                amount = (double)amount,
-                duration_seconds = durationSeconds,
-                direction = direction == TradeDirection.Call ? "CALL" : "PUT"
-            },
-            Json,
-            deadline.Token).ConfigureAwait(false);
+        var response = await SendAsync(
+                token => _http.PostAsJsonAsync("/orders", payload, Json, token),
+                ct,
+                TimeSpan.FromSeconds(20))
+            .ConfigureAwait(false);
 
         if (!response.IsSuccessStatusCode)
             throw await TranslateAsync(response, ct).ConfigureAwait(false);
@@ -332,9 +330,10 @@ public sealed class BrokerGatewayClient : IBrokerClient
         try
         {
             var query = $"user_id={Uri.EscapeDataString(UserId)}&broker={Broker}";
-            using var deadline = Deadline(ct, TimeSpan.FromSeconds(15));
-            await _http
-                .PostAsync($"/sessions/disconnect?{query}", content: null, deadline.Token)
+            await SendAsync(
+                    token => _http.PostAsync($"/sessions/disconnect?{query}", content: null, token),
+                    ct,
+                    TimeSpan.FromSeconds(15))
                 .ConfigureAwait(false);
         }
         catch (Exception ex)
@@ -362,16 +361,53 @@ public sealed class BrokerGatewayClient : IBrokerClient
         return cts;
     }
 
+    /// <summary>
+    /// Runs one request, turning transport failures into the app's own error type.
+    ///
+    /// <para>Without this a gateway that is simply not running throws a raw
+    /// <see cref="HttpRequestException"/> straight out of the login endpoint — the user gets
+    /// a 500 and a stack trace, and nothing in the message says which of the two processes
+    /// is down. Every call goes through here so that never happens again.</para>
+    /// </summary>
+    private async Task<HttpResponseMessage> SendAsync(
+        Func<CancellationToken, Task<HttpResponseMessage>> send,
+        CancellationToken ct,
+        TimeSpan? budget = null)
+    {
+        using var deadline = Deadline(ct, budget);
+        try
+        {
+            return await send(deadline.Token).ConfigureAwait(false);
+        }
+        catch (HttpRequestException ex)
+        {
+            Lifecycle = SessionLifecycleState.Disconnected;
+            IsTransportConnected = false;
+            _logger.LogError(
+                ex, "Broker gateway unreachable at {BaseAddress} for {Broker}", _http.BaseAddress, Broker);
+            throw new ApiException(
+                ApiErrorCodes.BinollaNotConnected,
+                $"The {Broker} service is not running on the server. Start the broker gateway "
+                + $"(backend/brokers) on {_http.BaseAddress}, then try again.",
+                503);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw new ApiException(
+                ApiErrorCodes.BinollaNotConnected,
+                $"The {Broker} service did not answer in time.",
+                504);
+        }
+    }
+
     private async Task<T> GetAsync<T>(
         string path, string? query, CancellationToken ct, TimeSpan? budget = null)
     {
         var url = $"{path}?user_id={Uri.EscapeDataString(UserId)}&broker={Broker}"
                   + (string.IsNullOrEmpty(query) ? string.Empty : "&" + query);
 
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        deadline.CancelAfter(budget ?? CallBudget);
-
-        var response = await _http.GetAsync(url, deadline.Token).ConfigureAwait(false);
+        var response = await SendAsync(token => _http.GetAsync(url, token), ct, budget)
+            .ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
             throw await TranslateAsync(response, ct).ConfigureAwait(false);
 
