@@ -52,6 +52,8 @@ public sealed class BotAccessService : IBotAccessService
         }
     }
 
+    public void Invalidate(Guid userId) => AccessCache.TryRemove(userId, out _);
+
     private static bool TryGetCached(Guid userId, out BotAccessResult result)
     {
         if (AccessCache.TryGetValue(userId, out var hit) &&

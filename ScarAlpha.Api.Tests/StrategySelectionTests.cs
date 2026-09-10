@@ -162,6 +162,9 @@ public sealed class StrategySelectionTests
         public Task<BotAccessResult> CheckAsync(Guid userId, CancellationToken ct = default) =>
             Task.FromResult(new BotAccessResult(
                 BotAccessState.Allowed, true, true, "Demo", "Approved"));
+
+        // Nothing is cached here, so there is nothing to drop.
+        public void Invalidate(Guid userId) { }
     }
 }
 

@@ -62,6 +62,11 @@ from urllib.parse import urlparse
 
 from app.proxy import proxy_url
 
+#: Longest a single upgrade attempt may take. A broker either accepts the handshake
+#: quickly or is not going to; anything beyond this is a misconfiguration hanging, and
+#: waiting it out blocks a connect slot that other sign-ins are queued behind.
+_CONNECT_TIMEOUT = 25
+
 #: Engine.IO v3 packet types used here.
 _OPEN = "0"
 _PING = "2"
@@ -331,8 +336,17 @@ def _open_with_curl(ws_url: str, headers: dict[str, str]) -> Any:
     if session_factory is None:
         return None
 
+    # Bounded. Without a timeout an upgrade against a misconfigured proxy hung for FIVE
+    # MINUTES before giving up — holding a connect slot the whole time, which is what
+    # turned one bad setting into a storm of refused sign-ins everywhere else.
     try:
-        session = session_factory(impersonate="chrome110")
+        session = session_factory(impersonate="chrome110", timeout=_CONNECT_TIMEOUT)
+    except TypeError:
+        # Older curl_cffi takes the timeout per request rather than per session.
+        try:
+            session = session_factory(impersonate="chrome110")
+        except Exception:
+            return None
     except Exception:
         return None
 
@@ -356,7 +370,10 @@ def _open_with_curl(ws_url: str, headers: dict[str, str]) -> Any:
         return None
 
     try:
-        socket = connect(ws_url, headers=headers)
+        try:
+            socket = connect(ws_url, headers=headers, timeout=_CONNECT_TIMEOUT)
+        except TypeError:
+            socket = connect(ws_url, headers=headers)
     except Exception as exc:
         _log(f"impersonated upgrade refused ({_short(exc)})")
         try:
@@ -418,7 +435,7 @@ def _warm_session(session: Any, ws_url: str) -> None:
     try:
         session.get(
             http_url,
-            timeout=15,
+            timeout=_CONNECT_TIMEOUT,
             headers={"Origin": origin, "Referer": f"{origin}/"},
         )
     except Exception as exc:

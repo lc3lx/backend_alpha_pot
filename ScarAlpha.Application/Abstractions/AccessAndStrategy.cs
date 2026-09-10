@@ -22,6 +22,18 @@ public sealed record BotAccessResult(
 public interface IBotAccessService
 {
     Task<BotAccessResult> CheckAsync(Guid userId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Drops this user's cached access decision.
+    ///
+    /// <para>The result is cached briefly so a page load does not re-query for every
+    /// widget on it. That cache outlives a LINK CHANGE, though: a login asks for access
+    /// before it writes the link and again after, and the second answer came back from
+    /// the cache — still saying "not connected" for an account that had just connected.
+    /// The user was then sent to the link screen by a login that had actually
+    /// succeeded.</para>
+    /// </summary>
+    void Invalidate(Guid userId);
 }
 
 /// <summary>

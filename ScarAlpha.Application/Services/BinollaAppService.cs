@@ -414,6 +414,9 @@ public sealed class BinollaAppService
 
             await _links.UpsertAsync(link, workCt);
             _brokerResolver.Invalidate(userId);
+            // The link just changed; a cached "not connected" from moments ago would
+            // send this user to the link screen despite the login succeeding.
+            _access.Invalidate(userId);
 
             var access = await _access.CheckAsync(userId, workCt);
             _logger.LogInformation(
@@ -471,6 +474,7 @@ public sealed class BinollaAppService
                 link.UpdatedAt = now;
                 await _links.UpsertAsync(link, CancellationToken.None);
                 _brokerResolver.Invalidate(userId);
+                _access.Invalidate(userId);
                 var access = await _access.CheckAsync(userId, CancellationToken.None);
                 return new BinollaConnectResponse(
                     Connected: true,
@@ -670,6 +674,7 @@ public sealed class BinollaAppService
             link.AccountType = accountType;
             link.UpdatedAt = DateTimeOffset.UtcNow;
             await _links.UpsertAsync(link, ct);
+            _access.Invalidate(_currentUser.UserId);
         }
 
         return await GetStatusAsync(ct);
@@ -690,6 +695,7 @@ public sealed class BinollaAppService
             link.Status = BinollaLinkStatus.Disconnected;
             link.UpdatedAt = DateTimeOffset.UtcNow;
             await _links.UpsertAsync(link, ct);
+            _access.Invalidate(userId);
         }
     }
 
@@ -745,6 +751,7 @@ public sealed class BinollaAppService
         // The routing cache must see the new venue immediately — a bot reading a stale
         // value would place this user's next trade through the wrong broker's client.
         _brokerResolver.Invalidate(userId);
+        _access.Invalidate(userId);
 
         decimal? balance = null;
         try
