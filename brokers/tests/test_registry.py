@@ -93,3 +93,28 @@ def test_backoff_grows_with_consecutive_failures():
         delays.append(t._user_retry_after["u1"] - before)
     # Each failure must wait longer than the last.
     assert t._user_failures["u1"] == 3
+
+
+def test_a_second_device_is_recognised_as_the_same_sign_in():
+    """
+    Two devices, one account, one session. The gateway needs to be able to tell that a
+    connect is already under way so the second caller can WAIT for it — refusing instead
+    told a user signing in on their laptop that a sign-in was already running, while
+    their phone was quietly completing the very same one.
+    """
+    t = _Throttle()
+
+    assert t.is_connecting("u1") is False
+    assert t.can_attempt("u1") is True
+    assert t.is_connecting("u1") is True
+
+    t.mark_succeeded("u1")
+    assert t.is_connecting("u1") is False
+
+
+def test_a_failed_attempt_also_stops_being_in_flight():
+    """Otherwise the slot leaks and every later sign-in waits for something already over."""
+    t = _Throttle()
+    t.can_attempt("u1")
+    t.mark_failed("u1")
+    assert t.is_connecting("u1") is False

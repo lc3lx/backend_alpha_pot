@@ -109,6 +109,10 @@ class _Throttle:
     def _release(self, user_id: str) -> None:
         self._in_flight.discard(user_id)
 
+    def is_connecting(self, user_id: str) -> bool:
+        """Whether a connect for this account is already under way."""
+        return user_id in self._in_flight
+
     def describe(self, user_id: str) -> str:
         """Why an attempt was refused, in words a user can act on."""
         now = time.monotonic()

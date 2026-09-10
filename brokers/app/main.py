@@ -159,6 +159,33 @@ async def health() -> dict[str, object]:
     }
 
 
+#: How long a second caller waits for an in-flight connect before giving up on joining
+#: it. Comfortably longer than a healthy handshake, short enough not to hold a request.
+_JOIN_WAIT_SECONDS = 25.0
+
+
+async def _await_session(user_id: str, broker: str, account_type: AccountType) -> BrokerSession | None:
+    """Waits for an in-flight connect to produce a usable session, or None if it does not."""
+    deadline = asyncio.get_running_loop().time() + _JOIN_WAIT_SECONDS
+
+    while asyncio.get_running_loop().time() < deadline:
+        session = registry.get(user_id, broker)
+        if (
+            session is not None
+            and session.transport_connected
+            and session.account_type == account_type
+        ):
+            return session
+
+        # The attempt finished without producing one — failed, or on another balance.
+        if not registry.throttle(broker).is_connecting(user_id):
+            return session if session is not None and session.transport_connected else None
+
+        await asyncio.sleep(0.3)
+
+    return None
+
+
 @app.post("/sessions/connect", response_model=SessionStatus, dependencies=[Guarded])
 async def connect(body: ConnectRequest) -> SessionStatus:
     broker = body.broker.strip().lower()
@@ -176,6 +203,16 @@ async def connect(body: ConnectRequest) -> SessionStatus:
         and existing.account_type == body.account_type
     ):
         return _status(existing)
+
+    # A connect for this same account is already under way — from another device, or
+    # from a background restore. WAIT for it rather than refusing: one account has one
+    # session, and whoever asked second wants exactly the session the first will produce.
+    # Refusing here is what told a user signing in on their laptop that a sign-in was
+    # "already running", while their phone was quietly completing the very same one.
+    if throttle.is_connecting(body.user_id):
+        joined = await _await_session(body.user_id, broker, body.account_type)
+        if joined is not None:
+            return _status(joined)
 
     # Ask before trying. A broker that is refusing logins keeps refusing, and the caller
     # retries on its own schedule — without this the gateway relays the storm.
