@@ -115,13 +115,20 @@ class MarketData:
 
         async with self._lock:
             held = self._feed.get(key)
-            if held is not None and held[0] != user_id:
+            if held is not None:
                 holder_alive = held[1]
+                alive = False
                 try:
-                    if holder_alive():
-                        return  # someone healthy is already feeding it
+                    alive = bool(holder_alive())
                 except Exception:
-                    pass  # treat an unanswerable session as gone and take over
+                    alive = False  # an unanswerable session counts as gone
+
+                # Whoever holds it — including this same caller. `get_candles` subscribes
+                # on every read, so without this the pair was re-subscribed on every poll:
+                # production logs showed the same `depth/follow` fired once or twice a
+                # second per pair, for pairs that were already streaming.
+                if alive:
+                    return
 
             # Load whatever previous runs left on disk before the first tick arrives, so
             # a pair is analysable immediately instead of after a fresh warm-up.

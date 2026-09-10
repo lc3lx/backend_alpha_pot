@@ -125,3 +125,35 @@ async def test_a_quote_falls_back_to_the_newest_bar(market):
     quote = market.quote("EURUSD_otc")
     assert quote is not None
     assert quote[1] == pytest.approx(1.23)
+
+
+async def test_the_same_account_does_not_resubscribe_a_live_pair(market):
+    """
+    `get_candles` subscribes on every read, so a pair that is already streaming must be
+    left alone. Without this the same `depth/follow` was fired once or twice a second per
+    pair — pure load on the broker for a stream that was already open.
+    """
+    calls: list[str] = []
+
+    for _ in range(5):
+        await market.ensure_feed(
+            "EURUSD_otc", 60, "user-a", lambda: calls.append("subscribe"), lambda: True
+        )
+
+    assert calls == ["subscribe"]
+
+
+async def test_a_dead_own_feed_is_reopened(market):
+    """The flip side: if this account's own socket dropped, the pair must be reopened."""
+    alive = {"ok": True}
+    calls: list[str] = []
+
+    await market.ensure_feed(
+        "EURUSD_otc", 60, "user-a", lambda: calls.append("a1"), lambda: alive["ok"]
+    )
+    alive["ok"] = False
+    await market.ensure_feed(
+        "EURUSD_otc", 60, "user-a", lambda: calls.append("a2"), lambda: True
+    )
+
+    assert calls == ["a1", "a2"]
