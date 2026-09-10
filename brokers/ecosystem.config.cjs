@@ -48,6 +48,14 @@ module.exports = {
         // so one proxy line in scaralpha.env serves both processes.
         BROKER_PROXY: process.env.BROKER_PROXY || process.env.BINOLLA_AUTH_PROXY || '',
         BINOLLA_AUTH_PROXY: process.env.BINOLLA_AUTH_PROXY || '',
+        // Where the streamed candle history is kept. Quotex has no history call, so this
+        // directory IS the price history — losing it costs hours of re-accumulation.
+        BROKER_DATA_DIR: process.env.BROKER_DATA_DIR || path.join(__dirname, 'var'),
+        // Set by app/proxy.py at start-up too; passed through so an operator can override
+        // the exit for this process alone.
+        HTTPS_PROXY: process.env.HTTPS_PROXY || '',
+        HTTP_PROXY: process.env.HTTP_PROXY || '',
+        NO_PROXY: process.env.NO_PROXY || '127.0.0.1,localhost',
         PYTHONUNBUFFERED: '1',
         PATH: `${venvBin}:${process.env.PATH || ''}`,
       },

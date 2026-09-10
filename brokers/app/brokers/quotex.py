@@ -22,11 +22,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import os
 import time
 from typing import Any
 
 from app.candle_store import CandleStore, trim
+from app.proxy import configure_process_proxy, proxy_url
 from app.brokers.base import (
     AuthError,
     BlockedError,
@@ -160,6 +160,11 @@ class QuotexSession(BrokerSession):
         cls = _load_client_cls()
         self.lifecycle = LifecycleState.CONNECTING
 
+        # Before the client is constructed, not after: its transport reads the proxy from
+        # the environment when it builds its session, and there is no object to set it on
+        # afterwards.
+        configure_process_proxy()
+
         # The balance is chosen in the constructor, before the socket exists. Switching
         # after the handshake races the broker's own setup and can leave the session on
         # the other balance while the API reports this one.
@@ -170,9 +175,11 @@ class QuotexSession(BrokerSession):
             is_demo=account_type is AccountType.DEMO,
         )
 
-        proxy = _proxy_settings()
-        if proxy:
-            _apply_proxy(client, proxy)
+        # Belt and braces for builds that DO expose a proxy attribute. The environment
+        # above is what actually carries it for this library.
+        url = proxy_url()
+        if url:
+            _apply_proxy(client, {"http": url, "https": url})
 
         try:
             await _maybe_await(client.connect())
@@ -640,27 +647,3 @@ def _translate_reason(reason: str) -> Exception:
     return AuthError(reason or "Quotex refused the connection.")
 
 
-def _proxy_settings() -> dict[str, str] | None:
-    """
-    Proxy for outbound broker traffic, from BROKER_PROXY (or BINOLLA_AUTH_PROXY, so one
-    value can serve both).
-
-    Accepts either shape:
-        http://user:pass@host:port
-        host:port:user:pass          (what proxy vendors usually hand out)
-    """
-    raw = (os.environ.get("BROKER_PROXY") or os.environ.get("BINOLLA_AUTH_PROXY") or "").strip()
-    if not raw:
-        return None
-
-    url = raw
-    if "://" not in raw:
-        parts = raw.split(":")
-        if len(parts) >= 4:
-            host, port, user, *rest = parts
-            # Keep the remainder as the password so one containing ':' survives.
-            url = f"http://{user}:{':'.join(rest)}@{host}:{port}"
-        elif len(parts) == 2:
-            url = f"http://{raw}"
-
-    return {"http": url, "https": url}

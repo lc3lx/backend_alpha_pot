@@ -35,6 +35,7 @@ from app.models import (
     SessionStatus,
     TradingAsset,
 )
+from app.proxy import configure_process_proxy, mask
 from app.registry import SessionRegistry
 
 #: Adapters by broker id. Binolla joins this once its port lands; until then the .NET
@@ -46,6 +47,10 @@ ADAPTERS: dict[str, type[BrokerSession]] = {
 
 app = FastAPI(title="Scar Alpha Broker Gateway", version="0.1.0")
 registry = SessionRegistry()
+
+#: Set once, at import, before any broker client exists — a client that builds its HTTP
+#: session before this runs would go out on the server's own IP and be refused.
+_PROXY = configure_process_proxy()
 
 #: Shared secret with the .NET backend. Localhost binding is the real boundary; this stops
 #: another local process from driving somebody's trading session.
@@ -120,6 +125,10 @@ async def health() -> dict[str, object]:
         "ok": True,
         "brokers": sorted(ADAPTERS),
         "sessions": registry.count,
+        # Whether broker traffic is actually leaving through the proxy is the single most
+        # common cause of "the broker refuses everything", so it is visible here rather
+        # than only discoverable from a log. Host and port only — never the credentials.
+        "proxy": mask(_PROXY),
     }
 
 
