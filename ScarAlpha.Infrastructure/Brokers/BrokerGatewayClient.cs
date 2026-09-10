@@ -214,9 +214,13 @@ public sealed class BrokerGatewayClient : IBrokerClient
     public async Task<QuoteData> GetLatestQuoteAsync(string asset, CancellationToken ct = default)
     {
         var query = $"asset={Uri.EscapeDataString(asset)}";
-        var dto = await GetAsync<QuoteDto?>("/market/quote", query, ct).ConfigureAwait(false);
+        // The gateway answers `null` when a pair has no price yet — normal for a broker
+        // that only streams, and normal for a pair subscribed seconds ago. Reading that
+        // through the non-null helper turned it into "Gateway returned no body" and a 500
+        // on every price poll.
+        var dto = await GetOrNullAsync<QuoteDto>("/market/quote", query, ct).ConfigureAwait(false);
         if (dto is null)
-            throw new ApiException(ApiErrorCodes.MarketUnavailable, $"No quote for {asset}.", 503);
+            throw new ApiException(ApiErrorCodes.MarketUnavailable, $"No quote for {asset} yet.", 503);
 
         var quote = new QuoteData
         {
@@ -441,6 +445,25 @@ public sealed class BrokerGatewayClient : IBrokerClient
                 $"The {Broker} service did not answer in time.",
                 504);
         }
+    }
+
+    /// <summary>
+    /// Like <see cref="GetAsync{T}"/> but accepts an absent payload as an answer rather
+    /// than an error — for endpoints where "nothing yet" is a real, expected state.
+    /// </summary>
+    private async Task<T?> GetOrNullAsync<T>(
+        string path, string? query, CancellationToken ct, TimeSpan? budget = null)
+        where T : class
+    {
+        var url = $"{path}?user_id={Uri.EscapeDataString(UserId)}&broker={Broker}"
+                  + (string.IsNullOrEmpty(query) ? string.Empty : "&" + query);
+
+        var response = await SendAsync(token => _http.GetAsync(url, token), ct, budget)
+            .ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw await TranslateAsync(response, ct).ConfigureAwait(false);
+
+        return await response.Content.ReadFromJsonAsync<T>(Json, ct).ConfigureAwait(false);
     }
 
     private async Task<T> GetAsync<T>(

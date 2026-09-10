@@ -774,8 +774,17 @@ public sealed class BinollaAppService
         {
             // Throttling and failure marking happen inside; a refusal (including the
             // "already running / just refused" 429) simply means no session this round.
+            // The venue MUST come from the link. Left off, it normalised to Binolla and a
+            // Quotex user's background reconnect ran Binolla's browser capture against
+            // their Quotex credentials — which is how signing in to Quotex ended up
+            // logging people into Binolla instead.
             return await LoginWithCredentialsAsync(
-                new BinollaCredentialRequest(email, password, link.AccountType.ToString()),
+                new BinollaCredentialRequest(
+                    email,
+                    password,
+                    link.AccountType.ToString(),
+                    ReferralCode: null,
+                    Broker: Brokers.Normalize(link.Broker)),
                 ct);
         }
         catch (ApiException)

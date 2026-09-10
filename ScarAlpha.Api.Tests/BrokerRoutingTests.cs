@@ -68,4 +68,26 @@ public sealed class BrokerRoutingTests
         new BrokerCredentials().AccountType
             .Should().Be(ScarAlpha.Binolla.Models.AccountType.Real);
     }
+
+    /// <summary>
+    /// A background reconnect must go to the user's OWN venue.
+    ///
+    /// <para>The stored-credential relogin built its request without a broker, and an
+    /// absent broker normalises to Binolla — so a Quotex user's silent reconnect ran
+    /// Binolla's browser capture against their Quotex email and password. From the user's
+    /// side that looked like signing in to Quotex and landing in Binolla.</para>
+    ///
+    /// <para>This pins the normalisation that made the omission invisible: it never throws
+    /// and never reports an unknown value, so the only defence is passing the broker.</para>
+    /// </summary>
+    [Fact]
+    public void An_omitted_broker_silently_becomes_binolla()
+    {
+        Brokers.Normalize(null).Should().Be(Brokers.Binolla);
+        Brokers.Normalize(string.Empty).Should().Be(Brokers.Binolla);
+
+        // Which is correct for a link that predates the choice, and wrong for every other
+        // one — so a caller holding a link must read the broker from it.
+        Brokers.Normalize("quotex").Should().Be(Brokers.Quotex);
+    }
 }

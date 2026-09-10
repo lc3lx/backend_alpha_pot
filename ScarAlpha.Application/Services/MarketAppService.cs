@@ -177,6 +177,14 @@ public sealed class MarketAppService
         {
             throw new ApiException(ApiErrorCodes.ValidationError, ex.Message);
         }
+        catch (ApiException ex) when (ex.Code == ApiErrorCodes.MarketUnavailable)
+        {
+            // "No price yet" is a state, not a failure: a streaming broker has nothing for
+            // a pair until its feed fills. A 500 here made the chart poll produce a server
+            // error every two seconds and buried real problems in the log.
+            client.EnsureMarketDataWarm(symbol, 60);
+            return new MarketPriceResponse(symbol, null, DateTimeOffset.UtcNow);
+        }
         catch (ApiException) { throw; }
         catch (Exception ex)
         {
