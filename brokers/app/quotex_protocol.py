@@ -204,7 +204,7 @@ class QuotexLiveData:
         async with self.balance_lock:
             if self.balances is None or time.monotonic() - self.balance_at >= 3:
                 self.balance_ready.clear()
-                await self.send_event("s_balance/list")
+                await self.send_event("s_balance/list", {"_placeholder": True, "num": 0})
                 try:
                     await asyncio.wait_for(self.balance_ready.wait(), 8)
                 except asyncio.TimeoutError as exc:

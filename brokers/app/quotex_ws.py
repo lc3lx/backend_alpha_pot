@@ -225,6 +225,11 @@ class WebSocketTransport:
         if self._on_close is not None:
             delegate.set_on_close(self._on_close)
 
+        if hasattr(delegate, "_poll_messages"):
+            # Own the polling loop too: the vendor otherwise retries expired SIDs
+            # forever while continuing to report is_connected() == True.
+            delegate._poll_messages = lambda: self._poll_loop(delegate)
+
         try:
             opened = bool(delegate.connect())
         except Exception as exc:
@@ -252,11 +257,6 @@ class WebSocketTransport:
         except ValueError:
             return False
 
-        if hasattr(delegate, "_poll_messages"):
-            # Own the polling loop too: the vendor otherwise retries expired SIDs
-            # forever while continuing to report is_connected() == True.
-            delegate._poll_messages = lambda: self._poll_loop(delegate)
-
         if not isinstance(payload, dict):
             return False
 
@@ -278,7 +278,12 @@ class WebSocketTransport:
             with self._send_lock:
                 if hasattr(self._delegate, "polling_url"):
                     return self._send_polling(message)
-                return bool(self._delegate.send(message))
+                try:
+                    res = self._delegate.send(message)
+                    return res is not False
+                except Exception as exc:
+                    self._fail(exc)
+                    return False
         if not self.is_connected():
             return False
         try:
@@ -519,7 +524,7 @@ def _open_with_curl(ws_url: str, headers: dict[str, str]) -> Any:
         except Exception:
             pass
 
-    _warm_session(session, ws_url)
+    sid = _warm_session(session, ws_url)
 
     connect = getattr(session, "ws_connect", None)
     if connect is None:
@@ -531,18 +536,42 @@ def _open_with_curl(ws_url: str, headers: dict[str, str]) -> Any:
             pass
         return None
 
-    try:
+    # Strip custom User-Agent so curl_cffi uses its matched TLS browser profile
+    ws_headers = {k: v for k, v in headers.items() if k.lower() != "user-agent"}
+
+    # Forward cookies from warm session if available
+    if hasattr(session, "cookies") and session.cookies:
         try:
-            socket = connect(ws_url, headers=headers, timeout=_CONNECT_TIMEOUT)
-        except TypeError:
-            socket = connect(ws_url, headers=headers)
-    except Exception as exc:
-        _log(f"impersonated upgrade refused ({_short(exc)})")
-        try:
-            session.close()
+            cookie_items = [f"{c.name}={c.value}" for c in session.cookies]
+            if cookie_items and "Cookie" not in ws_headers and "cookie" not in ws_headers:
+                ws_headers["Cookie"] = "; ".join(cookie_items)
         except Exception:
             pass
-        return None
+
+    target_url = ws_url
+    if sid and "sid=" not in target_url:
+        separator = "&" if "?" in target_url else "?"
+        target_url = f"{target_url}{separator}sid={sid}"
+
+    try:
+        try:
+            socket = connect(target_url, headers=ws_headers, timeout=_CONNECT_TIMEOUT)
+        except TypeError:
+            socket = connect(target_url, headers=ws_headers)
+    except Exception as exc:
+        _log(f"impersonated upgrade with sid refused ({_short(exc)}); trying direct ws_url")
+        try:
+            try:
+                socket = connect(ws_url, headers=ws_headers, timeout=_CONNECT_TIMEOUT)
+            except TypeError:
+                socket = connect(ws_url, headers=ws_headers)
+        except Exception as exc2:
+            _log(f"impersonated upgrade refused ({_short(exc2)})")
+            try:
+                session.close()
+            except Exception:
+                pass
+            return None
 
     _log("upgraded on the impersonating session")
     return _CurlSocket(session, socket)
@@ -583,7 +612,7 @@ def _open_with_websocket_client(ws_url: str, headers: dict[str, str]) -> Any:
         return None
 
 
-def _warm_session(session: Any, ws_url: str) -> None:
+def _warm_session(session: Any, ws_url: str) -> str | None:
     """
     Earns Cloudflare's clearance cookie on this session, so the upgrade carries it.
 
@@ -595,13 +624,20 @@ def _warm_session(session: Any, ws_url: str) -> None:
 
     origin = _origin(ws_url)
     try:
-        session.get(
+        resp = session.get(
             http_url,
             timeout=_CONNECT_TIMEOUT,
             headers={"Origin": origin, "Referer": f"{origin}/"},
         )
+        if resp.status_code == 200 and resp.text.startswith("0{"):
+            try:
+                data = json.loads(resp.text[1:])
+                return data.get("sid")
+            except Exception:
+                pass
     except Exception as exc:
         _log(f"session warm-up failed ({_short(exc)}); trying the upgrade anyway")
+    return None
 
 
 def _short(exc: Exception) -> str:

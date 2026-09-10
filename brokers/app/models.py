@@ -10,6 +10,7 @@ that broker's adapter and never reaches this module.
 from __future__ import annotations
 
 from enum import Enum
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -17,6 +18,14 @@ from pydantic import BaseModel, Field
 class AccountType(str, Enum):
     DEMO = "Demo"
     REAL = "Real"
+
+    @classmethod
+    def _missing_(cls, value: object) -> Any:
+        if isinstance(value, str):
+            for member in cls:
+                if member.value.lower() == value.strip().lower():
+                    return member
+        return super()._missing_(value)
 
 
 class LifecycleState(str, Enum):

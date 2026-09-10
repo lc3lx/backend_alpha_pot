@@ -225,3 +225,22 @@ async def test_session_connect_uses_wire_auth_and_balance_and_closes_on_failure(
             assert (await session.get_balance()).real == 42.5
         finally:
             await session.disconnect()
+
+
+def test_account_type_case_insensitive():
+    assert AccountType("REAL") is AccountType.REAL
+    assert AccountType("real") is AccountType.REAL
+    assert AccountType("DEMO") is AccountType.DEMO
+    assert AccountType("demo") is AccountType.DEMO
+
+
+async def test_get_balance_sends_placeholder_payload(live):
+    sends = []
+    async def send(event, data=None):
+        sends.append((event, data))
+        live.on_event("s_balance/list", {"liveBalance": 100.0, "demoBalance": 50.0})
+    live.send_event = send
+    bal = await live.get_balance(AccountType.REAL)
+    assert len(sends) == 1
+    assert sends[0] == ("s_balance/list", {"_placeholder": True, "num": 0})
+    assert bal.real == 100.0
