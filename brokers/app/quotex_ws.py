@@ -1,62 +1,11 @@
-"""
-A real WebSocket transport for the Quotex client.
+"""Synchronous Quotex transport with a curl_cffi WebSocket and polling fallback.
 
-## Why
+Network operations are called through asyncio.to_thread by the protocol adapter.
+Commands use text frames; polling packets use Engine.IO v3 length prefixes.
+Upgrade attempts are bounded and backed off after repeated failures. The plain
+websocket-client fallback is opt-in because it adds another TLS handshake.
 
-The vendored library's transport is called `CurlWebSocketTransport`, but it speaks no
-WebSocket at all: it rewrites `transport=websocket` to `transport=polling` and then sends
-every Socket.IO frame as a separate HTTP POST through `curl_cffi`. Quotex itself offers
-the upgrade — its handshake answers `"upgrades":["websocket"]` — and the library declines
-it.
-
-Measured on the production log, that cost:
-
-  * ~1 second per subscribe, because each frame is a fresh HTTPS round trip through the
-    proxy — 25 pairs took 25+ seconds to arm
-  * a constant stream of `{"code":1,"message":"Session ID unknown"}`, because a polling
-    session dies to a 5-second ping timeout the moment a poll is late or exits from a
-    different proxy IP
-  * candles that never arrived, since the subscribes they were riding on were rejected
-
-One open socket removes all three at once: frames go out immediately, the session is held
-by the connection itself rather than by a sequence of matched requests, and pushes arrive
-as the market prints them.
-
-## How it is wired in
-
-By replacing the class the library imports, not by editing the library. `vendor/QuotexAPI`
-is a git checkout that is re-cloned on every deploy, so an edit there disappears silently
-and the slow path comes back with nothing to explain why.
-
-The interface below matches the original exactly — sync, same method names, same callback
-registration — so every protocol behaviour above it is untouched.
-
-## Cloudflare, and why the upgrade goes through curl_cffi
-
-Quotex sits behind Cloudflare, which is why the library reached for `curl_cffi` in the
-first place: it impersonates Chrome's TLS fingerprint, and Cloudflare's bot management
-scores that fingerprint (JA3) as much as it scores the IP.
-
-The first attempt here opened the socket with `websocket-client` and merely COPIED the
-Cloudflare cookie across from a `curl_cffi` request. That cannot work, and the logs said
-so — every upgrade came back 403 while the very same cookie fetch returned 200. A
-`__cf_bm` cookie is issued to a fingerprint as well as an address, and presenting it from
-a connection that plainly announces itself as Python is a worse signal than not
-presenting it at all.
-
-So the upgrade is made BY curl_cffi, on the impersonating session, and inherits the
-fingerprint that already passes. `websocket-client` remains as a second attempt for a
-curl_cffi too old to speak WebSocket.
-
-## When the upgrade is refused
-
-It DELEGATES to the transport it replaced, and the session carries on over polling.
-
-That fallback is the whole reason this is safe to install. Without it, replacing the
-class removed the only working path: this returned False, the library read that as a
-fatal connection failure, and every Quotex login died with "Failed to establish curl
-WebSocket connection" — on a venue that had been working, slowly, moments before. A
-faster transport is worth having; it is not worth trading a working one for.
+This module is installed outside vendor/ so deployments retain the fixes.
 """
 
 from __future__ import annotations
@@ -86,7 +35,7 @@ _BACKOFF_SECONDS = 1800
 #: Longest a single upgrade attempt may take. A broker either accepts the handshake
 #: quickly or is not going to; anything beyond this is a misconfiguration hanging, and
 #: waiting it out blocks a connect slot that other sign-ins are queued behind.
-_CONNECT_TIMEOUT = 25
+_CONNECT_TIMEOUT = 6
 
 #: Engine.IO v3 packet types used here.
 _OPEN = "0"
@@ -95,7 +44,8 @@ _PONG = "3"
 
 
 def _enabled() -> bool:
-    return (os.environ.get("QUOTEX_WS_TRANSPORT", "1") or "1").strip().lower() not in {
+    return os.environ.get("BROKER_QUOTEX_WS_TRANSPORT",
+        os.environ.get("QUOTEX_WS_TRANSPORT", "1")).strip().lower() not in {
         "0",
         "false",
         "no",
@@ -165,6 +115,8 @@ class WebSocketTransport:
         self._reader: threading.Thread | None = None
         self._pinger: threading.Thread | None = None
         self._running = threading.Event()
+        self._stopped = threading.Event()
+        self._send_lock = threading.Lock()
         self._ping_interval = 25.0
 
         self._on_message: Callable[[str], None] | None = None
@@ -216,7 +168,7 @@ class WebSocketTransport:
         # Cloudflare on the polling endpoint, so it is the one whose fingerprint the
         # challenge accepts.
         self._ws = _open_with_curl(ws_url, headers)
-        if self._ws is None:
+        if self._ws is None and os.getenv("QUOTEX_WS_PLAIN_FALLBACK", "0") == "1":
             self._ws = _open_with_websocket_client(ws_url, headers)
         if self._ws is None:
             _health.record_failure()
@@ -230,13 +182,18 @@ class WebSocketTransport:
             opening = self._ws.recv()
         except Exception as exc:
             _log(f"no open packet ({exc})")
-            self._fail(exc)
-            return False
+            self.close()
+            _health.record_failure()
+            return self._connect_via_original()
 
         if not self._read_open(opening):
-            _log(f"unexpected open packet: {str(opening)[:80]}")
-            return False
+            _log("unexpected open packet")
+            self.close()
+            _health.record_failure()
+            return self._connect_via_original()
 
+        self.message_queue.put(opening)
+        self._stopped.clear()
         self._running.set()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
@@ -244,7 +201,7 @@ class WebSocketTransport:
         self._pinger.start()
 
         _health.record_success()
-        _log(f"connected sid={self.sid} interval={self._ping_interval:.0f}s")
+        _log(f"connected interval={self._ping_interval:.0f}s")
         return True
 
     def _connect_via_original(self) -> bool:
@@ -279,6 +236,10 @@ class WebSocketTransport:
 
         self._delegate = delegate
         self.sid = getattr(delegate, "sid", None)
+        self._stopped.clear()
+        self._running.set()
+        self._pinger = threading.Thread(target=self._ping_loop, daemon=True)
+        self._pinger.start()
         _log("running on the original transport (polling)")
         return True
 
@@ -289,6 +250,14 @@ class WebSocketTransport:
         try:
             payload = json.loads(text[1:])
         except ValueError:
+            return False
+
+        if hasattr(delegate, "_poll_messages"):
+            # Own the polling loop too: the vendor otherwise retries expired SIDs
+            # forever while continuing to report is_connected() == True.
+            delegate._poll_messages = lambda: self._poll_loop(delegate)
+
+        if not isinstance(payload, dict):
             return False
 
         self.sid = payload.get("sid")
@@ -306,15 +275,54 @@ class WebSocketTransport:
 
     def send(self, message: str) -> bool:
         if self._delegate is not None:
-            return bool(self._delegate.send(message))
+            with self._send_lock:
+                if hasattr(self._delegate, "polling_url"):
+                    return self._send_polling(message)
+                return bool(self._delegate.send(message))
         if not self.is_connected():
             return False
         try:
-            self._ws.send(message)
+            with self._send_lock:
+                self._ws.send(message)
             return True
         except Exception as exc:
             self._fail(exc)
             return False
+
+    def _send_polling(self, message: str) -> bool:
+        delegate = self._delegate
+        if not delegate.is_connected():
+            return False
+        # Engine.IO v3 polling POSTs carry length-prefixed packets. The length is
+        # measured in JavaScript UTF-16 code units, not UTF-8 bytes.
+        size = len(message.encode("utf-16-le")) // 2
+        try:
+            response = delegate.session.post(
+                f"{delegate.polling_url}&sid={delegate.sid}",
+                headers={**self.headers, "Content-Type": "text/plain;charset=UTF-8"},
+                data=f"{size}:{message}", timeout=6)
+            if response.status_code != 200:
+                raise ConnectionError(f"Polling send failed: HTTP {response.status_code}")
+            return True
+        except Exception as exc:
+            delegate.close()
+            self._fail(exc)
+            return False
+
+    def _poll_loop(self, delegate: Any) -> None:
+        while delegate.is_connected():
+            try:
+                response = delegate.session.get(
+                    f"{delegate.polling_url}&sid={delegate.sid}",
+                    headers=self.headers, timeout=25)
+                if response.status_code != 200:
+                    raise ConnectionError(f"Polling receive failed: HTTP {response.status_code}")
+                for packet in delegate._parse_polling_payload(response.text):
+                    delegate.message_queue.put(packet)
+            except Exception as exc:
+                delegate.close()
+                self._fail(exc)
+                break
 
     def recv(self, timeout: float | None = None) -> str | None:
         if self._delegate is not None:
@@ -327,6 +335,8 @@ class WebSocketTransport:
             return None
 
     def close(self) -> None:
+        self._running.clear()
+        self._stopped.set()
         delegate, self._delegate = self._delegate, None
         if delegate is not None:
             try:
@@ -336,6 +346,7 @@ class WebSocketTransport:
             return
 
         self._running.clear()
+        self._stopped.set()
         ws, self._ws = self._ws, None
         if ws is not None:
             try:
@@ -360,7 +371,8 @@ class WebSocketTransport:
                 break
 
             if frame is None or frame == "":
-                continue
+                self._fail(ConnectionError("WebSocket closed by peer"))
+                break
 
             text = frame.decode() if isinstance(frame, (bytes, bytearray)) else str(frame)
 
@@ -370,7 +382,7 @@ class WebSocketTransport:
             if text == _PING:
                 # Some servers ping the client; answer or be dropped as unresponsive.
                 try:
-                    self._ws.send(_PONG)
+                    self.send(_PONG)
                 except Exception:
                     pass
                 continue
@@ -389,17 +401,26 @@ class WebSocketTransport:
         # A little under the server's interval: sending late is what gets a connection
         # closed as idle, and sending early costs nothing.
         while self._running.is_set():
-            time.sleep(max(1.0, self._ping_interval * 0.8))
-            if not self._running.is_set() or self._ws is None:
+            if self._stopped.wait(max(1.0, self._ping_interval * 0.8)):
+                break
+            if not self._running.is_set() or not self.is_connected():
                 break
             try:
-                self._ws.send(_PING)
+                if not self.send(_PING):
+                    break
             except Exception as exc:
                 self._fail(exc)
                 break
 
     def _fail(self, exc: Exception) -> None:
         self._running.clear()
+        self._stopped.set()
+        ws, self._ws = self._ws, None
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
         if self._on_error is not None:
             try:
                 self._on_error(exc)
@@ -419,15 +440,30 @@ class _CurlSocket:
     def __init__(self, session: Any, socket: Any) -> None:
         self._session = session
         self._socket = socket
+        self._opening = True
 
     def recv(self) -> str:
-        frame = self._socket.recv()
+        # Synchronous curl_cffi.recv has no timeout argument. Bound the initial
+        # Engine.IO packet by closing the socket if its handshake never arrives.
+        timer = threading.Timer(_CONNECT_TIMEOUT, self.close) if self._opening else None
+        if timer is not None:
+            timer.daemon = True
+            timer.start()
+        try:
+            frame = self._socket.recv()
+        finally:
+            self._opening = False
+            if timer is not None:
+                timer.cancel()
         if isinstance(frame, tuple):
+            if int(frame[1]) & 8:  # CurlWsFlag.CLOSE
+                return ""
             frame = frame[0]
         return frame.decode() if isinstance(frame, (bytes, bytearray)) else str(frame)
 
     def send(self, message: str) -> None:
-        self._socket.send(message.encode())
+        # curl_cffi defaults to BINARY for bytes, but Socket.IO commands are TEXT.
+        self._socket.send_str(message)
 
     def close(self) -> None:
         try:

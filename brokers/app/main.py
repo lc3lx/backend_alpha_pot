@@ -155,7 +155,13 @@ async def health() -> dict[str, object]:
         # Which transport Quotex is on. "polling" means every frame is a separate HTTPS
         # round trip, which is the difference between a subscribe costing a millisecond
         # and costing a second.
-        "quotex_transport": "websocket" if _WEBSOCKET else "polling",
+        "quotex_transport": "websocket-with-polling-fallback" if _WEBSOCKET else "polling",
+        "quotex_live_transports": {
+            mode: sum(1 for session in registry.all_sessions()
+                if session.broker == "quotex" and session.transport_connected
+                and getattr(session, "transport_mode", None) == mode)
+            for mode in ("websocket", "polling")
+        },
     }
 
 

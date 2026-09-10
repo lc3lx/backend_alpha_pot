@@ -1,0 +1,239 @@
+"""Live Quotex events, isolated from the vendor's mock instruments/balance fallbacks.
+
+Wire references: cleitonleonel/pyquotex pyquotex/api.py and _api/assets.py.
+The vendor transport is synchronous; all I/O below runs outside the asyncio loop.
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import inspect
+import json
+import math
+import time
+from uuid import uuid4
+
+from app.brokers.base import AuthError, NotConnected
+from app.models import AccountType, Balance, TradingAsset
+
+
+class SocketIOPackets:
+    """Reassemble Socket.IO binary events before dispatching their JSON attachments."""
+
+    def __init__(self):
+        self.pending = None
+
+    def parse(self, message):
+        text = message.decode() if isinstance(message, bytes) else message
+        if text.startswith("b4"):
+            text = base64.b64decode(text[2:]).decode()
+        if text.startswith("45") and "-" in text:
+            count, body = text[2:].split("-", 1)
+            payload = json.loads(body)
+            if count != "1":
+                self.pending = None
+                raise ValueError("Unsupported Quotex attachment count")
+            if isinstance(payload, list) and payload and isinstance(payload[0], str):
+                data = payload[1] if len(payload) > 1 else None
+                if isinstance(data, dict) and data.get("_placeholder") is True:
+                    self.pending = payload[0]
+                    return None
+                return payload[0], data
+            if isinstance(payload, list) and len(payload) == 1 and isinstance(payload[0], dict):
+                return "balance", payload[0]
+        elif text.startswith("42"):
+            payload = json.loads(text[2:])
+            return payload[0], payload[1] if len(payload) > 1 else None
+        elif text.startswith(("[", "{")):
+            payload = json.loads(text)
+            if self.pending is not None:
+                event, self.pending = self.pending, None
+                return event, payload
+            if isinstance(payload, dict) and "liveBalance" in payload and "demoBalance" in payload:
+                return "balance", payload
+            if isinstance(payload, list):
+                return "quotes", payload
+        return None
+
+
+class QuotexLiveData:
+    def __init__(self, client, market):
+        self.client = client
+        self.connection = client.connection
+        self.market = market
+        self.packets = SocketIOPackets()
+        self.assets = None
+        self.assets_at = 0.0
+        self.balances = None
+        self.balance_at = 0.0
+        self.assets_ready = asyncio.Event()
+        self.balance_ready = asyncio.Event()
+        self.auth_ready = asyncio.Event()
+        self.auth_error = None
+        self.asset_lock = asyncio.Lock()
+        self.balance_lock = asyncio.Lock()
+        self.periods = set()
+        # The vendor delivers each packet through BOTH callback and recv(). Use only
+        # its ordered receive queue, otherwise a binary header is consumed twice.
+        self.connection._handle_message = self._ignore_callback
+        self.connection._receive_messages = self.receive
+        self.connection.send_raw = self.send_raw
+        self.connection.send_request = self.send_request
+
+    async def _ignore_callback(self, message):
+        pass
+
+    async def send_raw(self, message):
+        ws = self.connection._ws
+        if ws is None or not ws.is_connected():
+            raise NotConnected("Quotex transport disconnected.")
+        if inspect.iscoroutinefunction(ws.send):
+            sent = await ws.send(message)
+        else:
+            sent = await asyncio.to_thread(ws.send, message)
+        if sent is False:
+            raise NotConnected("Quotex transport refused the outgoing frame.")
+
+    async def send_request(self, message_type, data=None, timeout=None, expect_response=True):
+        # Compatibility for vendor services that await the synchronous transport.send.
+        request_id = str(uuid4())
+        future = asyncio.get_running_loop().create_future()
+        pending = self.connection._pending_requests
+        if expect_response:
+            pending[request_id] = future
+        try:
+            await self.send_raw(json.dumps({**(data or {}), "msg": message_type, "request_id": request_id}))
+            if expect_response:
+                return await asyncio.wait_for(future, timeout or self.connection._request_timeout)
+        finally:
+            pending.pop(request_id, None)
+
+    async def send_event(self, event, data=None):
+        payload = [event] if data is None else [event, data]
+        await self.send_raw("42" + json.dumps(payload, separators=(",", ":")))
+
+    async def receive(self):
+        ws = self.connection._ws
+        while ws is not None and ws.is_connected():
+            message = await asyncio.to_thread(ws.recv, 0.5)
+            if not message:
+                continue
+            if message == "2":
+                await self.send_raw("3")
+                continue
+            try:
+                if isinstance(message, str) and message.startswith("{"):
+                    value = json.loads(message)
+                    if value.get("request_id"):
+                        await self.connection._route_message(value)
+                        continue
+                parsed = self.packets.parse(message)
+                if parsed is None:
+                    continue
+                event, data = parsed
+                self.on_event(event, data)
+                await self.connection._route_socketio_event(event, data)
+            except (ValueError, TypeError, KeyError, IndexError):
+                # Malformed input must not stop subsequent valid market updates.
+                continue
+
+    def on_event(self, event, data):
+        if event in {"s_authorization", "authorization/reject"}:
+            if event == "authorization/reject" or (isinstance(data, dict) and
+                    (data.get("error") or data.get("isSuccessful") is False)):
+                self.auth_error = AuthError("Quotex rejected the session. Sign in again.")
+            self.auth_ready.set()
+        if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict):
+            data = data[0]
+        if isinstance(data, dict) and "liveBalance" in data and "demoBalance" in data:
+            real, demo = float(data["liveBalance"]), float(data["demoBalance"])
+            if math.isfinite(real) and math.isfinite(demo):
+                self.balances = (real, demo)
+                self.balance_at = time.monotonic()
+                self.balance_ready.set()
+        if event == "instruments/list":
+            rows = data.get("list") if isinstance(data, dict) else data
+            if not isinstance(rows, list):
+                return
+            assets = []
+            for row in rows:
+                if not isinstance(row, list) or len(row) < 15 or not isinstance(row[1], str):
+                    continue
+                try:
+                    assets.append(TradingAsset(symbol=row[1], name=str(row[2]).replace("\n", ""),
+                        payout=int(float(row[5] or 0)), is_open=row[14] in (True, 1)))
+                except (ValueError, TypeError):
+                    continue
+            if rows and not assets:
+                return
+            self.assets = assets
+            self.assets_at = time.monotonic()
+            self.assets_ready.set()
+        if event in {"quotes", "instruments/update", "quotes/stream"} and isinstance(data, list):
+            for row in data:
+                if not isinstance(row, list) or len(row) < 3 or not isinstance(row[0], str):
+                    continue
+                try:
+                    symbol, ts, price = row[0], float(row[1]), float(row[2])
+                    if not math.isfinite(ts) or not math.isfinite(price) or price <= 0:
+                        continue
+                    tick = {"time": ts, "price": price}
+                    self.market.apply_quote(symbol, tick)
+                    for asset, period in self.periods:
+                        if asset == symbol:
+                            self.market.apply_candle(asset, period, tick)
+                except (ValueError, TypeError):
+                    continue
+
+    async def authenticate(self, ssid, account_type):
+        if not ssid:
+            raise AuthError("Quotex requires a browser-captured session before connecting.")
+        self.auth_ready.clear()
+        self.auth_error = None
+        await self.send_event("authorization", {"session": ssid,
+            "isDemo": int(account_type is AccountType.DEMO), "tournamentId": 0})
+        try:
+            await asyncio.wait_for(self.auth_ready.wait(), 15)
+        except asyncio.TimeoutError as exc:
+            raise AuthError("Quotex authorization timed out. Sign in again.") from exc
+        if self.auth_error:
+            raise self.auth_error
+
+    async def get_balance(self, account_type):
+        self.require_connected()
+        async with self.balance_lock:
+            if self.balances is None or time.monotonic() - self.balance_at >= 3:
+                self.balance_ready.clear()
+                await self.send_event("s_balance/list")
+                try:
+                    await asyncio.wait_for(self.balance_ready.wait(), 8)
+                except asyncio.TimeoutError as exc:
+                    raise NotConnected("Quotex did not provide a live balance.") from exc
+            real, demo = self.balances
+            return Balance(real=real, demo=demo, current_type=account_type)
+
+    async def list_assets(self):
+        self.require_connected()
+        async with self.asset_lock:
+            if self.assets is None or time.monotonic() - self.assets_at >= 30:
+                self.assets_ready.clear()
+                await self.send_event("instruments/get")
+                try:
+                    await asyncio.wait_for(self.assets_ready.wait(), 8)
+                except asyncio.TimeoutError as exc:
+                    raise NotConnected("Quotex did not provide live instruments.") from exc
+            return list(self.assets)
+
+    def require_connected(self):
+        ws = self.connection._ws
+        if ws is None or not ws.is_connected():
+            raise NotConnected("Quotex transport disconnected.")
+
+    async def subscribe(self, asset, period):
+        key = (asset, period)
+        self.periods.add(key)
+        try:
+            await self.send_event("instruments/update", {"asset": asset, "period": period})
+        except BaseException:
+            self.periods.discard(key)
+            raise

@@ -33,9 +33,11 @@ from typing import Any
 from app.market_data import market_data
 from app.proxy import configure_process_proxy, proxy_url
 from app.quotex_ws import install as install_websocket_transport
+from app.quotex_protocol import QuotexLiveData
 from app.brokers.base import (
     AuthError,
     BlockedError,
+    BrokerError,
     BrokerSession,
     CaptchaRequired,
     NotConnected,
@@ -142,6 +144,7 @@ class QuotexSession(BrokerSession):
         super().__init__(user_id)
         self._client: Any = None
         self._data: Any = None
+        self._live: QuotexLiveData | None = None
         #: Shared across every session on this broker — see app.market_data.
         self._market = market_data(self.broker)
         #: Pairs this session has subscribed, so its claims can be released on close.
@@ -171,17 +174,7 @@ class QuotexSession(BrokerSession):
         # the environment when it builds its session, and there is no object to set it on
         # afterwards.
         configure_process_proxy()
-        # The faster WebSocket transport is OFF unless this deployment asks for it.
-        #
-        # It is not merely unproven, it is known broken: the shim's send/recv/connect are
-        # plain functions while the library awaits them, so every send died with "object
-        # bool can't be used in 'await' expression" — the authorisation frame included.
-        # That is why a correctly captured SSID still produced "Session ID unknown" and an
-        # account with no candles and no balance. A slow transport that works beats a fast
-        # one that silently swallows authentication, so the library keeps its own until the
-        # shim is made properly asynchronous.
-        if os.getenv("BROKER_QUOTEX_WS_TRANSPORT", "").strip().lower() in {"1", "true", "yes"}:
-            install_websocket_transport()
+        install_websocket_transport()
 
         # The balance is chosen in the constructor, before the socket exists. Switching
         # after the handshake races the broker's own setup and can leave the session on
@@ -199,37 +192,38 @@ class QuotexSession(BrokerSession):
         if url:
             _apply_proxy(client, {"http": url, "https": url})
 
-        try:
-            await _maybe_await(client.connect())
-        except Exception as exc:
-            self.lifecycle = LifecycleState.FAULTED
-            raise _translate(exc)
-
-        # `connect()` returns None and signals failure by raising, so the session is only
-        # proven live by a call that needs authentication. Doing it here means a bad
-        # password fails at login instead of surfacing later as an empty market.
-        try:
-            await _maybe_await(client.get_balance())
-        except Exception as exc:
-            if not await self._explicit_login(client, ssid, email, password):
-                self.lifecycle = LifecycleState.AUTH_FAILED
-                raise _translate(exc)
-
         self._client = client
-        self._data = _find_data_service(client)
         self.account_type = account_type
-        #: Remembered so a later connect can tell "the same session again" from "a freshly
-        #: captured one". Without it every login would tear down a working socket.
         self.ssid = ssid
-        self.lifecycle = LifecycleState.CONNECTED
-
-        # Confirm the balance rather than trusting the constructor flag alone.
+        connection = getattr(client, "connection", None)
+        if connection is not None and hasattr(connection, "_route_socketio_event"):
+            self._live = QuotexLiveData(client, self._market)
         try:
-            await self.change_account(account_type)
-        except Exception:
-            # Already on the right balance, or the library has no switch. The constructor
-            # flag stands; a wrong balance would show up in get_balance either way.
-            pass
+            if self._live is not None and not ssid:
+                raise AuthError("Quotex requires a browser-captured session before connecting.")
+            connected = await _maybe_await(client.connect())
+            if connected is False:
+                raise NotConnected("Quotex connection failed.")
+            if self._live is not None:
+                await self._live.authenticate(ssid, account_type)
+                # No placeholder balances: login is usable only after a real response.
+                await self._live.get_balance(account_type)
+            else:
+                if hasattr(client, "login_with_ssid") or hasattr(client, "login_with_email"):
+                    if not await self._explicit_login(client, ssid, email, password):
+                        raise AuthError("Quotex authentication failed.")
+                await _maybe_await(client.get_balance())
+        except BaseException as exc:
+            await self.disconnect()
+            self.lifecycle = LifecycleState.AUTH_FAILED if isinstance(exc, AuthError) else LifecycleState.FAULTED
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            if isinstance(exc, BrokerError):
+                raise
+            raise _translate(exc) from exc
+
+        self._data = _find_data_service(client)
+        self.lifecycle = LifecycleState.CONNECTED
 
     async def _explicit_login(
         self, client: Any, ssid: str | None, email: str | None, password: str | None
@@ -257,6 +251,7 @@ class QuotexSession(BrokerSession):
 
         client, self._client = self._client, None
         self._data = None
+        self._live = None
         self.lifecycle = LifecycleState.DISCONNECTED
         if client is None:
             return
@@ -276,6 +271,11 @@ class QuotexSession(BrokerSession):
         if self._client is None:
             return False
         try:
+            connection = getattr(self._client, "connection", None)
+            if connection is not None and hasattr(connection, "_ws"):
+                ws = connection._ws
+                if ws is None or not ws.is_connected():
+                    return False
             connected = getattr(self._client, "is_connected", None)
             if connected is None:
                 return True
@@ -288,10 +288,20 @@ class QuotexSession(BrokerSession):
             raise NotConnected("Quotex session is not connected.")
         return self._client
 
+    @property
+    def transport_mode(self) -> str:
+        connection = getattr(self._client, "connection", None)
+        ws = getattr(connection, "_ws", None)
+        if getattr(ws, "_ws", None) is not None and getattr(ws, "_delegate", None) is None:
+            return "websocket"
+        return "polling"
+
     # ---- account -----------------------------------------------------------
 
     async def get_balance(self) -> Balance:
         client = self._require()
+        if self._live is not None:
+            return await self._live.get_balance(self.account_type)
         enums = _enums()
         demo_type = _enum_member(enums.AccountType, "DEMO", "PRACTICE")
 
@@ -326,6 +336,12 @@ class QuotexSession(BrokerSession):
 
     async def change_account(self, account_type: AccountType) -> None:
         client = self._require()
+        if account_type is self.account_type:
+            return
+        if self._live is not None:
+            # The gateway session manager reconnects with credentials for a different
+            # balance. Do not send the vendor's unsupported generic switch_account.
+            raise NotConnected("Reconnect the Quotex session to change account type.")
         switch = getattr(client, "switch_account", None) or getattr(
             client, "change_account", None
         )
@@ -343,6 +359,8 @@ class QuotexSession(BrokerSession):
 
     async def list_assets(self) -> list[TradingAsset]:
         client = self._require()
+        if self._live is not None:
+            return await self._live.list_assets()
         raw = await _maybe_await(client.get_assets())
 
         assets: list[TradingAsset] = []
@@ -411,6 +429,13 @@ class QuotexSession(BrokerSession):
     async def subscribe(self, asset: str, period_seconds: int = 60) -> None:
         client = self._require()
         key = (asset, period_seconds)
+
+        if self._live is not None:
+            await self._market.ensure_feed(asset, period_seconds, self.user_id,
+                lambda: self._live.subscribe(asset, period_seconds),
+                lambda: self.transport_connected)
+            self._subscribed.add(key)
+            return
 
         data = self._data or _find_data_service(client)
         if data is None:

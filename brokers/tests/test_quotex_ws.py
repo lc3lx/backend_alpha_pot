@@ -249,3 +249,63 @@ def test_without_an_original_there_is_nothing_to_fall_back_to(monkeypatch):
     monkeypatch.setattr(ws, "_health", ws._UpgradeHealth())
 
     assert ws.WebSocketTransport("wss://example/socket.io/").connect() is False
+
+
+def test_curl_sends_commands_as_text_and_uses_sync_recv_signature():
+    from types import SimpleNamespace
+    from app.quotex_ws import _CurlSocket
+    sent = []
+    socket = SimpleNamespace(send_str=sent.append,
+        recv=lambda: (b'40', 1))
+    adapter = _CurlSocket(None, socket)
+    adapter.send('42["authorization",{}]')
+    assert sent == ['42["authorization",{}]']
+    assert adapter.recv() == '40'
+    assert adapter.recv() == '40'
+
+
+def test_empty_read_closes_connection_instead_of_busy_looping():
+    from types import SimpleNamespace
+    closed = []
+    transport = WebSocketTransport('wss://example/')
+    transport._ws = SimpleNamespace(recv=lambda: '', close=lambda: closed.append(True))
+    transport._running.set()
+    transport._read_loop()
+    assert not transport.is_connected()
+    assert closed == [True]
+
+
+def test_both_transport_environment_names_use_one_policy(monkeypatch):
+    from app.quotex_ws import _enabled
+    monkeypatch.setenv('QUOTEX_WS_TRANSPORT', '1')
+    monkeypatch.setenv('BROKER_QUOTEX_WS_TRANSPORT', '0')
+    assert not _enabled()
+
+
+def test_polling_frames_use_engineio_lengths_and_failed_posts_disconnect():
+    from types import SimpleNamespace
+    sent = []
+    delegate = _FakeOriginal('https://example/')
+    delegate.connected = True
+    delegate.polling_url = 'https://example/?EIO=3&transport=polling'
+    delegate.session = SimpleNamespace(post=lambda *args, **kwargs:
+        (sent.append(kwargs['data']) or SimpleNamespace(status_code=200)))
+    transport = WebSocketTransport(delegate.url)
+    transport._delegate = delegate
+    assert transport.send('2')
+    assert sent == ['1:2']
+    delegate.session.post = lambda *a, **kw: SimpleNamespace(status_code=400)
+    assert not transport.send('2')
+    assert not transport.is_connected()
+
+
+def test_unknown_polling_sid_stops_receiving_and_marks_transport_dead():
+    from types import SimpleNamespace
+    delegate = _FakeOriginal('https://example/')
+    delegate.connected = True
+    delegate.polling_url = delegate.url
+    delegate.session = SimpleNamespace(get=lambda *a, **kw: SimpleNamespace(status_code=400))
+    transport = WebSocketTransport(delegate.url)
+    transport._delegate = delegate
+    transport._poll_loop(delegate)
+    assert not transport.is_connected()

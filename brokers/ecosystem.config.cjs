@@ -52,6 +52,8 @@ module.exports = {
         // the whole WebSocket from a single exit IP — which is what a rotating residential
         // pool otherwise breaks.
         BROKER_PROXY_SCHEME: process.env.BROKER_PROXY_SCHEME || '',
+        BROKER_QUOTEX_WS_TRANSPORT: process.env.BROKER_QUOTEX_WS_TRANSPORT || process.env.QUOTEX_WS_TRANSPORT || '1',
+        QUOTEX_WS_PLAIN_FALLBACK: process.env.QUOTEX_WS_PLAIN_FALLBACK || '0',
         // Where the streamed candle history is kept. Quotex has no history call, so this
         // directory IS the price history — losing it costs hours of re-accumulation.
         BROKER_DATA_DIR: process.env.BROKER_DATA_DIR || path.join(__dirname, 'var'),
