@@ -35,6 +35,7 @@ from app.models import (
     SessionStatus,
     TradingAsset,
 )
+from app.market_data import all_stores
 from app.proxy import configure_process_proxy, mask
 from app.registry import SessionRegistry
 
@@ -129,6 +130,9 @@ async def health() -> dict[str, object]:
         # common cause of "the broker refuses everything", so it is visible here rather
         # than only discoverable from a log. Host and port only — never the credentials.
         "proxy": mask(_PROXY),
+        # Shared history, so "is one feed really serving everyone?" is answerable without
+        # reading logs: series and feeds should stay flat as accounts are added.
+        "market": {broker: store.stats() for broker, store in all_stores().items()},
     }
 
 
@@ -248,3 +252,16 @@ def _status(session: BrokerSession) -> SessionStatus:
         transport_connected=session.transport_connected,
         account_type=session.account_type,
     )
+
+
+@app.on_event("shutdown")
+async def _persist_on_shutdown() -> None:
+    """
+    Write the shared history out before exiting.
+
+    A restart is exactly when the newest bars matter most: without this the last minute
+    of every series is lost to the write debounce, and on a venue with no history call
+    that gap cannot be fetched back.
+    """
+    for store in all_stores().values():
+        store.flush()

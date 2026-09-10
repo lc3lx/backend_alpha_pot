@@ -9,11 +9,14 @@ Everything Quotex-specific stops here. The rest of the service, and all of .NET,
 the neutral types in `app.models`.
 
 **On candles.** This library has no history call. Its `DataService` streams candles and
-quotes and nothing more, so bars are accumulated here as they arrive and persisted by
-`app.candle_store` so a restart does not throw the series away — without that, every
-deploy left each pair untradeable for hours while the warm-up re-accumulated.
+quotes and nothing more, so bars are accumulated as they arrive.
 
-What remains true is that a pair subscribed for the FIRST time has no past, and cannot be
+That accumulation is deliberately NOT held here. A pair's candles belong to the market,
+not to whoever is watching, so they live in the process-wide `app.market_data` store: one
+subscription per pair feeds every account, and an account that connects later inherits the
+whole history instead of warming up again from nothing. See that module for why.
+
+What remains true is that a pair nobody has ever subscribed has no past, and cannot be
 analysed until enough bars have streamed in. `has_fresh_candles` answers honestly, and
 `get_candles` returns only bars that genuinely closed.
 """
@@ -25,7 +28,7 @@ import inspect
 import time
 from typing import Any
 
-from app.candle_store import CandleStore, trim
+from app.market_data import market_data
 from app.proxy import configure_process_proxy, proxy_url
 from app.brokers.base import (
     AuthError,
@@ -136,13 +139,10 @@ class QuotexSession(BrokerSession):
         super().__init__(user_id)
         self._client: Any = None
         self._data: Any = None
-        self._store = CandleStore(self.broker)
-        #: (asset, timeframe) -> {bar_start: [open, high, low, close, volume]}
-        self._bars: dict[tuple[str, int], dict[int, list[float]]] = {}
-        #: (asset, timeframe) -> monotonic time of the last bar update actually received.
-        self._last_tick: dict[tuple[str, int], float] = {}
-        #: asset -> (epoch seconds, price), from the quote stream.
-        self._quotes: dict[str, tuple[float, float]] = {}
+        #: Shared across every session on this broker — see app.market_data.
+        self._market = market_data(self.broker)
+        #: Pairs this session has subscribed, so its claims can be released on close.
+        self._subscribed: set[tuple[str, int]] = set()
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -228,8 +228,11 @@ class QuotexSession(BrokerSession):
     async def disconnect(self) -> None:
         # Persist before tearing down: a clean shutdown is exactly when the newest bars
         # are worth keeping, and the debounce may have skipped the last minute of them.
-        for (asset, period_seconds), bucket in self._bars.items():
-            self._store.save(asset, period_seconds, bucket, force=True)
+        self._market.flush()
+        # Hand back the pairs this session was feeding so another can take them over
+        # rather than leaving them silently dead for everyone else.
+        await self._market.release_feeds(self.user_id)
+        self._subscribed.clear()
 
         client, self._client = self._client, None
         self._data = None
@@ -356,7 +359,7 @@ class QuotexSession(BrokerSession):
         # failing outright — it will simply return few or no bars until it fills.
         await self.subscribe(asset, period_seconds)
 
-        bucket = self._bars.get((asset, period_seconds), {})
+        bucket = self._market.bars(asset, period_seconds)
         now = time.time()
         # A bar is closed once its whole period is behind us. The forming bar is what
         # makes an indicator disagree with the broker's own chart, and no downstream
@@ -378,14 +381,8 @@ class QuotexSession(BrokerSession):
         return candles[-count:]
 
     async def get_quote(self, asset: str) -> Quote | None:
-        hit = self._quotes.get(asset)
+        hit = self._market.quote(asset)
         if hit is None:
-            # Fall back to the newest streamed bar's close, so a pair with candles but no
-            # separate quote feed still has a price.
-            for (sym, _tf), bucket in self._bars.items():
-                if sym == asset and bucket:
-                    start = max(bucket)
-                    return Quote(asset=asset, timestamp=float(start), price=bucket[start][3])
             return None
         ts, price = hit
         return Quote(asset=asset, timestamp=ts, price=price)
@@ -393,8 +390,6 @@ class QuotexSession(BrokerSession):
     async def subscribe(self, asset: str, period_seconds: int = 60) -> None:
         client = self._require()
         key = (asset, period_seconds)
-        if key in self._bars:
-            return  # already streaming
 
         data = self._data or _find_data_service(client)
         if data is None:
@@ -403,80 +398,55 @@ class QuotexSession(BrokerSession):
                 "built. The bot cannot analyse Quotex pairs without it."
             )
         self._data = data
-        # Start from what survived the last run. This is the whole point of persisting:
-        # a pair with history on disk is analysable immediately instead of after hours
-        # of re-accumulation.
-        self._bars[key] = self._store.load(asset, period_seconds)
+
+        def open_stream() -> Any:
+            async def run() -> None:
+                await _maybe_await(data.subscribe_candles(asset, period_seconds))
+                data.on_candle(asset, self._make_candle_handler(asset, period_seconds))
+
+                subscribe_quotes = getattr(data, "subscribe_quotes", None)
+                on_quote = getattr(data, "on_quote", None)
+                if subscribe_quotes is not None and on_quote is not None:
+                    await _maybe_await(subscribe_quotes(asset))
+                    on_quote(asset, self._make_quote_handler(asset))
+
+            return run()
 
         try:
-            await _maybe_await(data.subscribe_candles(asset, period_seconds))
-            data.on_candle(asset, self._make_candle_handler(asset, period_seconds))
-
-            subscribe_quotes = getattr(data, "subscribe_quotes", None)
-            on_quote = getattr(data, "on_quote", None)
-            if subscribe_quotes is not None and on_quote is not None:
-                await _maybe_await(subscribe_quotes(asset))
-                on_quote(asset, self._make_quote_handler(asset))
+            # One subscription per pair for the whole gateway, not one per account: the
+            # bars are identical, and multiplying them by the user count is what put
+            # thousands of redundant subscriptions on the broker.
+            await self._market.ensure_feed(
+                asset,
+                period_seconds,
+                self.user_id,
+                open_stream,
+                # This session's own liveness, remembered with the claim so another
+                # account can take the pair over if this socket drops.
+                lambda: self.transport_connected,
+            )
+            self._subscribed.add(key)
         except Exception as exc:
-            # Do not keep an empty bucket for a pair that never subscribed: it would read
-            # as "streaming but quiet" forever.
-            self._bars.pop(key, None)
             raise _translate(exc)
 
     def has_fresh_candles(self, asset: str, period_seconds: int) -> bool:
-        seen = self._last_tick.get((asset, period_seconds))
-        if seen is None:
-            return False
-        # One bar of slack: past that the stream is not keeping the series current.
-        return (time.monotonic() - seen) < (period_seconds + 15)
+        return self._market.is_fresh(asset, period_seconds)
 
     def _make_candle_handler(self, asset: str, period_seconds: int) -> Any:
-        key = (asset, period_seconds)
+        market = self._market
 
         def handle(payload: Any) -> None:
             row = payload if isinstance(payload, dict) else getattr(payload, "__dict__", {})
-            ts = _num(row.get("time") or row.get("from") or row.get("timestamp"))
-            close = _num(row.get("close") or row.get("price") or row.get("value"))
-            if ts is None or close is None:
-                return
-
-            start = int(ts) - (int(ts) % period_seconds)
-            bucket = self._bars.setdefault(key, {})
-            high = _num(row.get("high")) or close
-            low = _num(row.get("low")) or close
-            volume = _num(row.get("volume")) or 0.0
-
-            existing = bucket.get(start)
-            if existing is None:
-                bucket[start] = [
-                    _num(row.get("open")) or close, high, low, close, volume
-                ]
-            else:
-                # A bar is revised repeatedly while it forms; keep the extremes and take
-                # the newest close.
-                existing[1] = max(existing[1], high)
-                existing[2] = min(existing[2], low)
-                existing[3] = close
-                existing[4] = max(existing[4], volume)
-
-            # Rolling window: whatever no longer fits drops off the far end, so the
-            # series holds its size instead of growing for ever.
-            trim(bucket, period_seconds)
-            self._last_tick[key] = time.monotonic()
-            # Debounced inside the store — this fires per streamed tick, and writing
-            # each one would be hundreds of writes a minute per pair.
-            self._store.save(asset, period_seconds, bucket)
+            market.apply_candle(asset, period_seconds, row)
 
         return handle
 
     def _make_quote_handler(self, asset: str) -> Any:
+        market = self._market
+
         def handle(payload: Any) -> None:
             row = payload if isinstance(payload, dict) else getattr(payload, "__dict__", {})
-            price = _num(row.get("price") or row.get("close") or row.get("value"))
-            if price is None:
-                return
-            ts = _num(row.get("time") or row.get("timestamp")) or time.time()
-            self._quotes[asset] = (float(ts), price)
+            market.apply_quote(asset, row)
 
         return handle
 

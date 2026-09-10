@@ -77,7 +77,7 @@ public sealed class BinollaAppService
         // Venues other than Binolla are served by the broker gateway, which owns their
         // protocol. Binolla keeps the credential-capture path below because it is live and
         // carries fixes that would be reopened by moving it.
-        var broker = Brokers.Normalize(request.Broker);
+        var broker = await ResolveLoginBrokerAsync(userId, request.Broker, ct).ConfigureAwait(false);
         if (broker != Brokers.Binolla)
             return await ConnectViaGatewayAsync(userId, broker, request, ct);
 
@@ -128,6 +128,37 @@ public sealed class BinollaAppService
         // Captured a session: release the throttle so the next outage retries promptly.
         _restorer.ClearAuthFailure(userId);
         return await CompleteCredentialConnectForUserAsync(userId, captured, request, sw, workCt);
+    }
+
+    /// <summary>
+    /// Which venue a login is for.
+    ///
+    /// <para>An omitted broker used to mean Binolla, full stop. That default is correct
+    /// only for an account that has never chosen — and it silently sent Quotex users into
+    /// Binolla twice: once from the background reconnect, once from the re-link screen,
+    /// both of which built a request without the field. Neither failed loudly, because
+    /// guessing Binolla is always a valid-looking answer.</para>
+    ///
+    /// <para>So the user's own link decides whenever the caller did not say. The plain
+    /// default now applies only to someone who has no link at all.</para>
+    /// </summary>
+    private async Task<string> ResolveLoginBrokerAsync(
+        Guid userId, string? requested, CancellationToken ct)
+    {
+        if (Brokers.IsKnown(requested))
+            return Brokers.Normalize(requested);
+
+        var link = await _links.GetByUserIdAsync(userId, ct).ConfigureAwait(false);
+        var linked = Brokers.Normalize(link?.Broker);
+
+        if (link is not null && linked != Brokers.Default)
+        {
+            _logger.LogInformation(
+                "Login for user {UserId} did not name a broker; using their linked {Broker}",
+                userId, linked);
+        }
+
+        return linked;
     }
 
     public async Task<BinollaConnectResponse> SignUpWithCredentialsForUserAsync(
