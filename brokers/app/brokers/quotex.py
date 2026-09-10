@@ -30,6 +30,7 @@ from typing import Any
 
 from app.market_data import market_data
 from app.proxy import configure_process_proxy, proxy_url
+from app.quotex_ws import install as install_websocket_transport
 from app.brokers.base import (
     AuthError,
     BlockedError,
@@ -164,6 +165,10 @@ class QuotexSession(BrokerSession):
         # the environment when it builds its session, and there is no object to set it on
         # afterwards.
         configure_process_proxy()
+        # And before the first connection: the library binds its transport class when a
+        # connection service is built, so swapping it later would leave this session on
+        # the slow polling path.
+        install_websocket_transport()
 
         # The balance is chosen in the constructor, before the socket exists. Switching
         # after the handshake races the broker's own setup and can leave the session on

@@ -9,6 +9,9 @@ dependencies = [
     "pydantic>=2.6",
     "websockets>=12.0",
     "httpx>=0.27",
+    # Real WebSocket transport for Quotex. The vendored client ships an HTTP-polling
+    # transport only; this is what replaces it.
+    "websocket-client>=1.7",
 ]
 
 [project.optional-dependencies]

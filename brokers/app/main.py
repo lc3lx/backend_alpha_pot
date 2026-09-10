@@ -11,6 +11,7 @@ from outside the host.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Annotated
 
@@ -37,6 +38,7 @@ from app.models import (
 )
 from app.market_data import all_stores
 from app.proxy import configure_process_proxy, mask
+from app.quotex_ws import install as install_websocket_transport
 from app.registry import SessionRegistry
 
 #: Adapters by broker id. Binolla joins this once its port lands; until then the .NET
@@ -52,6 +54,11 @@ registry = SessionRegistry()
 #: Set once, at import, before any broker client exists — a client that builds its HTTP
 #: session before this runs would go out on the server's own IP and be refused.
 _PROXY = configure_process_proxy()
+
+#: Swapped in at import so the very first session already uses it — the library binds its
+#: transport when a connection service is built, and a later swap would leave that
+#: session on the slow polling path.
+_WEBSOCKET = install_websocket_transport()
 
 #: Shared secret with the .NET backend. Localhost binding is the real boundary; this stops
 #: another local process from driving somebody's trading session.
@@ -133,6 +140,10 @@ async def health() -> dict[str, object]:
         # Shared history, so "is one feed really serving everyone?" is answerable without
         # reading logs: series and feeds should stay flat as accounts are added.
         "market": {broker: store.stats() for broker, store in all_stores().items()},
+        # Which transport Quotex is on. "polling" means every frame is a separate HTTPS
+        # round trip, which is the difference between a subscribe costing a millisecond
+        # and costing a second.
+        "quotex_transport": "websocket" if _WEBSOCKET else "polling",
     }
 
 
@@ -209,6 +220,29 @@ async def quote(user_id: str, broker: str, asset: str) -> Quote | None:
 async def subscribe(
     user_id: str, broker: str, asset: str, period_seconds: int = 60
 ) -> dict[str, bool]:
+    # Answers immediately and opens the stream behind the request.
+    #
+    # Warming is a background chore, and the caller does not use the result — but a
+    # subscribe costs the broker a full round trip, and the warm-up worker asks for one
+    # pair at a time. Waiting on each turned warming a 25-pair list into a 25-second
+    # crawl that blocked an API thread the whole way.
+    session = _session(user_id, broker)
+
+    async def open_stream() -> None:
+        try:
+            await session.subscribe(asset, period_seconds)
+        except Exception as exc:  # noqa: BLE001 - background work has nobody to raise to
+            print(f"subscribe failed {broker}:{asset}@{period_seconds}s: {exc}")
+
+    asyncio.create_task(open_stream())
+    return {"ok": True}
+
+
+@app.post("/market/subscribe/sync", dependencies=[Guarded])
+async def subscribe_sync(
+    user_id: str, broker: str, asset: str, period_seconds: int = 60
+) -> dict[str, bool]:
+    """Subscribe and wait for it — for a caller that needs the stream open before it acts."""
     try:
         await _session(user_id, broker).subscribe(asset, period_seconds)
         return {"ok": True}
