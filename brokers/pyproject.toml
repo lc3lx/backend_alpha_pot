@@ -17,6 +17,14 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "anyio>=4.0"]
 
+# Named explicitly rather than auto-discovered. At runtime this directory also holds
+# `var/` (the candle cache), `logs/` and `vendor/` (the cloned Quotex client), and
+# setuptools refuses to guess which of those is the package — so a reinstall on a server
+# that had ever run failed, while the same command worked on a clean checkout.
+[tool.setuptools.packages.find]
+include = ["app*"]
+exclude = ["var*", "logs*", "vendor*", "tests*"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
