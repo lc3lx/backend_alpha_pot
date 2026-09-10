@@ -139,7 +139,14 @@ try
         await scope.ServiceProvider.GetRequiredService<IBotMaintenanceService>().WarmAsync();
     }
 
-    app.UseMiddleware<ExceptionHandlingMiddleware>();
+    // Request logging OUTSIDE the exception handler, so it observes the response the
+    // client actually received.
+    //
+    // The other way round, every handled ApiException escaped past Serilog before being
+    // turned into its real status: a routine "wrong password" was logged as an Error,
+    // "responded 500", with a full stack trace, while the caller got a 400 and a clear
+    // message. Hunting a genuine fault in a log where ordinary refusals look like crashes
+    // costs far more than this line is worth.
     app.UseSerilogRequestLogging(opts =>
     {
         opts.GetLevel = (httpContext, elapsed, ex) =>
@@ -147,6 +154,7 @@ try
             httpContext.Response.StatusCode >= 500 ? LogEventLevel.Error :
             LogEventLevel.Information;
     });
+    app.UseMiddleware<ExceptionHandlingMiddleware>();
 
     if (app.Environment.IsDevelopment())
     {

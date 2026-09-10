@@ -426,7 +426,10 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
             return "Binolla login failed.";
 
         var trimmed = error.Trim();
-        return trimmed.Length > 240 ? trimmed[..240] + "…" : trimmed;
+        // Roomy enough to keep the page diagnostics the capture attaches when it cannot
+        // find a field. Cutting those off leaves the message saying only that a selector
+        // did not match — which is the one thing already known.
+        return trimmed.Length > 500 ? trimmed[..500] + "…" : trimmed;
     }
 
     private static readonly JsonSerializerOptions JsonOptions = new()

@@ -63,6 +63,39 @@ async function fillFirst(page, selectors, value) {
   return false;
 }
 
+/**
+ * A one-line description of the page's own form fields.
+ *
+ * Attached to a "could not find the field" error. Without it that message says only that
+ * a selector list did not match, which is the one thing already known — and the page it
+ * failed on is gone by the time anyone reads the log.
+ */
+async function describeInputs(page) {
+  try {
+    const found = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('input')).slice(0, 25).map((el) => {
+        const box = el.getBoundingClientRect();
+        return [
+          el.getAttribute('type') || 'text',
+          el.getAttribute('name') || el.getAttribute('id') || '?',
+          // Visibility is usually the reason a correct selector still misses.
+          box.width > 0 && box.height > 0 ? 'shown' : 'hidden',
+        ].join(':');
+      }),
+    );
+    const where = (() => {
+      try {
+        return new URL(page.url()).pathname;
+      } catch {
+        return '?';
+      }
+    })();
+    return `at ${where}, inputs: ${found.join(', ') || 'none'}`;
+  } catch {
+    return 'page could not be inspected';
+  }
+}
+
 async function clickSubmit(page, isSignup) {
   const selectors = isSignup
     ? [
@@ -456,7 +489,11 @@ async function main() {
         ],
         email,
       );
-      if (!emailOk) throw new Error(`Could not find the ${preset.label} email field`);
+      if (!emailOk) {
+        throw new Error(
+          `Could not find the ${preset.label} email field (${await describeInputs(page)})`,
+        );
+      }
 
       const passOk = await fillFirst(
         page,
@@ -465,10 +502,19 @@ async function main() {
           'input[type="password"]',
           'input[autocomplete="current-password"]',
           'input[autocomplete="new-password"]',
+          // Quotex renders its own control rather than a plainly named input, and the
+          // field can appear a moment after the email one is filled.
+          'input[id*="pass" i]',
+          'input[placeholder*="pass" i]',
+          '[data-testid*="password" i] input',
         ],
         password,
       );
-      if (!passOk) throw new Error(`Could not find the ${preset.label} password field`);
+      if (!passOk) {
+        throw new Error(
+          `Could not find the ${preset.label} password field (${await describeInputs(page)})`,
+        );
+      }
 
       if (isSignup) {
         await fillFirst(
