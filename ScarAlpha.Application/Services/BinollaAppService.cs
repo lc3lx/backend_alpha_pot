@@ -727,7 +727,20 @@ public sealed class BinollaAppService
         await EnsureAccountTypeAllowedAsync(userId, accountType, ct);
 
         var engineType = accountType == DomainAccount.Demo ? EngineAccount.Demo : EngineAccount.Real;
-        var captured = await CaptureGatewaySessionAsync(userId, broker, request, ct);
+
+        // The link is read BEFORE the capture, because whether a capture is needed depends
+        // on what is already stored on it.
+        var now = DateTimeOffset.UtcNow;
+        var link = await _links.GetByUserIdAsync(userId, ct) ?? new BinollaLink
+        {
+            Id = Guid.NewGuid(),
+            UserId = userId,
+            CreatedAt = now,
+            AdminApproved = false,
+            ApprovalStatus = AdminApprovalStatus.Pending
+        };
+
+        var captured = await CaptureGatewaySessionAsync(userId, broker, link, request, ct);
 
         var client = await _brokers.GetOrCreateAsync(
             userId,
@@ -739,16 +752,6 @@ public sealed class BinollaAppService
                 Password: request.Password,
                 AccountType: engineType),
             ct);
-
-        var now = DateTimeOffset.UtcNow;
-        var link = await _links.GetByUserIdAsync(userId, ct) ?? new BinollaLink
-        {
-            Id = Guid.NewGuid(),
-            UserId = userId,
-            CreatedAt = now,
-            AdminApproved = false,
-            ApprovalStatus = AdminApprovalStatus.Pending
-        };
 
         link.Broker = broker;
         link.AccountType = accountType;
@@ -819,20 +822,26 @@ public sealed class BinollaAppService
     private async Task<BinollaCapturedSession?> CaptureGatewaySessionAsync(
         Guid userId,
         string broker,
+        BinollaLink link,
         BinollaCredentialRequest request,
         CancellationToken ct)
     {
         if (broker != Brokers.Quotex)
             return null;
 
-        // Already connected: nothing to capture. GetOrCreateAsync below reuses a live
-        // session and ignores whatever credentials it is handed, so paying forty seconds
-        // of browser to produce a session that will be discarded is pure cost — and it is
-        // what made a second click report "a sign-in is already running" instead of simply
-        // showing the account that was connected the whole time.
+        // Skip the browser only for a session that is both live AND was opened from a
+        // captured session of its own.
+        //
+        // "Live" alone is not enough, and assuming it was cost a round trip: a Quotex
+        // session built from credentials reports Connected quite happily, then returns
+        // five assets, no candles and a zero balance, because the socket it needs was
+        // refused. Skipping the capture for one of those would leave the user permanently
+        // stuck on the broken session with no way to replace it. A stored SSID is the
+        // thing that distinguishes a session worth keeping from one worth redoing.
         var live = _brokers.Get(userId, broker);
         if (live is not null &&
-            live.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
+            live.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected &&
+            !string.IsNullOrWhiteSpace(link.EncryptedSsid))
         {
             _logger.LogInformation(
                 "{Broker} session already live for user {UserId}; skipping browser capture",
