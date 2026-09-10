@@ -11,12 +11,48 @@ def test_first_attempt_is_allowed():
     assert t.can_attempt("u1") is True
 
 
-def test_only_one_login_runs_at_a_time_across_users():
+def test_different_users_can_sign_in_at_the_same_time():
+    """
+    Two people signing in at once is the product working, not a storm.
+
+    This used to allow exactly one attempt anywhere: the second user was refused
+    instantly, and since a connect takes ten seconds or more, a person clicking "log in"
+    routinely lost the slot to a background reconnect and was told a login was already
+    running — for a healthy account on a healthy broker.
+    """
     t = _Throttle()
-    # A login drives a browser/socket from the server's single IP. Letting each user hold
-    # an independent cooldown still produced an attempt every few seconds in production.
     assert t.can_attempt("u1") is True
-    assert t.can_attempt("u2") is False
+    assert t.can_attempt("u2") is True
+
+
+def test_concurrent_logins_are_still_bounded():
+    """Bounded, so a restart cannot open a hundred handshakes at the broker together."""
+    t = _Throttle(max_concurrent=3)
+    assert [t.can_attempt(f"u{i}") for i in range(4)] == [True, True, True, False]
+
+
+def test_a_second_attempt_for_the_same_user_is_refused():
+    """Whoever asked, a second concurrent attempt for one account is a duplicate."""
+    t = _Throttle()
+    assert t.can_attempt("u1") is True
+    assert t.can_attempt("u1") is False
+
+
+def test_spacing_applies_only_once_attempts_are_failing():
+    """
+    On a healthy broker the floor would serialise ordinary logins behind each other for
+    no reason; after a failure it is what stops a retry storm.
+    """
+    healthy = _Throttle()
+    assert healthy.can_attempt("u1") is True
+    healthy.mark_succeeded("u1")
+    assert healthy.can_attempt("u2") is True
+
+    failing = _Throttle()
+    assert failing.can_attempt("u1") is True
+    failing.mark_failed("u1")
+    # u2 has no failures of its own, but the broker just refused someone.
+    assert failing.can_attempt("u2") is False
 
 
 def test_account_failure_holds_only_that_user_out():

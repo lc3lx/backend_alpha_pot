@@ -397,12 +397,40 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
         }
     }
 
+    /// <summary>
+    /// Whether this user already has a healthy session — on ANY venue.
+    ///
+    /// <para>Asking Binolla's manager alone reported every Quotex user as dead, however
+    /// healthy their session was. Every access check then queued a restore, and each of
+    /// those took the broker's one connect slot — so the person actually signing in was
+    /// refused with "a login attempt is already running" for an account that was already
+    /// connected.</para>
+    /// </summary>
     private bool IsLive(Guid userId)
     {
-        var client = _sessions.Get(userId.ToString());
-        return client is not null &&
-               client.IsTransportConnected &&
-               client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected;
+        foreach (var broker in Brokers.All)
+        {
+            var client = broker == Brokers.Binolla
+                ? (object?)_sessions.Get(userId.ToString())
+                : _brokerSessions.Get(userId, broker);
+
+            if (client is null) continue;
+
+            var (transportUp, lifecycle) = client switch
+            {
+                IBinollaClient b => (b.IsTransportConnected, b.Lifecycle),
+                IBrokerClient g => (g.IsTransportConnected, g.Lifecycle),
+                _ => (false, SessionLifecycleState.Disconnected)
+            };
+
+            if (transportUp &&
+                lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private async Task<bool> RestoreOneAsync(Guid userId, int maxAttempts, CancellationToken ct)

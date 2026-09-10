@@ -153,13 +153,24 @@ async def connect(body: ConnectRequest) -> SessionStatus:
     cls = _adapter(broker)
     throttle = registry.throttle(broker)
 
+    # A session that is already live needs no login at all. Reconnecting a healthy
+    # account was the single biggest source of refused sign-ins: background restores
+    # asked for one on every status poll, each took the slot, and the person actually
+    # clicking "log in" was turned away.
+    existing = registry.get(body.user_id, broker)
+    if (
+        existing is not None
+        and existing.transport_connected
+        and existing.account_type == body.account_type
+    ):
+        return _status(existing)
+
     # Ask before trying. A broker that is refusing logins keeps refusing, and the caller
     # retries on its own schedule — without this the gateway relays the storm.
     if not throttle.can_attempt(body.user_id):
-        raise HTTPException(
-            status_code=429,
-            detail="A connect attempt is already running or was just refused. Wait before retrying.",
-        )
+        # Say which of the several reasons applies; "wait a moment" told a user nothing
+        # about whether the problem was theirs, the broker's, or just timing.
+        raise HTTPException(status_code=429, detail=throttle.describe(body.user_id))
 
     await registry.remove(body.user_id, broker)
     session = cls(body.user_id)
