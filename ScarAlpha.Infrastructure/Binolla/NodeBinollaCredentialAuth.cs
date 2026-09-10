@@ -203,11 +203,13 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         if (!result.Ok || string.IsNullOrWhiteSpace(result.Token) || result.Token.Length < 16)
         {
             var safeError = SanitizeCaptureError(result.Error, stderr);
+            // A CAPTCHA carries its own code: nothing is wrong with the credentials, and
+            // the caller can offer the user the guided login rather than an error.
+            var code = ClassifyCaptureError(result.Error, stderr) == "captcha-required"
+                ? ApiErrorCodes.BinollaCaptchaRequired
+                : ApiErrorCodes.BinollaLoginFailed;
             // Use 400 so clients do not treat this as Scar Alpha JWT expiry.
-            throw new ApiException(
-                ApiErrorCodes.BinollaLoginFailed,
-                safeError,
-                400);
+            throw new ApiException(code, safeError, 400);
         }
 
         // tokenSource is optional (older capture.mjs may omit it); token field remains required.
@@ -347,9 +349,8 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
 
         if (kind == "captcha-required")
         {
-            return "Binolla asked for a CAPTCHA on this login. It is intermittent — the "
-                   + "next automatic attempt usually succeeds. To connect right now, sign in "
-                   + "at binolla.com yourself and paste your SSID from Edit Profile.";
+            return "Binolla asked for a human check on this login. Continue in the guided "
+                   + "login window to answer it.";
         }
 
         if (kind == "edge-blocked")

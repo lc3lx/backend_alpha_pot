@@ -85,6 +85,7 @@ public static class DependencyInjection
         services.AddScoped<AccountAppService>();
         services.AddScoped<StrategyAppService>();
         services.AddScoped<BinollaAppService>();
+        services.AddScoped<BinollaGuidedLoginService>();
         services.AddScoped<MarketAppService>();
         services.AddScoped<RsiSignalAppService>();
         services.AddScoped<TradeAppService>();
@@ -208,6 +209,24 @@ public static class DependencyInjection
         // Singleton so the venue lookup is one cached read on the hot signal path rather
         // than a query per pair per scan.
         services.AddSingleton<IBrokerResolver, BrokerResolver>();
+
+        // Guided login (user solves the CAPTCHA themselves) runs in its own Node process,
+        // because it holds a browser open per login and the one-shot capture cannot.
+        var interactiveUrl = configuration["BINOLLA_INTERACTIVE_URL"]
+                             ?? NodeBinollaInteractiveAuth.DefaultBaseUrl;
+        var interactiveToken = configuration["BINOLLA_INTERACTIVE_TOKEN"] ?? string.Empty;
+
+        services.AddHttpClient(NodeBinollaInteractiveAuth.HttpClientName, http =>
+        {
+            http.BaseAddress = new Uri(interactiveUrl);
+            // Each call sets its own deadline: starting a browser is slow, relaying a
+            // click must not be.
+            http.Timeout = Timeout.InfiniteTimeSpan;
+            if (!string.IsNullOrWhiteSpace(interactiveToken))
+                http.DefaultRequestHeaders.Add("X-Auth-Token", interactiveToken);
+        });
+
+        services.AddSingleton<IBinollaInteractiveAuth, NodeBinollaInteractiveAuth>();
 
         services.Configure<BinollaSessionRestoreOptions>(options =>
         {

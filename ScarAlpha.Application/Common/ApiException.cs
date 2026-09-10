@@ -14,6 +14,13 @@ public static class ApiErrorCodes
     public const string BinollaSessionExpired = "BINOLLA_SESSION_EXPIRED";
     public const string BinollaConnectionFailed = "BINOLLA_CONNECTION_FAILED";
     public const string BinollaLoginFailed = "BINOLLA_LOGIN_FAILED";
+
+    /// <summary>
+    /// Binolla demanded a human check. Distinct from a failed login on purpose: the
+    /// credentials were never judged, so the answer is to let the user answer the
+    /// challenge — not to tell them their password is wrong.
+    /// </summary>
+    public const string BinollaCaptchaRequired = "BINOLLA_CAPTCHA_REQUIRED";
     public const string BinollaMarketUnavailable = "BINOLLA_MARKET_UNAVAILABLE";
     public const string MarketUnavailable = "MARKET_UNAVAILABLE";
     public const string InsufficientBalance = "INSUFFICIENT_BALANCE";

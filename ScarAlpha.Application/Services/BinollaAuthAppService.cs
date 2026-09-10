@@ -65,17 +65,35 @@ public sealed class BinollaAuthAppService
 
         await EnsureUserEmailAsync(user, email, ct);
 
-        var connect = await _binolla.LoginWithCredentialsForUserAsync(user.Id, request, ct);
+        BinollaConnectResponse connect;
         try
         {
-            user.EncryptedLoginPassword = _protector.Encrypt(request.Password);
-            user.UpdatedAt = DateTimeOffset.UtcNow;
-            await _users.UpdateAsync(user, ct);
+            connect = await _binolla.LoginWithCredentialsForUserAsync(user.Id, request, ct);
         }
-        catch (Exception ex)
+        catch (ApiException ex) when (ex.Code == ApiErrorCodes.BinollaCaptchaRequired)
         {
-            _logger.LogWarning(ex, "Failed to store encrypted login password for Binolla user {UserId}", user.Id);
+            // The credentials were never judged — the broker interrupted with a human
+            // check. The app account is real and already resolved, so signing the user in
+            // here is what lets them answer the challenge: the guided-login endpoints
+            // require a token, and failing the whole login would leave them without one.
+            await StoreLoginPasswordAsync(user, request.Password, ct);
+            _logger.LogInformation(
+                "Binolla web login needs a human check user={UserId}", user.Id);
+
+            return new BinollaAuthResponse(
+                AccessToken: _jwt.CreateToken(user),
+                UserId: user.Id.ToString(),
+                Connected: false,
+                AccountType: request.AccountType ?? "Real",
+                Access: BotAccessState.BinollaNotConnected.ToString(),
+                AdminApproved: false,
+                ApprovalStatus: AdminApprovalStatus.Pending.ToString(),
+                LastConnectedAt: null,
+                Balance: null,
+                RequiresGuidedLogin: true);
         }
+
+        await StoreLoginPasswordAsync(user, request.Password, ct);
 
         var token = _jwt.CreateToken(user);
         _logger.LogInformation(
@@ -183,6 +201,25 @@ public sealed class BinollaAuthAppService
         user.UpdatedAt = DateTimeOffset.UtcNow;
         await _users.UpdateAsync(user, ct);
         _logger.LogInformation("Backfilled email on user {UserId} from Binolla login", user.Id);
+    }
+
+    /// <summary>
+    /// Keeps the login password so a later silent re-login does not need the user again.
+    /// Encrypted at rest; a failure here must never fail the sign-in itself.
+    /// </summary>
+    private async Task StoreLoginPasswordAsync(User user, string password, CancellationToken ct)
+    {
+        try
+        {
+            user.EncryptedLoginPassword = _protector.Encrypt(password);
+            user.UpdatedAt = DateTimeOffset.UtcNow;
+            await _users.UpdateAsync(user, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex, "Failed to store encrypted login password for Binolla user {UserId}", user.Id);
+        }
     }
 
     private static BinollaAuthResponse ToAuthResponse(

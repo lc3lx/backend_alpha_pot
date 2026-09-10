@@ -154,6 +154,36 @@ public static class BinollaEndpoints
             Results.Ok(await svc.SignUpWithCredentialsAsync(request, ct)))
             .RequireRateLimiting("connect");
 
+        // Guided login: the user answers Binolla's CAPTCHA themselves on a relayed view of
+        // the real page. Rate-limited like every other login path — it opens a browser.
+        group.MapPost("/login/guided/start", async (
+                [FromBody] BinollaCredentialRequest request,
+                BinollaGuidedLoginService svc,
+                CancellationToken ct) =>
+            Results.Ok(await svc.StartAsync(request, ct)))
+            .RequireRateLimiting("connect");
+
+        group.MapPost("/login/guided/event", async (
+                [FromBody] GuidedLoginEventRequest request,
+                BinollaGuidedLoginService svc,
+                CancellationToken ct) =>
+            Results.Ok(await svc.SendEventAsync(request, ct)));
+
+        group.MapGet("/login/guided/state", async (
+                [FromQuery] string sessionId,
+                BinollaGuidedLoginService svc,
+                CancellationToken ct) =>
+            Results.Ok(await svc.GetStateAsync(sessionId, ct)));
+
+        group.MapPost("/login/guided/cancel", async (
+                [FromQuery] string sessionId,
+                BinollaGuidedLoginService svc,
+                CancellationToken ct) =>
+        {
+            await svc.CancelAsync(sessionId, ct);
+            return Results.Ok(new { cancelled = true });
+        });
+
         group.MapGet("/status", async (BinollaAppService svc, CancellationToken ct) =>
             Results.Ok(await svc.GetStatusAsync(ct)));
 

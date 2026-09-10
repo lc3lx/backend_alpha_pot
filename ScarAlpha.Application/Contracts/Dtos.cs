@@ -30,7 +30,13 @@ public sealed record BinollaAuthResponse(
     bool AdminApproved,
     string ApprovalStatus,
     DateTimeOffset? LastConnectedAt,
-    decimal? Balance);
+    decimal? Balance,
+    /// <summary>
+    /// The broker asked for a human check, so the account exists and is signed in but the
+    /// broker is not linked yet. The client should open the guided login and let the user
+    /// answer the challenge; the access token above is what authorises those calls.
+    /// </summary>
+    bool RequiresGuidedLogin = false);
 
 public sealed record MeResponse(
     string UserId,
@@ -638,3 +644,28 @@ public sealed record AdminTradeListResponse(
     int PageSize);
 
 public sealed record ApiErrorResponse(string Code, string Message);
+
+/// <summary>One frame of a guided login, plus the connection once it succeeds.</summary>
+/// <param name="Screenshot">
+/// The live login page as a data URI, for display only. It is a picture of Binolla's own
+/// page — the user reads and answers the challenge on it.
+/// </param>
+/// <param name="Connection">Present only when the login completed.</param>
+public sealed record GuidedLoginResponse(
+    string SessionId,
+    string State,
+    string? Screenshot,
+    int Width,
+    int Height,
+    string? Message,
+    BinollaConnectResponse? Connection);
+
+/// <summary>One user action to replay into the live login page.</summary>
+public sealed record GuidedLoginEventRequest(
+    string SessionId,
+    string? Type,
+    double? X = null,
+    double? Y = null,
+    string? Text = null,
+    string? Key = null,
+    double? DeltaY = null);

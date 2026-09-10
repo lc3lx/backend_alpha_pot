@@ -167,6 +167,22 @@ public sealed class BinollaAppService
         return connected;
     }
 
+    /// <summary>
+    /// Finishes a credential login from a captured session, whoever captured it.
+    ///
+    /// <para>Guided login (the user solving the CAPTCHA themselves) ends up holding the
+    /// same token the automated capture produces, and must be recorded identically —
+    /// approval state, encryption at rest, account type. Sharing this step is what keeps
+    /// the two paths from drifting into different rules.</para>
+    /// </summary>
+    public Task<BinollaConnectResponse> CompleteCredentialConnectAsync(
+        Guid userId,
+        BinollaCapturedSession captured,
+        BinollaCredentialRequest request,
+        CancellationToken ct) =>
+        CompleteCredentialConnectForUserAsync(
+            userId, captured, request, System.Diagnostics.Stopwatch.StartNew(), ct);
+
     private async Task<BinollaConnectResponse> CompleteCredentialConnectForUserAsync(
         Guid userId,
         BinollaCapturedSession captured,
