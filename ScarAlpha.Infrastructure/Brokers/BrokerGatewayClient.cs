@@ -160,7 +160,11 @@ public sealed class BrokerGatewayClient : IBrokerClient
                 Symbol = a.Symbol,
                 Description = a.Name ?? a.Symbol,
                 IsOpen = a.IsOpen,
-                PayoutPercentage = a.Payout
+                PayoutPercentage = a.Payout,
+                // The FX filter reads this to drop crypto, stocks and indices. Left unset
+                // it falls back to guessing from the symbol, which passes anything that
+                // merely looks like a six-letter pair.
+                Category = a.Category
             }).ToList();
 
             _assets = assets;
@@ -528,7 +532,8 @@ public sealed class BrokerGatewayClient : IBrokerClient
         string Symbol,
         string? Name,
         [property: JsonPropertyName("is_open")] bool IsOpen,
-        int Payout);
+        int Payout,
+        string? Category = null);
 
     private sealed record CandleDto(
         long Timestamp, decimal Open, decimal High, decimal Low, decimal Close, decimal? Volume);

@@ -323,17 +323,26 @@ class QuotexSession(BrokerSession):
 
         assets: list[TradingAsset] = []
         for entry in raw or []:
-            symbol = _attr(entry, "symbol", "name", "id")
+            symbol = _attr(entry, "symbol", "ticker", "id", "name")
             if not symbol:
                 continue
-            is_open = _attr(entry, "is_open", "is_active", "open", default=True)
-            payout = _attr(entry, "payout", "payout_percentage", "profit", default=0)
+            # This library's Asset model is
+            # (symbol, name, asset_type, is_active, current_payout). The alternatives are
+            # kept because the payout field in particular has already been renamed once,
+            # and reading the wrong name does not fail loudly — it reports every pair at
+            # 0% and quietly makes the whole venue look untradeable.
+            is_open = _attr(entry, "is_active", "is_open", "open", "active", default=True)
+            payout = _attr(
+                entry, "current_payout", "payout", "payout_percentage", "profit", default=0
+            )
+            category = _attr(entry, "asset_type", "category", "type")
             assets.append(
                 TradingAsset(
                     symbol=str(symbol),
                     name=str(_attr(entry, "name", "description", default=symbol)),
                     is_open=bool(is_open),
                     payout=int(float(payout or 0)),
+                    category=str(category) if category is not None else None,
                 )
             )
         return assets

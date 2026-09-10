@@ -69,6 +69,10 @@ class TradingAsset(BaseModel):
     name: str | None = None
     is_open: bool = False
     payout: int = 0
+    #: Broker's own grouping (currency, crypto, stock, ...). Carried through so the
+    #: strategy layer can drop everything that is not FX without guessing from the
+    #: symbol alone.
+    category: str | None = None
 
 
 class OrderRequest(BaseModel):
