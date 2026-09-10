@@ -145,17 +145,24 @@ public sealed class BinollaAppService
         Guid userId, string? requested, CancellationToken ct)
     {
         if (Brokers.IsKnown(requested))
-            return Brokers.Normalize(requested);
+        {
+            var chosen = Brokers.Normalize(requested);
+            // Logged on every login, not only on the odd path. "The user picked Quotex
+            // but Binolla ran" is impossible to tell apart from "the client never sent
+            // the choice" without seeing what actually arrived.
+            _logger.LogInformation(
+                "Login for user {UserId} requested broker '{Requested}' → {Broker}",
+                userId, requested, chosen);
+            return chosen;
+        }
 
         var link = await _links.GetByUserIdAsync(userId, ct).ConfigureAwait(false);
         var linked = Brokers.Normalize(link?.Broker);
 
-        if (link is not null && linked != Brokers.Default)
-        {
-            _logger.LogInformation(
-                "Login for user {UserId} did not name a broker; using their linked {Broker}",
-                userId, linked);
-        }
+        _logger.LogWarning(
+            "Login for user {UserId} named no broker (received '{Requested}'); "
+            + "falling back to {Broker}. A client that means Quotex must send it.",
+            userId, requested ?? "<null>", linked);
 
         return linked;
     }
