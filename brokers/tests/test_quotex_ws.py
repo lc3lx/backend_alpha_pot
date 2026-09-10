@@ -117,3 +117,17 @@ def test_a_socks_proxy_without_a_port_uses_the_socks_default(monkeypatch):
 def test_an_http_proxy_still_reports_http(monkeypatch):
     monkeypatch.setenv("BROKER_PROXY", "http://proxy.example.net:9000")
     assert _proxy_kwargs()["proxy_type"] == "http"
+
+
+def test_origin_is_the_site_not_the_socket_host():
+    """
+    A browser opening wss://ws2.qxbroker.com from the trading site sends the SITE as the
+    origin. Sending the socket host is a combination no browser produces — and the upgrade
+    was refused 403 while ordinary requests to the same host passed.
+    """
+    from app.quotex_ws import _origin
+
+    assert _origin("wss://ws2.qxbroker.com/socket.io/?EIO=3") == "https://qxbroker.com"
+    assert _origin("wss://ws.example.co/socket.io/") == "https://example.co"
+    # Already the bare site: nothing to strip.
+    assert _origin("wss://qxbroker.com/socket.io/") == "https://qxbroker.com"

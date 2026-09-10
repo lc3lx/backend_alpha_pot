@@ -121,7 +121,18 @@ class WebSocketTransport:
     def connect(self) -> bool:
         ws_url = _as_websocket_url(self.url)
         headers = dict(self.headers)
-        headers.setdefault("Origin", _origin(ws_url))
+        # The set a browser actually sends on an upgrade. Cloudflare scores the shape of
+        # a request, not only its TLS: an upgrade missing the Sec-Fetch trio and carrying
+        # the wrong Origin looks like no browser it has ever seen.
+        origin = _origin(ws_url)
+        headers.setdefault("Origin", origin)
+        headers.setdefault("Referer", f"{origin}/")
+        headers.setdefault("Sec-Fetch-Dest", "websocket")
+        headers.setdefault("Sec-Fetch-Mode", "websocket")
+        headers.setdefault("Sec-Fetch-Site", "same-site")
+        headers.setdefault("Accept-Language", "en-US,en;q=0.9")
+        headers.setdefault("Cache-Control", "no-cache")
+        headers.setdefault("Pragma", "no-cache")
 
         # Impersonating first. This is the transport that already gets 200s from
         # Cloudflare on the polling endpoint, so it is the one whose fingerprint the
@@ -403,8 +414,13 @@ def _warm_session(session: Any, ws_url: str) -> None:
     http_url = ws_url.replace("wss://", "https://").replace("ws://", "http://")
     http_url = http_url.replace("transport=websocket", "transport=polling")
 
+    origin = _origin(ws_url)
     try:
-        session.get(http_url, timeout=15)
+        session.get(
+            http_url,
+            timeout=15,
+            headers={"Origin": origin, "Referer": f"{origin}/"},
+        )
     except Exception as exc:
         _log(f"session warm-up failed ({_short(exc)}); trying the upgrade anyway")
 
@@ -431,8 +447,19 @@ def _as_websocket_url(url: str) -> str:
 
 
 def _origin(ws_url: str) -> str:
-    host = urlparse(ws_url).netloc
-    return f"https://{host}"
+    """
+    The page's origin, not the socket's host.
+
+    A browser opening `wss://ws2.qxbroker.com/...` from the trading site sends
+    `Origin: https://qxbroker.com` — the document it is running in. Sending the socket
+    host instead is a combination no browser produces, and it is a difference Cloudflare
+    can see: the polling requests were passing while the upgrade alone came back 403.
+    """
+    host = urlparse(ws_url).netloc.split(":")[0]
+    labels = host.split(".")
+    # ws2.qxbroker.com -> qxbroker.com; a bare two-label host is already the site.
+    site = ".".join(labels[-2:]) if len(labels) > 2 else host
+    return f"https://{site}"
 
 
 def _cloudflare_cookies(ws_url: str) -> str | None:
