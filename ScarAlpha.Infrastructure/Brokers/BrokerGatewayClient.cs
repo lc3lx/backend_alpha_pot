@@ -42,6 +42,18 @@ public sealed class BrokerGatewayClient : IBrokerClient
 
     private readonly Dictionary<string, decimal> _closedPnl = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// How long the tradable-asset list is reused. Long enough that a full pair scan costs
+    /// one broker call rather than one per pair, short enough to notice a market opening
+    /// or closing well inside a bar.
+    /// </summary>
+    private static readonly TimeSpan AssetCacheTtl = TimeSpan.FromSeconds(60);
+
+    /// <summary>One refresh at a time, so a scan does not fire N identical fetches.</summary>
+    private readonly SemaphoreSlim _assetGate = new(1, 1);
+    private IReadOnlyList<TradingAsset>? _assets;
+    private DateTimeOffset _assetsAt = DateTimeOffset.MinValue;
+
     public BrokerGatewayClient(
         HttpClient http,
         Guid userId,
@@ -124,14 +136,41 @@ public sealed class BrokerGatewayClient : IBrokerClient
 
     public async Task<IReadOnlyList<TradingAsset>> GetTradingAssetsAsync(CancellationToken ct = default)
     {
-        var dtos = await GetAsync<List<AssetDto>>("/market/assets", null, ct).ConfigureAwait(false);
-        return dtos.Select(a => new TradingAsset
+        // Served from cache between refreshes. The payout gate asks for the asset list
+        // once PER PAIR in a scan, which the Binolla client answers from memory — over
+        // HTTP that became a broker round trip per pair per second, and production logs
+        // showed the list being fetched twice a second with one call stalling 10.8s.
+        // The list changes when a market opens or closes, so a minute of staleness is
+        // nothing next to that.
+        var cached = _assets;
+        if (cached is not null && DateTimeOffset.UtcNow - _assetsAt < AssetCacheTtl)
+            return cached;
+
+        await _assetGate.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            Symbol = a.Symbol,
-            Description = a.Name ?? a.Symbol,
-            IsOpen = a.IsOpen,
-            PayoutPercentage = a.Payout
-        }).ToList();
+            // Re-check: while this call waited, the pair ahead of it refreshed the list.
+            cached = _assets;
+            if (cached is not null && DateTimeOffset.UtcNow - _assetsAt < AssetCacheTtl)
+                return cached;
+
+            var dtos = await GetAsync<List<AssetDto>>("/market/assets", null, ct).ConfigureAwait(false);
+            var assets = dtos.Select(a => new TradingAsset
+            {
+                Symbol = a.Symbol,
+                Description = a.Name ?? a.Symbol,
+                IsOpen = a.IsOpen,
+                PayoutPercentage = a.Payout
+            }).ToList();
+
+            _assets = assets;
+            _assetsAt = DateTimeOffset.UtcNow;
+            return assets;
+        }
+        finally
+        {
+            _assetGate.Release();
+        }
     }
 
     public async Task<HistoryData> GetHistoryAsync(
