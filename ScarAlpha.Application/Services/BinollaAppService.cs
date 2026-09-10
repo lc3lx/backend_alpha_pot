@@ -90,8 +90,7 @@ public sealed class BinollaAppService
         {
             throw new ApiException(
                 ApiErrorCodes.BinollaLoginFailed,
-                "A Binolla login attempt is already running or was just refused. "
-                + "Wait a moment before trying again.",
+                _restorer.DescribeCredentialRefusal(userId),
                 429);
         }
 

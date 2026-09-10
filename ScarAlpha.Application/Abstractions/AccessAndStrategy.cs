@@ -78,6 +78,13 @@ public interface IBinollaSessionRestorer
     bool CanAttemptCredentialLogin(Guid userId);
 
     /// <summary>
+    /// Why the last <see cref="CanAttemptCredentialLogin"/> said no, in words a user can
+    /// act on. "Wait a moment" told them nothing about whether the problem was their
+    /// account, the broker, or simply timing.
+    /// </summary>
+    string DescribeCredentialRefusal(Guid userId);
+
+    /// <summary>
     /// Records a failed credential login so the next attempt waits. Backoff grows with
     /// consecutive failures — a broker returning 403 will keep doing so, and retrying at
     /// the same rate only deepens the hole.

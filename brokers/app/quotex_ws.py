@@ -62,6 +62,18 @@ from urllib.parse import urlparse
 
 from app.proxy import proxy_url
 
+#: Consecutive refusals before the upgrade is left alone for a while.
+#:
+#: Cloudflare refuses this venue's upgrade for reasons outside our reach, and retrying it
+#: on every connect spends the timeout below each time — turning a broker that WOULD work
+#: over polling into one that takes half a minute to reach. Three attempts is enough to
+#: tell a refusal from a blip.
+_MAX_CONSECUTIVE_FAILURES = 3
+
+#: How long to stay on polling after giving up. Long enough not to matter, short enough
+#: that a venue which starts allowing upgrades is picked up the same day.
+_BACKOFF_SECONDS = 1800
+
 #: Longest a single upgrade attempt may take. A broker either accepts the handshake
 #: quickly or is not going to; anything beyond this is a misconfiguration hanging, and
 #: waiting it out blocks a connect slot that other sign-ins are queued behind.
@@ -83,6 +95,38 @@ def _enabled() -> bool:
 
 def _log(message: str) -> None:
     print(f"[WS] {message}", flush=True)
+
+
+class _UpgradeHealth:
+    """Remembers whether upgrades are worth attempting on this host."""
+
+    def __init__(self) -> None:
+        self._failures = 0
+        self._skip_until = 0.0
+
+    def should_try(self) -> bool:
+        if time.monotonic() < self._skip_until:
+            return False
+        return True
+
+    def record_success(self) -> None:
+        self._failures = 0
+        self._skip_until = 0.0
+
+    def record_failure(self) -> None:
+        self._failures += 1
+        if self._failures < _MAX_CONSECUTIVE_FAILURES:
+            return
+
+        self._skip_until = time.monotonic() + _BACKOFF_SECONDS
+        self._failures = 0
+        _log(
+            f"upgrade refused {_MAX_CONSECUTIVE_FAILURES}x; staying on polling for "
+            f"{_BACKOFF_SECONDS // 60} minutes"
+        )
+
+
+_health = _UpgradeHealth()
 
 
 class WebSocketTransport:
@@ -124,6 +168,11 @@ class WebSocketTransport:
     # ---- lifecycle ---------------------------------------------------------
 
     def connect(self) -> bool:
+        if not _health.should_try():
+            # Already established that this host refuses upgrades. Failing fast here is
+            # the difference between a connect taking a second and taking half a minute.
+            return False
+
         ws_url = _as_websocket_url(self.url)
         headers = dict(self.headers)
         # The set a browser actually sends on an upgrade. Cloudflare scores the shape of
@@ -146,6 +195,7 @@ class WebSocketTransport:
         if self._ws is None:
             self._ws = _open_with_websocket_client(ws_url, headers)
         if self._ws is None:
+            _health.record_failure()
             return False
 
         # Engine.IO opens with 0{"sid":...}. Without it there is no session and nothing
@@ -167,6 +217,7 @@ class WebSocketTransport:
         self._pinger = threading.Thread(target=self._ping_loop, daemon=True)
         self._pinger.start()
 
+        _health.record_success()
         _log(f"connected sid={self.sid} interval={self._ping_interval:.0f}s")
         return True
 

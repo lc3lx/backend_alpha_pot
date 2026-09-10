@@ -131,3 +131,32 @@ def test_origin_is_the_site_not_the_socket_host():
     assert _origin("wss://ws.example.co/socket.io/") == "https://example.co"
     # Already the bare site: nothing to strip.
     assert _origin("wss://qxbroker.com/socket.io/") == "https://qxbroker.com"
+
+
+def test_a_repeatedly_refused_upgrade_stops_being_attempted():
+    """
+    Cloudflare refuses this venue's upgrade for reasons outside our reach. Retrying it on
+    every connect spent the full timeout each time, turning a broker that works over
+    polling into one that takes half a minute to reach.
+    """
+    from app.quotex_ws import _MAX_CONSECUTIVE_FAILURES, _UpgradeHealth
+
+    health = _UpgradeHealth()
+    assert health.should_try() is True
+
+    for _ in range(_MAX_CONSECUTIVE_FAILURES):
+        health.record_failure()
+
+    assert health.should_try() is False
+
+
+def test_an_occasional_failure_does_not_give_up():
+    """A blip is not a refusal; one success resets the count."""
+    from app.quotex_ws import _UpgradeHealth
+
+    health = _UpgradeHealth()
+    health.record_failure()
+    health.record_success()
+    health.record_failure()
+
+    assert health.should_try() is True

@@ -173,6 +173,9 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
             // A capture that succeeded proves the IP is fine again.
             _globalFailures = 0;
             _globalRetryAfterUtc = DateTimeOffset.MinValue;
+            // …and that the spacing floor should stop holding anyone else back.
+            _recentCaptureFailures = 0;
+            _lastCaptureStartedUtc = DateTimeOffset.MinValue;
 
             // The spacing floor exists to throttle FAILED attempts against a broker that
             // is refusing us. After a success it would only delay other users onboarding
@@ -196,7 +199,22 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
     /// independent 30-second cooldowns still produced a login attempt roughly every six
     /// seconds, which is what the broker sees and blocks.</para>
     /// </summary>
-    private Guid? _globalCaptureHolder;
+    /// <summary>
+    /// Users whose credential capture is running right now.
+    ///
+    /// <para>Bounded rather than singular. A Binolla capture drives a headless browser,
+    /// which is genuinely expensive, so it cannot be unlimited — but allowing exactly one
+    /// meant a person clicking "sign in" was refused because a BACKGROUND reconnect for
+    /// somebody else held the slot, and a capture takes tens of seconds. The user saw
+    /// "a login attempt is already running" for an attempt that was never theirs.</para>
+    /// </summary>
+    private readonly HashSet<Guid> _captureHolders = new();
+
+    /// <summary>How many captures may run together. Chromium is heavy; this is a ceiling, not a queue.</summary>
+    private const int MaxConcurrentCaptures = 2;
+
+    /// <summary>Consecutive capture failures across all users; reset by any success.</summary>
+    private int _recentCaptureFailures;
     private readonly object _globalGate = new();
 
     /// <summary>Set when the broker refuses the IP itself; applies to every user.</summary>
@@ -224,19 +242,49 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
             if (now < _globalRetryAfterUtc)
                 return false;
 
-            if (_globalCaptureHolder is not null)
+            if (_captureHolders.Count >= MaxConcurrentCaptures)
                 return false;
 
-            if (now - _lastCaptureStartedUtc < MinGlobalCaptureInterval)
+            // The spacing floor applies only while captures are actually FAILING. On a
+            // healthy broker it serialised ordinary sign-ins behind each other for twenty
+            // seconds apiece, for no reason anyone could see.
+            if (_recentCaptureFailures > 0 && now - _lastCaptureStartedUtc < MinGlobalCaptureInterval)
                 return false;
 
+            // A second capture for the SAME account is always a duplicate, whoever asked.
             if (!_credentialInFlight.TryAdd(userId, 1))
                 return false;
 
-            _globalCaptureHolder = userId;
+            _captureHolders.Add(userId);
             _lastCaptureStartedUtc = now;
             return true;
         }
+    }
+
+    public string DescribeCredentialRefusal(Guid userId)
+    {
+        var now = DateTimeOffset.UtcNow;
+
+        if (_retryAfterUtc.TryGetValue(userId, out var until) && now < until)
+        {
+            var seconds = (int)(until - now).TotalSeconds + 1;
+            return $"This account's last sign-in was refused. Try again in {seconds}s.";
+        }
+
+        if (_credentialInFlight.ContainsKey(userId))
+            return "A sign-in for this account is already running. Give it a moment.";
+
+        lock (_globalGate)
+        {
+            if (now < _globalRetryAfterUtc)
+            {
+                var seconds = (int)(_globalRetryAfterUtc - now).TotalSeconds + 1;
+                return "Binolla is refusing sign-ins from this server right now. "
+                       + $"It retries automatically in {seconds}s.";
+            }
+        }
+
+        return "Too many sign-ins are starting at once. Try again in a few seconds.";
     }
 
     public void MarkCredentialLoginFailed(Guid userId) => MarkCredentialLoginFailed(userId, false);
@@ -245,6 +293,10 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
     {
         _credentialInFlight.TryRemove(userId, out _);
         ReleaseGlobalSlot(userId);
+        lock (_globalGate)
+        {
+            _recentCaptureFailures = Math.Min(_recentCaptureFailures + 1, 8);
+        }
 
         var failures = _credentialFailures.AddOrUpdate(userId, 1, (_, n) => n + 1);
 
@@ -273,8 +325,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
     {
         lock (_globalGate)
         {
-            if (_globalCaptureHolder == userId)
-                _globalCaptureHolder = null;
+            _captureHolders.Remove(userId);
         }
     }
 

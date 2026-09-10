@@ -87,17 +87,68 @@ public sealed class CredentialLoginBackoffTests
         svc.CanAttemptCredentialLogin(user).Should().BeTrue();
     }
 
+    /// <summary>
+    /// A capture drives a headless browser from the server's single public IP, so the
+    /// number running at once has to be capped — but capped, not singular.
+    ///
+    /// <para>Allowing exactly one meant a person clicking "sign in" was refused because a
+    /// BACKGROUND reconnect for a different account held the slot, and a capture takes
+    /// tens of seconds. They were told a login was "already running" for an attempt that
+    /// was never theirs. The protection that actually stops a storm is the per-account
+    /// backoff below, plus a spacing floor that applies once captures start failing.</para>
+    /// </summary>
     [Fact]
-    public void Only_one_capture_runs_at_a_time_across_all_users()
+    public void Concurrent_captures_are_capped_rather_than_serialised()
     {
         var svc = NewService();
 
-        // A capture drives a headless browser and hits Binolla from the server's single
-        // public IP. Five bots with dead sessions each holding their own 30s cooldown
-        // still produced an attempt every ~6 seconds, which is what the broker blocks.
         svc.CanAttemptCredentialLogin(Guid.NewGuid()).Should().BeTrue();
+        svc.CanAttemptCredentialLogin(Guid.NewGuid()).Should().BeTrue();
+        // Past the ceiling: Chromium is heavy and this is a limit, not a queue.
         svc.CanAttemptCredentialLogin(Guid.NewGuid()).Should().BeFalse();
-        svc.CanAttemptCredentialLogin(Guid.NewGuid()).Should().BeFalse();
+    }
+
+    [Fact]
+    public void A_second_capture_for_the_same_account_is_refused()
+    {
+        var svc = NewService();
+        var user = Guid.NewGuid();
+
+        svc.CanAttemptCredentialLogin(user).Should().BeTrue();
+        // Whoever asked — a retry, another tab, a background restore — this is a duplicate.
+        svc.CanAttemptCredentialLogin(user).Should().BeFalse();
+    }
+
+    [Fact]
+    public void The_spacing_floor_holds_others_back_only_after_a_failure()
+    {
+        var healthy = NewService();
+        var first = Guid.NewGuid();
+        healthy.CanAttemptCredentialLogin(first).Should().BeTrue();
+        healthy.ClearAuthFailure(first);
+        // A success proves the broker is reachable; nobody else should be made to wait.
+        healthy.CanAttemptCredentialLogin(Guid.NewGuid()).Should().BeTrue();
+
+        var failing = NewService();
+        var unlucky = Guid.NewGuid();
+        failing.CanAttemptCredentialLogin(unlucky).Should().BeTrue();
+        failing.MarkCredentialLoginFailed(unlucky);
+        // The broker just refused someone: everyone waits out the floor.
+        failing.CanAttemptCredentialLogin(Guid.NewGuid()).Should().BeFalse();
+    }
+
+    [Fact]
+    public void The_refusal_says_which_reason_applies()
+    {
+        var svc = NewService();
+        var user = Guid.NewGuid();
+
+        svc.CanAttemptCredentialLogin(user).Should().BeTrue();
+
+        // "Wait a moment" left a user unable to tell whether the problem was their
+        // account, the broker, or simply timing.
+        svc.DescribeCredentialRefusal(user)
+            .Should().Contain("already running");
     }
 
     [Fact]
