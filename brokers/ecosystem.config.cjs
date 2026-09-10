@@ -48,6 +48,10 @@ module.exports = {
         // so one proxy line in scaralpha.env serves both processes.
         BROKER_PROXY: process.env.BROKER_PROXY || process.env.BINOLLA_AUTH_PROXY || '',
         BINOLLA_AUTH_PROXY: process.env.BINOLLA_AUTH_PROXY || '',
+        // http (default) or socks5. SOCKS5 is connection-oriented, so one tunnel carries
+        // the whole WebSocket from a single exit IP — which is what a rotating residential
+        // pool otherwise breaks.
+        BROKER_PROXY_SCHEME: process.env.BROKER_PROXY_SCHEME || '',
         // Where the streamed candle history is kept. Quotex has no history call, so this
         // directory IS the price history — losing it costs hours of re-accumulation.
         BROKER_DATA_DIR: process.env.BROKER_DATA_DIR || path.join(__dirname, 'var'),

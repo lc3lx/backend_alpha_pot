@@ -31,13 +31,39 @@ _PROXY_VARS = (
 )
 
 
+#: Schemes understood here. `socks5h` resolves DNS at the proxy, which is what you want
+#: through a residential exit — resolving locally leaks the lookup and can land on a
+#: different CDN edge than the one the traffic reaches.
+_SCHEMES = {"http", "https", "socks5", "socks5h", "socks4"}
+
+
+def proxy_scheme() -> str:
+    """
+    Which protocol to speak to the proxy.
+
+    <para>SOCKS5 is worth preferring where the provider offers it: it is CONNECTION-
+    oriented, so one tunnel carries the whole WebSocket from a single exit IP. An HTTP
+    proxy re-resolves per request, which on a rotating residential pool means a different
+    IP for the Cloudflare cookie than for the upgrade that presents it — and a 403.</para>
+    """
+    raw = (os.environ.get("BROKER_PROXY_SCHEME") or "").strip().lower()
+    if raw in _SCHEMES:
+        # socks5 without the h resolves locally; the remote form is nearly always meant.
+        return "socks5h" if raw == "socks5" else raw
+    return "http"
+
+
 def proxy_url() -> str | None:
     """
     The configured proxy as a URL, or None.
 
     Accepts either shape, because vendors hand out both:
-        http://user:pass@host:port
+        socks5://user:pass@host:port   (or http://)
         host:port:user:pass
+
+    A URL keeps its own scheme. The bare host:port form takes BROKER_PROXY_SCHEME, so
+    switching a whole deployment between HTTP and SOCKS5 is one environment variable
+    rather than a rewritten credential line.
     """
     raw = (os.environ.get("BROKER_PROXY") or os.environ.get("BINOLLA_AUTH_PROXY") or "").strip()
     if not raw:
@@ -46,13 +72,14 @@ def proxy_url() -> str | None:
     if "://" in raw:
         return raw
 
+    scheme = proxy_scheme()
     parts = raw.split(":")
     if len(parts) >= 4:
         host, port, user, *rest = parts
         # The remainder is the password, kept whole so one containing ':' survives.
-        return f"http://{user}:{':'.join(rest)}@{host}:{port}"
+        return f"{scheme}://{user}:{':'.join(rest)}@{host}:{port}"
     if len(parts) == 2:
-        return f"http://{raw}"
+        return f"{scheme}://{raw}"
     return raw
 
 
@@ -87,3 +114,39 @@ def configure_process_proxy() -> str | None:
         os.environ["no_proxy"] = os.environ["NO_PROXY"]
 
     return url
+
+
+def check_stickiness(samples: int = 3) -> dict[str, object]:
+    """
+    Reports whether the proxy keeps one exit IP across requests.
+
+    A rotating proxy breaks every session-based protocol: Cloudflare issues its clearance
+    cookie to the IP that asked for it, so a WebSocket upgrade from a different IP is
+    refused 403, and a Socket.IO session opened on one IP is unknown on the next. Both
+    failures look like broker or code problems from the outside — the 403 arrives with a
+    normal-looking Cloudflare page, and the session error says only "Session ID unknown".
+
+    Diagnosing that from those symptoms cost several rounds. Asking directly costs one
+    request, so it is asked at start-up and the answer is stated plainly.
+    """
+    url = proxy_url()
+    if not url:
+        return {"proxy": "none", "sticky": None, "exits": []}
+
+    try:
+        import httpx
+    except ImportError:
+        return {"proxy": mask(url), "sticky": None, "exits": []}
+
+    exits: list[str] = []
+    for _ in range(max(2, samples)):
+        try:
+            with httpx.Client(proxy=url, timeout=10) as client:
+                exits.append(client.get("https://api.ipify.org").text.strip())
+        except Exception:
+            # A failed sample says nothing either way; a partial answer is still useful.
+            continue
+
+    unique = sorted(set(exits))
+    sticky = len(unique) == 1 if len(exits) >= 2 else None
+    return {"proxy": mask(url), "sticky": sticky, "exits": unique}

@@ -13,6 +13,12 @@ import pytest
 from app.quotex_ws import WebSocketTransport, _as_websocket_url, _proxy_kwargs
 
 
+@pytest.fixture(autouse=True)
+def _clean_proxy_env(monkeypatch):
+    for name in ("BROKER_PROXY", "BINOLLA_AUTH_PROXY", "BROKER_PROXY_SCHEME"):
+        monkeypatch.delenv(name, raising=False)
+
+
 def test_the_polling_url_is_rewritten_to_websocket():
     """
     The library hands over its polling URL. Left alone, this would open a second polling
@@ -86,3 +92,28 @@ def test_no_proxy_means_no_proxy_arguments(monkeypatch):
     monkeypatch.delenv("BROKER_PROXY", raising=False)
     monkeypatch.delenv("BINOLLA_AUTH_PROXY", raising=False)
     assert _proxy_kwargs() == {}
+
+
+def test_socks5_is_passed_as_socks_not_http(monkeypatch):
+    """
+    Sending a SOCKS proxy as `http` makes the client speak HTTP CONNECT at a SOCKS
+    listener. That fails looking like the broker refusing us, not a misconfiguration.
+    """
+    monkeypatch.setenv("BROKER_PROXY", "socks5://user:pass@proxy.example.net:1080")
+
+    kwargs = _proxy_kwargs()
+
+    assert kwargs["proxy_type"] == "socks5h"
+    assert kwargs["http_proxy_host"] == "proxy.example.net"
+    assert kwargs["http_proxy_port"] == 1080
+    assert kwargs["http_proxy_auth"] == ("user", "pass")
+
+
+def test_a_socks_proxy_without_a_port_uses_the_socks_default(monkeypatch):
+    monkeypatch.setenv("BROKER_PROXY", "socks5://proxy.example.net")
+    assert _proxy_kwargs()["http_proxy_port"] == 1080
+
+
+def test_an_http_proxy_still_reports_http(monkeypatch):
+    monkeypatch.setenv("BROKER_PROXY", "http://proxy.example.net:9000")
+    assert _proxy_kwargs()["proxy_type"] == "http"

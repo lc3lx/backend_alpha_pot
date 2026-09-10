@@ -137,7 +137,9 @@ class WebSocketTransport:
                 **_proxy_kwargs(),
             )
         except Exception as exc:
-            _log(f"handshake refused ({exc}); falling back to polling")
+            proxy = _proxy_kwargs()
+            via = f" via {proxy.get('proxy_type')} proxy" if proxy else " directly"
+            _log(f"handshake refused{via} ({exc}); falling back to polling")
             self._fail(exc)
             return False
 
@@ -328,7 +330,13 @@ def _cloudflare_cookies(ws_url: str) -> str | None:
 
 
 def _proxy_kwargs() -> dict[str, Any]:
-    """websocket-client takes the proxy split into parts rather than as a URL."""
+    """
+    websocket-client takes the proxy split into parts rather than as a URL.
+
+    The scheme decides `proxy_type`. Sending a SOCKS5 proxy as `http` makes the client
+    speak HTTP CONNECT at a SOCKS listener, which fails in a way that looks like the
+    broker refusing us rather than a misconfiguration.
+    """
     url = proxy_url()
     if not url:
         return {}
@@ -337,10 +345,20 @@ def _proxy_kwargs() -> dict[str, Any]:
     if not parsed.hostname:
         return {}
 
+    scheme = (parsed.scheme or "http").lower()
+    if scheme.startswith("socks"):
+        # websocket-client needs PySocks for these; without it the connection fails with
+        # an import error rather than a network one.
+        proxy_type = "socks5h" if scheme in {"socks5h", "socks5"} else scheme
+        default_port = 1080
+    else:
+        proxy_type = "http"
+        default_port = 8080
+
     kwargs: dict[str, Any] = {
         "http_proxy_host": parsed.hostname,
-        "http_proxy_port": parsed.port or 8080,
-        "proxy_type": "http",
+        "http_proxy_port": parsed.port or default_port,
+        "proxy_type": proxy_type,
     }
     if parsed.username:
         kwargs["http_proxy_auth"] = (parsed.username, parsed.password or "")

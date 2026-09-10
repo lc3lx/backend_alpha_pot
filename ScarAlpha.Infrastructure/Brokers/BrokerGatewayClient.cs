@@ -506,9 +506,13 @@ public sealed class BrokerGatewayClient : IBrokerClient
                 + "password). Set a proxy in an allowed country, or paste an SSID.",
                 400),
 
+            // The gateway says WHICH of several reasons applies — this account's own
+            // backoff, a broker refusing the server, or simply too many at once. Replacing
+            // that with one fixed sentence left a user unable to tell whether the problem
+            // was theirs, the broker's, or just timing.
             HttpStatusCode.TooManyRequests => new ApiException(
                 ApiErrorCodes.BinollaLoginFailed,
-                "A login attempt is already running or was just refused. Wait a moment before trying again.",
+                DetailOr(detail, "Too many sign-ins are starting at once. Try again shortly."),
                 429),
 
             HttpStatusCode.Unauthorized => new ApiException(
@@ -526,6 +530,35 @@ public sealed class BrokerGatewayClient : IBrokerClient
                 $"{Broker} gateway error ({(int)response.StatusCode}). {detail}".Trim(),
                 502)
         };
+    }
+
+    /// <summary>
+    /// The gateway's own explanation when it gave one, otherwise a fallback.
+    ///
+    /// <para>Bodies arrive as <c>{"detail":"..."}</c>; anything else is passed through
+    /// as-is rather than shown to a user as raw JSON.</para>
+    /// </summary>
+    private static string DetailOr(string body, string fallback)
+    {
+        if (string.IsNullOrWhiteSpace(body)) return fallback;
+
+        try
+        {
+            using var document = JsonDocument.Parse(body);
+            if (document.RootElement.TryGetProperty("detail", out var detail) &&
+                detail.ValueKind == JsonValueKind.String)
+            {
+                var text = detail.GetString();
+                if (!string.IsNullOrWhiteSpace(text)) return text!;
+            }
+        }
+        catch (JsonException)
+        {
+            // Not JSON. The raw body is still more informative than a fixed sentence,
+            // as long as it reads like a message.
+        }
+
+        return body.StartsWith('{') ? fallback : body;
     }
 
     private static async Task<string> SafeReadAsync(HttpResponseMessage response, CancellationToken ct)

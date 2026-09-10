@@ -37,7 +37,7 @@ from app.models import (
     TradingAsset,
 )
 from app.market_data import all_stores
-from app.proxy import configure_process_proxy, mask
+from app.proxy import check_stickiness, configure_process_proxy, mask
 from app.quotex_ws import install as install_websocket_transport
 from app.registry import SessionRegistry
 
@@ -125,6 +125,18 @@ def _fail(exc: Exception) -> HTTPException:
     if isinstance(exc, NotConnected):
         return HTTPException(status_code=409, detail=f"NOT_CONNECTED: {exc}")
     return HTTPException(status_code=502, detail=f"BROKER_ERROR: {exc}")
+
+
+@app.get("/proxy/check", dependencies=[Guarded])
+async def proxy_check() -> dict[str, object]:
+    """
+    Whether the proxy holds one exit IP.
+
+    `sticky: false` is fatal for Quotex however good the rest of the code is: Cloudflare
+    binds its clearance cookie to an IP, so an upgrade from a different one is refused,
+    and a session opened on one IP is unknown on the next.
+    """
+    return await asyncio.to_thread(check_stickiness)
 
 
 @app.get("/health")

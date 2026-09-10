@@ -380,6 +380,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
             await TouchLastConnectedAsync(userId, CancellationToken.None).ConfigureAwait(false);
             _authFailed.TryRemove(userId, out _);
             _retryAfterUtc.TryRemove(userId, out _);
+            _credentialFailures.TryRemove(userId, out _);
 
             _logger.LogInformation(
                 "Session restore: connected user {UserId} on {Broker} link={LinkId}",
@@ -388,6 +389,12 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
         }
         catch (Exception ex)
         {
+            // Back off before anyone tries again. Without this there was NO cooldown on
+            // this path at all: every status poll queued another restore, each failed in
+            // milliseconds, and the retries piled up fast enough to exhaust the gateway's
+            // own connect limit — so the person actually signing in was refused too.
+            MarkGatewayRestoreFailed(userId);
+
             // Left Connected deliberately: the link is still valid and the next sweep or the
             // next page load retries. Marking it Disconnected on a transient gateway failure
             // would push a working account back to the login screen.
@@ -406,6 +413,22 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
     /// refused with "a login attempt is already running" for an account that was already
     /// connected.</para>
     /// </summary>
+    /// <summary>
+    /// Applies the same growing backoff the Binolla path uses, for a gateway broker.
+    ///
+    /// <para>Shares <see cref="_retryAfterUtc"/> so <c>IsCoolingDown</c> — which every
+    /// entry point already checks — holds this user off without a second mechanism to
+    /// keep in step.</para>
+    /// </summary>
+    private void MarkGatewayRestoreFailed(Guid userId)
+    {
+        var failures = _credentialFailures.AddOrUpdate(userId, 1, (_, n) => n + 1);
+        var baseSeconds = Math.Max(1, _options.FailureCooldownSeconds);
+        var factor = Math.Min(1 << Math.Min(failures - 1, 6), 32);
+        var delay = Math.Min(baseSeconds * factor, 900);
+        _retryAfterUtc[userId] = DateTimeOffset.UtcNow.AddSeconds(delay);
+    }
+
     private bool IsLive(Guid userId)
     {
         foreach (var broker in Brokers.All)

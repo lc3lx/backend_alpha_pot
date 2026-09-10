@@ -12,6 +12,11 @@ dependencies = [
     # Real WebSocket transport for Quotex. The vendored client ships an HTTP-polling
     # transport only; this is what replaces it.
     "websocket-client>=1.7",
+    # SOCKS5. websocket-client needs PySocks to speak it, and httpx needs socksio for the
+    # stickiness check — without them a socks5:// proxy fails as an import error at the
+    # worst moment rather than at install.
+    "PySocks>=1.7",
+    "httpx[socks]>=0.27",
 ]
 
 [project.optional-dependencies]

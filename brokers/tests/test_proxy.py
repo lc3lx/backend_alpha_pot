@@ -102,3 +102,28 @@ def test_masking_never_leaks_credentials():
     assert "s3cr3t" not in masked
     assert "user-country-ae" not in masked
     assert mask(None) == "none"
+
+
+def test_socks5_scheme_is_applied_to_a_bare_credential_line(monkeypatch):
+    """
+    Switching a deployment between HTTP and SOCKS5 should be one variable, not a rewritten
+    credential line — vendors hand out `host:port:user:pass` with no scheme in it.
+    """
+    monkeypatch.setenv("BROKER_PROXY", VENDOR_LINE)
+    monkeypatch.setenv("BROKER_PROXY_SCHEME", "socks5")
+
+    # socks5h, not socks5: DNS resolves at the proxy, so the lookup and the traffic reach
+    # the same CDN edge.
+    assert proxy_url() == "socks5h://user-country-ae:s3cr3t@proxy.example.net:9000"
+
+
+def test_an_explicit_url_keeps_its_own_scheme(monkeypatch):
+    monkeypatch.setenv("BROKER_PROXY", "socks5://u:p@host:1080")
+    monkeypatch.setenv("BROKER_PROXY_SCHEME", "http")
+    assert proxy_url() == "socks5://u:p@host:1080"
+
+
+def test_an_unknown_scheme_falls_back_to_http(monkeypatch):
+    monkeypatch.setenv("BROKER_PROXY", VENDOR_LINE)
+    monkeypatch.setenv("BROKER_PROXY_SCHEME", "carrier-pigeon")
+    assert proxy_url() == VENDOR_URL
