@@ -45,9 +45,18 @@ a connection that plainly announces itself as Python is a worse signal than not
 presenting it at all.
 
 So the upgrade is made BY curl_cffi, on the impersonating session, and inherits the
-fingerprint that already passes. `websocket-client` remains only as a fallback for a
-curl_cffi too old to speak WebSocket; if neither works `connect()` returns False and the
-library keeps its own polling transport rather than being left with a dead session.
+fingerprint that already passes. `websocket-client` remains as a second attempt for a
+curl_cffi too old to speak WebSocket.
+
+## When the upgrade is refused
+
+It DELEGATES to the transport it replaced, and the session carries on over polling.
+
+That fallback is the whole reason this is safe to install. Without it, replacing the
+class removed the only working path: this returned False, the library read that as a
+fatal connection failure, and every Quotex login died with "Failed to establish curl
+WebSocket connection" — on a venue that had been working, slowly, moments before. A
+faster transport is worth having; it is not worth trading a working one for.
 """
 
 from __future__ import annotations
@@ -91,6 +100,11 @@ def _enabled() -> bool:
         "false",
         "no",
     }
+
+
+#: The transport this module replaced. Kept so a refused upgrade can hand the session
+#: back to it rather than failing outright.
+_original_transport: Any = None
 
 
 def _log(message: str) -> None:
@@ -145,6 +159,9 @@ class WebSocketTransport:
         self.message_queue: "queue.Queue[str]" = queue.Queue()
 
         self._ws: Any = None
+        #: Set when the upgrade is refused and the original transport takes over. Every
+        #: method below forwards to it, so the library never learns which one it got.
+        self._delegate: Any = None
         self._reader: threading.Thread | None = None
         self._pinger: threading.Thread | None = None
         self._running = threading.Event()
@@ -158,20 +175,27 @@ class WebSocketTransport:
 
     def set_on_message(self, callback: Callable[[str], None]) -> None:
         self._on_message = callback
+        if self._delegate is not None:
+            self._delegate.set_on_message(callback)
 
     def set_on_error(self, callback: Callable[[Exception], None]) -> None:
         self._on_error = callback
+        if self._delegate is not None:
+            self._delegate.set_on_error(callback)
 
     def set_on_close(self, callback: Callable[[], None]) -> None:
         self._on_close = callback
+        if self._delegate is not None:
+            self._delegate.set_on_close(callback)
 
     # ---- lifecycle ---------------------------------------------------------
 
     def connect(self) -> bool:
         if not _health.should_try():
-            # Already established that this host refuses upgrades. Failing fast here is
-            # the difference between a connect taking a second and taking half a minute.
-            return False
+            # Already established that this host refuses upgrades. Skipping straight to
+            # the transport that does work is the difference between a connect taking a
+            # second and taking half a minute.
+            return self._connect_via_original()
 
         ws_url = _as_websocket_url(self.url)
         headers = dict(self.headers)
@@ -196,7 +220,9 @@ class WebSocketTransport:
             self._ws = _open_with_websocket_client(ws_url, headers)
         if self._ws is None:
             _health.record_failure()
-            return False
+            # Refused — hand the session to the transport this replaced. Returning False
+            # here is what killed the venue outright instead of merely slowing it down.
+            return self._connect_via_original()
 
         # Engine.IO opens with 0{"sid":...}. Without it there is no session and nothing
         # below this would work, so a missing open packet is a failed connect.
@@ -221,6 +247,41 @@ class WebSocketTransport:
         _log(f"connected sid={self.sid} interval={self._ping_interval:.0f}s")
         return True
 
+    def _connect_via_original(self) -> bool:
+        """Opens the session on the transport this module replaced."""
+        if _original_transport is None:
+            _log("no original transport to fall back to; the session cannot open")
+            return False
+
+        try:
+            delegate = _original_transport(self.url, self.headers)
+        except Exception as exc:
+            _log(f"fallback transport could not be built ({_short(exc)})")
+            return False
+
+        # Hand over any callbacks registered before the fallback existed, or the library
+        # would receive nothing on a connection it believes is live.
+        if self._on_message is not None:
+            delegate.set_on_message(self._on_message)
+        if self._on_error is not None:
+            delegate.set_on_error(self._on_error)
+        if self._on_close is not None:
+            delegate.set_on_close(self._on_close)
+
+        try:
+            opened = bool(delegate.connect())
+        except Exception as exc:
+            _log(f"fallback transport failed to connect ({_short(exc)})")
+            return False
+
+        if not opened:
+            return False
+
+        self._delegate = delegate
+        self.sid = getattr(delegate, "sid", None)
+        _log("running on the original transport (polling)")
+        return True
+
     def _read_open(self, packet: Any) -> bool:
         text = packet.decode() if isinstance(packet, (bytes, bytearray)) else str(packet)
         if not text.startswith(_OPEN):
@@ -239,9 +300,13 @@ class WebSocketTransport:
         return bool(self.sid)
 
     def is_connected(self) -> bool:
+        if self._delegate is not None:
+            return bool(self._delegate.is_connected())
         return bool(self._running.is_set() and self._ws is not None)
 
     def send(self, message: str) -> bool:
+        if self._delegate is not None:
+            return bool(self._delegate.send(message))
         if not self.is_connected():
             return False
         try:
@@ -252,6 +317,8 @@ class WebSocketTransport:
             return False
 
     def recv(self, timeout: float | None = None) -> str | None:
+        if self._delegate is not None:
+            return self._delegate.recv(timeout)
         try:
             return self.message_queue.get(timeout=timeout) if timeout else (
                 self.message_queue.get_nowait()
@@ -260,6 +327,14 @@ class WebSocketTransport:
             return None
 
     def close(self) -> None:
+        delegate, self._delegate = self._delegate, None
+        if delegate is not None:
+            try:
+                delegate.close()
+            except Exception:
+                pass
+            return
+
         self._running.clear()
         ws, self._ws = self._ws, None
         if ws is not None:
@@ -618,6 +693,12 @@ def install() -> bool:
     if not hasattr(connection_module, "CurlWebSocketTransport"):
         _log("connection service has no transport to replace; library layout changed")
         return False
+
+    global _original_transport
+    if _original_transport is None:
+        # Captured BEFORE the swap, and only once: installing twice would otherwise make
+        # the fallback point at this class and recurse.
+        _original_transport = connection_module.CurlWebSocketTransport
 
     connection_module.CurlWebSocketTransport = WebSocketTransport  # type: ignore[attr-defined]
     _log("websocket transport installed")

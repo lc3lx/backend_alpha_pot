@@ -160,3 +160,92 @@ def test_an_occasional_failure_does_not_give_up():
     health.record_failure()
 
     assert health.should_try() is True
+
+
+class _FakeOriginal:
+    """Stands in for the library's own transport."""
+
+    def __init__(self, url, headers=None):
+        self.url = url
+        self.headers = headers
+        self.sid = "fallback-sid"
+        self.connected = False
+        self.sent: list[str] = []
+        self.on_message = None
+
+    def connect(self):
+        self.connected = True
+        return True
+
+    def is_connected(self):
+        return self.connected
+
+    def send(self, message):
+        self.sent.append(message)
+        return True
+
+    def recv(self, timeout=None):
+        return "42[\"from-fallback\"]"
+
+    def close(self):
+        self.connected = False
+
+    def set_on_message(self, cb):
+        self.on_message = cb
+
+    def set_on_error(self, cb):
+        pass
+
+    def set_on_close(self, cb):
+        pass
+
+
+def test_a_refused_upgrade_hands_the_session_to_the_original_transport(monkeypatch):
+    """
+    Replacing the library's transport removed the only working path: a refused upgrade
+    returned False, the library read that as a fatal connection failure, and every login
+    died on a venue that had been working — slowly — moments before.
+    """
+    import app.quotex_ws as ws
+
+    monkeypatch.setattr(ws, "_original_transport", _FakeOriginal)
+    # Both upgrade routes refuse, as Cloudflare does on this venue.
+    monkeypatch.setattr(ws, "_open_with_curl", lambda *_a, **_k: None)
+    monkeypatch.setattr(ws, "_open_with_websocket_client", lambda *_a, **_k: None)
+    monkeypatch.setattr(ws, "_health", ws._UpgradeHealth())
+
+    transport = ws.WebSocketTransport("wss://ws2.qxbroker.com/socket.io/?EIO=3")
+
+    assert transport.connect() is True
+    assert transport.is_connected() is True
+    assert transport.send('42["ping"]') is True
+    assert transport.recv() == '42["from-fallback"]'
+
+
+def test_callbacks_registered_before_the_fallback_still_arrive(monkeypatch):
+    """The library registers its handler first; a fallback that dropped it would be deaf."""
+    import app.quotex_ws as ws
+
+    monkeypatch.setattr(ws, "_original_transport", _FakeOriginal)
+    monkeypatch.setattr(ws, "_open_with_curl", lambda *_a, **_k: None)
+    monkeypatch.setattr(ws, "_open_with_websocket_client", lambda *_a, **_k: None)
+    monkeypatch.setattr(ws, "_health", ws._UpgradeHealth())
+
+    seen: list[str] = []
+    transport = ws.WebSocketTransport("wss://ws2.qxbroker.com/socket.io/?EIO=3")
+    transport.set_on_message(seen.append)
+
+    assert transport.connect() is True
+    transport._delegate.on_message("42[\"hello\"]")
+    assert seen == ['42["hello"]']
+
+
+def test_without_an_original_there_is_nothing_to_fall_back_to(monkeypatch):
+    import app.quotex_ws as ws
+
+    monkeypatch.setattr(ws, "_original_transport", None)
+    monkeypatch.setattr(ws, "_open_with_curl", lambda *_a, **_k: None)
+    monkeypatch.setattr(ws, "_open_with_websocket_client", lambda *_a, **_k: None)
+    monkeypatch.setattr(ws, "_health", ws._UpgradeHealth())
+
+    assert ws.WebSocketTransport("wss://example/socket.io/").connect() is False

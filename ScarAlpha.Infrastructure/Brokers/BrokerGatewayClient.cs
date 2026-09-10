@@ -517,17 +517,27 @@ public sealed class BrokerGatewayClient : IBrokerClient
 
             HttpStatusCode.Unauthorized => new ApiException(
                 ApiErrorCodes.BinollaLoginFailed,
-                $"{Broker} rejected the credentials.",
+                DetailOr(detail, $"{Broker} rejected the credentials."),
                 400),
 
+            // The gateway explains WHY it has no session — the broker's own message, a
+            // dead socket, a refused handshake. Replacing that with "connect first" threw
+            // away the only description of what actually went wrong, and left a failing
+            // login with nothing to diagnose it by.
             HttpStatusCode.Conflict => new ApiException(
                 ApiErrorCodes.BinollaNotConnected,
-                $"No live {Broker} session. Connect first.",
+                DetailOr(detail, $"No live {Broker} session. Connect first."),
                 409),
+
+            HttpStatusCode.BadRequest => new ApiException(
+                ApiErrorCodes.ValidationError,
+                DetailOr(detail, $"{Broker} rejected the request."),
+                400),
 
             _ => new ApiException(
                 ApiErrorCodes.BinollaNotConnected,
-                $"{Broker} gateway error ({(int)response.StatusCode}). {detail}".Trim(),
+                DetailOr(detail, $"{Broker} gateway error ({(int)response.StatusCode}).")
+                    .Trim(),
                 502)
         };
     }
