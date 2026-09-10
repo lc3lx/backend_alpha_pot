@@ -1,5 +1,7 @@
 using ScarAlpha.Domain.Enums;
 
+using ScarAlpha.Application.Abstractions;
+
 namespace ScarAlpha.Application.Contracts;
 
 public sealed record TelegramAuthRequest(string InitData, string? ReferralCode = null);
@@ -192,7 +194,13 @@ public sealed record BinollaStatusDto(
     DateTimeOffset? LastConnectedAt,
     decimal? Balance,
     string? Lifecycle = null,
-    bool WebSocketConnected = false);
+    bool WebSocketConnected = false,
+    /// <summary>
+    /// Which venue this account trades on. The UI names the broker in its own labels —
+    /// a Quotex user being shown "Binolla Market" is simply wrong — and it cannot know
+    /// without being told. Defaulted so links that predate the choice still deserialise.
+    /// </summary>
+    string Broker = Brokers.Binolla);
 
 public sealed record BinollaBalanceDto(
     bool Connected,

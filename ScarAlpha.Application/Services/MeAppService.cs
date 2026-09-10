@@ -51,7 +51,8 @@ public sealed class MeAppService
         }
 
         var link = await _links.GetByUserIdAsync(user.Id, ct);
-        var client = _sessions.Get(user.Id, Brokers.Normalize(link?.Broker));
+        var broker = Brokers.Normalize(link?.Broker);
+        var client = _sessions.Get(user.Id, broker);
         var liveConnected = client is not null &&
                             client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected;
 
@@ -67,7 +68,8 @@ public sealed class MeAppService
                 LastConnectedAt: link?.LastConnectedAt,
                 Balance: null,
                 Lifecycle: client?.Lifecycle.ToString() ?? "None",
-                WebSocketConnected: liveConnected);
+                WebSocketConnected: liveConnected,
+                Broker: broker);
         }
 
         return new MeResponse(

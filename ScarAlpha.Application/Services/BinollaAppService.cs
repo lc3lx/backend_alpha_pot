@@ -481,7 +481,11 @@ public sealed class BinollaAppService
             return _demo.BuildStatus(userId);
 
         var link = await _links.GetByUserIdAsync(userId, ct);
-        var client = _sessions.Get(userId.ToString());
+        // The link records the venue, so it answers the routing question directly. Asking
+        // Binolla's manager unconditionally — as this did — reported every Quotex user as
+        // disconnected no matter how healthy their session was.
+        var broker = Brokers.Normalize(link?.Broker);
+        var client = _brokers.Get(userId, broker);
 
         var connected = client is not null &&
                         client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected;
@@ -502,7 +506,8 @@ public sealed class BinollaAppService
             LastConnectedAt: link?.LastConnectedAt,
             Balance: balance,
             Lifecycle: client?.Lifecycle.ToString() ?? "None",
-            WebSocketConnected: connected);
+            WebSocketConnected: connected,
+            Broker: broker);
     }
 
     public async Task<BinollaBalanceDto> GetBalanceAsync(CancellationToken ct)
