@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import time
 from typing import Any
 
@@ -145,6 +146,8 @@ class QuotexSession(BrokerSession):
         self._market = market_data(self.broker)
         #: Pairs this session has subscribed, so its claims can be released on close.
         self._subscribed: set[tuple[str, int]] = set()
+        #: The session this connection was authenticated with, if any.
+        self.ssid: str | None = None
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -168,10 +171,17 @@ class QuotexSession(BrokerSession):
         # the environment when it builds its session, and there is no object to set it on
         # afterwards.
         configure_process_proxy()
-        # And before the first connection: the library binds its transport class when a
-        # connection service is built, so swapping it later would leave this session on
-        # the slow polling path.
-        install_websocket_transport()
+        # The faster WebSocket transport is OFF unless this deployment asks for it.
+        #
+        # It is not merely unproven, it is known broken: the shim's send/recv/connect are
+        # plain functions while the library awaits them, so every send died with "object
+        # bool can't be used in 'await' expression" — the authorisation frame included.
+        # That is why a correctly captured SSID still produced "Session ID unknown" and an
+        # account with no candles and no balance. A slow transport that works beats a fast
+        # one that silently swallows authentication, so the library keeps its own until the
+        # shim is made properly asynchronous.
+        if os.getenv("BROKER_QUOTEX_WS_TRANSPORT", "").strip().lower() in {"1", "true", "yes"}:
+            install_websocket_transport()
 
         # The balance is chosen in the constructor, before the socket exists. Switching
         # after the handshake races the broker's own setup and can leave the session on
@@ -208,6 +218,9 @@ class QuotexSession(BrokerSession):
         self._client = client
         self._data = _find_data_service(client)
         self.account_type = account_type
+        #: Remembered so a later connect can tell "the same session again" from "a freshly
+        #: captured one". Without it every login would tear down a working socket.
+        self.ssid = ssid
         self.lifecycle = LifecycleState.CONNECTED
 
         # Confirm the balance rather than trusting the constructor flag alone.

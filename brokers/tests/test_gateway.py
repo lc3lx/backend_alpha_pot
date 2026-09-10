@@ -25,11 +25,15 @@ class FakeBroker(BrokerSession):
     broker = "fake"
     fail_with: Exception | None = None
 
+    connects = 0
+
     async def connect(self, *, ssid=None, email=None, password=None, account_type=AccountType.REAL):
         if FakeBroker.fail_with is not None:
             raise FakeBroker.fail_with
+        FakeBroker.connects += 1
         self.lifecycle = LifecycleState.CONNECTED
         self.account_type = account_type
+        self.ssid = ssid
 
     async def disconnect(self):
         self.lifecycle = LifecycleState.DISCONNECTED
@@ -155,3 +159,32 @@ def test_place_order_and_outcome(client):
         params={"user_id": "u1", "broker": "fake", "order_id": "o1"},
     )
     assert res.json()["result"] == "Win"
+
+
+def test_connecting_again_with_the_same_session_reuses_the_socket(client):
+    FakeBroker.connects = 0
+    assert _connect(client).status_code == 200
+    assert _connect(client).status_code == 200
+    # Tearing down a healthy socket on every sign-in would drop the pair feeds it owns
+    # and cost a fresh handshake for nothing.
+    assert FakeBroker.connects == 1
+
+
+def test_a_newly_captured_session_replaces_a_live_one(client):
+    """
+    The rule the whole browser capture depends on.
+
+    A Quotex session opened from a password reports itself connected and then answers
+    every poll with "Session ID unknown", because Cloudflare refused its socket upgrade.
+    Reusing it because it "looks live" meant a freshly captured SSID was thrown away and
+    the account stayed on the dead session — no candles, no balance, five assets.
+    """
+    FakeBroker.connects = 0
+    assert _connect(client).status_code == 200
+
+    replaced = client.post(
+        "/sessions/connect",
+        json={"user_id": "u1", "broker": "fake", "ssid": "captured-in-a-browser", "account_type": "Real"},
+    )
+    assert replaced.status_code == 200
+    assert FakeBroker.connects == 2

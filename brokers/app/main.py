@@ -197,10 +197,21 @@ async def connect(body: ConnectRequest) -> SessionStatus:
     # asked for one on every status poll, each took the slot, and the person actually
     # clicking "log in" was turned away.
     existing = registry.get(body.user_id, broker)
+    # Reuse a live session — unless the caller brought a session the existing one was not
+    # built from.
+    #
+    # Reuse alone was wrong, and it is what made the whole browser-capture work invisible.
+    # A Quotex session opened from a password reports transport_connected quite happily and
+    # then answers every poll with {"code":1,"message":"Session ID unknown"}, because
+    # Cloudflare refused the socket upgrade for a connection that never signed in. The API
+    # would go and capture a real SSID, send it here, and this branch handed straight back
+    # the poisoned session it was meant to replace. Nothing downstream could recover: the
+    # session looked healthy from every angle except the data, which stayed empty.
     if (
         existing is not None
         and existing.transport_connected
         and existing.account_type == body.account_type
+        and not (body.ssid and body.ssid != getattr(existing, "ssid", None))
     ):
         return _status(existing)
 
