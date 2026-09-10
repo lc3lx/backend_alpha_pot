@@ -31,14 +31,23 @@ and the slow path comes back with nothing to explain why.
 The interface below matches the original exactly — sync, same method names, same callback
 registration — so every protocol behaviour above it is untouched.
 
-## Cloudflare
+## Cloudflare, and why the upgrade goes through curl_cffi
 
-Quotex sits behind Cloudflare, which is the reason the library reached for `curl_cffi`:
-it impersonates a browser's TLS fingerprint. A plain WebSocket handshake does not. So the
-Cloudflare cookies are collected first with `curl_cffi` and presented on the WebSocket
-handshake — the same trick the browser performs. If Cloudflare still refuses, `connect()`
-returns False and the caller falls back to the original transport rather than leaving the
-session dead.
+Quotex sits behind Cloudflare, which is why the library reached for `curl_cffi` in the
+first place: it impersonates Chrome's TLS fingerprint, and Cloudflare's bot management
+scores that fingerprint (JA3) as much as it scores the IP.
+
+The first attempt here opened the socket with `websocket-client` and merely COPIED the
+Cloudflare cookie across from a `curl_cffi` request. That cannot work, and the logs said
+so — every upgrade came back 403 while the very same cookie fetch returned 200. A
+`__cf_bm` cookie is issued to a fingerprint as well as an address, and presenting it from
+a connection that plainly announces itself as Python is a worse signal than not
+presenting it at all.
+
+So the upgrade is made BY curl_cffi, on the impersonating session, and inherits the
+fingerprint that already passes. `websocket-client` remains only as a fallback for a
+curl_cffi too old to speak WebSocket; if neither works `connect()` returns False and the
+library keeps its own polling transport rather than being left with a dead session.
 """
 
 from __future__ import annotations
@@ -110,37 +119,17 @@ class WebSocketTransport:
     # ---- lifecycle ---------------------------------------------------------
 
     def connect(self) -> bool:
-        try:
-            import websocket  # websocket-client
-        except ImportError:
-            _log("websocket-client is not installed; falling back to polling")
-            return False
-
         ws_url = _as_websocket_url(self.url)
         headers = dict(self.headers)
-
-        cookie = _cloudflare_cookies(ws_url)
-        if cookie:
-            headers["Cookie"] = cookie
         headers.setdefault("Origin", _origin(ws_url))
-        headers.setdefault(
-            "User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
-        )
 
-        try:
-            self._ws = websocket.create_connection(
-                ws_url,
-                header=[f"{k}: {v}" for k, v in headers.items()],
-                timeout=20,
-                **_proxy_kwargs(),
-            )
-        except Exception as exc:
-            proxy = _proxy_kwargs()
-            via = f" via {proxy.get('proxy_type')} proxy" if proxy else " directly"
-            _log(f"handshake refused{via} ({exc}); falling back to polling")
-            self._fail(exc)
+        # Impersonating first. This is the transport that already gets 200s from
+        # Cloudflare on the polling endpoint, so it is the one whose fingerprint the
+        # challenge accepts.
+        self._ws = _open_with_curl(ws_url, headers)
+        if self._ws is None:
+            self._ws = _open_with_websocket_client(ws_url, headers)
+        if self._ws is None:
             return False
 
         # Engine.IO opens with 0{"sid":...}. Without it there is no session and nothing
@@ -274,6 +263,126 @@ class WebSocketTransport:
                 self._on_error(exc)
             except Exception:
                 pass
+
+
+class _CurlSocket:
+    """
+    Adapts curl_cffi's WebSocket to the two calls this transport makes.
+
+    curl_cffi has changed the shape of `recv` between releases — sometimes bytes,
+    sometimes `(bytes, flags)` — so the result is normalised here rather than at every
+    call site.
+    """
+
+    def __init__(self, session: Any, socket: Any) -> None:
+        self._session = session
+        self._socket = socket
+
+    def recv(self) -> str:
+        frame = self._socket.recv()
+        if isinstance(frame, tuple):
+            frame = frame[0]
+        return frame.decode() if isinstance(frame, (bytes, bytearray)) else str(frame)
+
+    def send(self, message: str) -> None:
+        self._socket.send(message.encode())
+
+    def close(self) -> None:
+        try:
+            self._socket.close()
+        finally:
+            try:
+                self._session.close()
+            except Exception:
+                pass
+
+
+def _open_with_curl(ws_url: str, headers: dict[str, str]) -> Any:
+    """Opens the upgrade on an impersonating session, or None if that is not possible."""
+    try:
+        from curl_cffi import requests as curl_requests
+    except ImportError:
+        return None
+
+    session_factory = getattr(curl_requests, "Session", None)
+    if session_factory is None:
+        return None
+
+    try:
+        session = session_factory(impersonate="chrome110")
+    except Exception:
+        return None
+
+    proxy = proxy_url()
+    if proxy:
+        try:
+            session.proxies = {"http": proxy, "https": proxy}
+        except Exception:
+            pass
+
+    connect = getattr(session, "ws_connect", None)
+    if connect is None:
+        # curl_cffi predates WebSocket support. Not an error — the fallback handles it.
+        _log("curl_cffi has no ws_connect; trying websocket-client")
+        try:
+            session.close()
+        except Exception:
+            pass
+        return None
+
+    try:
+        socket = connect(ws_url, headers=headers)
+    except Exception as exc:
+        _log(f"impersonated upgrade refused ({_short(exc)})")
+        try:
+            session.close()
+        except Exception:
+            pass
+        return None
+
+    _log("upgraded on the impersonating session")
+    return _CurlSocket(session, socket)
+
+
+def _open_with_websocket_client(ws_url: str, headers: dict[str, str]) -> Any:
+    """
+    Last resort. Its TLS fingerprint is plainly Python, so Cloudflare usually refuses —
+    but on a venue without bot management it works, and it costs nothing to try.
+    """
+    try:
+        import websocket  # websocket-client
+    except ImportError:
+        _log("websocket-client is not installed either; leaving the polling transport")
+        return None
+
+    attempt = dict(headers)
+    cookie = _cloudflare_cookies(ws_url)
+    if cookie:
+        attempt["Cookie"] = cookie
+    attempt.setdefault(
+        "User-Agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
+    )
+
+    try:
+        return websocket.create_connection(
+            ws_url,
+            header=[f"{k}: {v}" for k, v in attempt.items()],
+            timeout=20,
+            **_proxy_kwargs(),
+        )
+    except Exception as exc:
+        proxy = _proxy_kwargs()
+        via = f" via {proxy.get('proxy_type')} proxy" if proxy else " directly"
+        _log(f"plain upgrade refused{via} ({_short(exc)}); falling back to polling")
+        return None
+
+
+def _short(exc: Exception) -> str:
+    """Cloudflare's refusal carries a full header dump; the first line is the useful part."""
+    text = str(exc).replace("\n", " ")
+    return text[:160]
 
 
 # ---- helpers ---------------------------------------------------------------
