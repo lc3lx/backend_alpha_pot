@@ -298,7 +298,19 @@ class _CurlSocket:
 
 
 def _open_with_curl(ws_url: str, headers: dict[str, str]) -> Any:
-    """Opens the upgrade on an impersonating session, or None if that is not possible."""
+    """
+    Opens the upgrade on an impersonating session, or None if that is not possible.
+
+    The session is WARMED with an ordinary request first. Cloudflare issues `__cf_bm` on a
+    connection's first request and expects it back on the rest; a cold WebSocket upgrade
+    carries no such cookie and is refused 403 — which is exactly what happened here even
+    from a dedicated static IP with Chrome's TLS fingerprint. The library's polling path
+    never hit this because it always GETs before it POSTs, so the cookie was already in
+    its jar.
+
+    Warming on the SAME session is what matters. An earlier attempt fetched the cookie on
+    one session and replayed it on another, which is a worse signal than sending none.
+    """
     try:
         from curl_cffi import requests as curl_requests
     except ImportError:
@@ -319,6 +331,8 @@ def _open_with_curl(ws_url: str, headers: dict[str, str]) -> Any:
             session.proxies = {"http": proxy, "https": proxy}
         except Exception:
             pass
+
+    _warm_session(session, ws_url)
 
     connect = getattr(session, "ws_connect", None)
     if connect is None:
@@ -377,6 +391,22 @@ def _open_with_websocket_client(ws_url: str, headers: dict[str, str]) -> Any:
         via = f" via {proxy.get('proxy_type')} proxy" if proxy else " directly"
         _log(f"plain upgrade refused{via} ({_short(exc)}); falling back to polling")
         return None
+
+
+def _warm_session(session: Any, ws_url: str) -> None:
+    """
+    Earns Cloudflare's clearance cookie on this session, so the upgrade carries it.
+
+    Failure is not fatal: some deployments answer the upgrade without one, and the
+    attempt costs a single request either way.
+    """
+    http_url = ws_url.replace("wss://", "https://").replace("ws://", "http://")
+    http_url = http_url.replace("transport=websocket", "transport=polling")
+
+    try:
+        session.get(http_url, timeout=15)
+    except Exception as exc:
+        _log(f"session warm-up failed ({_short(exc)}); trying the upgrade anyway")
 
 
 def _short(exc: Exception) -> str:
