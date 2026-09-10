@@ -49,6 +49,20 @@ function redactAuthBody(text) {
     .slice(0, 280);
 }
 
+/**
+ * Types `value` into the first of `selectors` that works.
+ *
+ * Two passes, and the second one matters. The normal pass insists the field is visible,
+ * which is right: it proves the form is really on screen and rules out filling a leftover
+ * hidden input from some other panel.
+ *
+ * But Quotex's sign-in page reports EVERY input as zero-sized — `_token`, `email`,
+ * `password`, its country widget, all of them — because the fields are custom controls
+ * whose real input sits behind a styled wrapper. Playwright refuses to type into those,
+ * so a page that was loaded, correct, and perfectly fillable came back as "could not find
+ * the password field". The second pass writes straight to the element and fires the same
+ * events a keystroke would, so the framework's own state updates.
+ */
 async function fillFirst(page, selectors, value) {
   for (const sel of selectors) {
     try {
@@ -60,6 +74,34 @@ async function fillFirst(page, selectors, value) {
       /* next */
     }
   }
+
+  // Fallback: the field exists but is not "visible" by Playwright's definition.
+  for (const sel of selectors) {
+    try {
+      const el = page.locator(sel).first();
+      await el.waitFor({ state: 'attached', timeout: 2000 });
+      const filled = await el.evaluate((node, v) => {
+        if (!(node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement)) return false;
+        // Through the native setter, or React/Vue keep their own cached value and the
+        // form submits empty while the box looks filled.
+        const proto = node instanceof HTMLTextAreaElement
+          ? HTMLTextAreaElement.prototype
+          : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        node.focus();
+        if (setter) setter.call(node, v);
+        else node.value = v;
+        node.dispatchEvent(new Event('input', { bubbles: true }));
+        node.dispatchEvent(new Event('change', { bubbles: true }));
+        node.dispatchEvent(new Event('blur', { bubbles: true }));
+        return node.value === v;
+      }, value);
+      if (filled) return true;
+    } catch {
+      /* next */
+    }
+  }
+
   return false;
 }
 
@@ -123,6 +165,36 @@ async function clickSubmit(page, isSignup) {
       /* next */
     }
   }
+
+  // Same reason the fields need a fallback: on a page whose controls report zero size,
+  // a real click never lands, and submitting nothing looks exactly like a wrong password.
+  for (const sel of selectors) {
+    try {
+      const btn = page.locator(sel).first();
+      if ((await btn.count()) === 0) continue;
+      await btn.evaluate((node) => node.click());
+      return `${sel} (direct)`;
+    } catch {
+      /* next */
+    }
+  }
+
+  // Last resort: submit the form the password field belongs to. Enter alone does nothing
+  // when nothing holds focus.
+  try {
+    const submitted = await page.evaluate(() => {
+      const field = document.querySelector('input[type="password"], input[name="password"]');
+      const form = field?.form;
+      if (!form) return false;
+      if (typeof form.requestSubmit === 'function') form.requestSubmit();
+      else form.submit();
+      return true;
+    });
+    if (submitted) return 'form.submit';
+  } catch {
+    /* fall through */
+  }
+
   await page.keyboard.press('Enter');
   return 'Enter';
 }
