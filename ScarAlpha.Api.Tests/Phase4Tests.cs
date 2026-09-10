@@ -53,9 +53,9 @@ public sealed class PendingApprovalApiFactory : WebApplicationFactory<Program>
         services.RemoveAll<IBinollaSessionManager>();
         services.RemoveAll<IBinollaCredentialAuth>();
         var credAuth = new Mock<IBinollaCredentialAuth>();
-        credAuth.Setup(c => c.LoginAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+        credAuth.Setup(c => c.LoginAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new BinollaCapturedSession("""42["authorization",{"isDemo":true,"token":"cred-login-token-abcdef"}]""", null));
-        credAuth.Setup(c => c.SignUpAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+        credAuth.Setup(c => c.SignUpAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new BinollaCapturedSession("""42["authorization",{"isDemo":true,"token":"cred-signup-token-abcdef"}]""", null));
         services.AddSingleton(credAuth.Object);
         var client = new Mock<IBinollaClient>(MockBehavior.Loose);

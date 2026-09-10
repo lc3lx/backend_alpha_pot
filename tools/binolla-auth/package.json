@@ -2,9 +2,12 @@
   "name": "scaralpha-binolla-auth",
   "private": true,
   "version": "1.0.0",
-  "description": "Binolla email/password → session token (A11ksa/API-Binolla style)",
+  "description": "Broker email/password -> session token via a real browser (Binolla, Quotex)",
   "type": "module",
   "dependencies": {
     "playwright": "^1.49.0"
+  },
+  "scripts": {
+    "test": "node --test"
   }
 }

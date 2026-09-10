@@ -101,7 +101,7 @@ public sealed class BinollaAppService
         var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
-            captured = await _credentialAuth.LoginAsync(request.Email, request.Password, workCt);
+            captured = await _credentialAuth.LoginAsync(Brokers.Binolla, request.Email, request.Password, workCt);
         }
         catch (ApiException ex) when (IsBrokerIpBlock(ex))
         {
@@ -180,7 +180,7 @@ public sealed class BinollaAppService
         BinollaCapturedSession captured;
         try
         {
-            captured = await _credentialAuth.SignUpAsync(request.Email, request.Password, ct);
+            captured = await _credentialAuth.SignUpAsync(Brokers.Binolla, request.Email, request.Password, ct);
         }
         catch (ApiException)
         {
@@ -727,10 +727,14 @@ public sealed class BinollaAppService
         await EnsureAccountTypeAllowedAsync(userId, accountType, ct);
 
         var engineType = accountType == DomainAccount.Demo ? EngineAccount.Demo : EngineAccount.Real;
+        var captured = await CaptureGatewaySessionAsync(userId, broker, request, ct);
+
         var client = await _brokers.GetOrCreateAsync(
             userId,
             broker,
             new BrokerCredentials(
+                Ssid: captured?.SsidFrame,
+                CookieHeader: captured?.CookieHeader,
                 Email: request.Email.Trim(),
                 Password: request.Password,
                 AccountType: engineType),
@@ -753,6 +757,16 @@ public sealed class BinollaAppService
         link.UpdatedAt = now;
         link.EncryptedBinollaEmail = _protector.Encrypt(request.Email.Trim());
         link.EncryptedBinollaPassword = _protector.Encrypt(request.Password);
+        if (captured is not null)
+        {
+            // Kept encrypted exactly like Binolla's, so a reconnect can reuse it instead of
+            // paying for another browser — and so a session that outlives the password
+            // change still works.
+            link.EncryptedSsid = _protector.Encrypt(captured.SsidFrame);
+            link.EncryptedCookieHeader = string.IsNullOrWhiteSpace(captured.CookieHeader)
+                ? null
+                : _protector.Encrypt(captured.CookieHeader);
+        }
         await _links.UpsertAsync(link, ct);
         // The routing cache must see the new venue immediately — a bot reading a stale
         // value would place this user's next trade through the wrong broker's client.
@@ -784,6 +798,72 @@ public sealed class BinollaAppService
             ApprovalStatus: access.ApprovalStatus,
             LastConnectedAt: link.LastConnectedAt,
             Balance: balance);
+    }
+
+    /// <summary>
+    /// Obtains a browser session for a gateway broker that cannot connect without one.
+    ///
+    /// <para>Quotex is the case that forced this. Its Cloudflare answers the polling
+    /// endpoint but returns 403 on the WebSocket upgrade for anything that did not
+    /// actually sign in, so a connect built from email and password alone reaches the
+    /// broker, is given a session id, and then dies with <c>Session ID unknown</c> the
+    /// moment it tries to use it. Every symptom the user saw — zero balance, no candles,
+    /// five assets instead of a hundred — was that one failure. A real Chromium login
+    /// produces a session the socket accepts.</para>
+    ///
+    /// <para>Returns null for brokers that do not need this, so nothing changes for them.
+    /// Failure throws rather than falling through: without the session the connect cannot
+    /// work, and replacing a precise error with a later obscure one costs the user the
+    /// only clue they had.</para>
+    /// </summary>
+    private async Task<BinollaCapturedSession?> CaptureGatewaySessionAsync(
+        Guid userId,
+        string broker,
+        BinollaCredentialRequest request,
+        CancellationToken ct)
+    {
+        if (broker != Brokers.Quotex)
+            return null;
+
+        // The same throttle as Binolla's capture, for the same reason: this launches a
+        // headless browser, and a client retrying the login would otherwise stack them.
+        if (!_restorer.CanAttemptCredentialLogin(userId))
+        {
+            throw new ApiException(
+                ApiErrorCodes.BinollaLoginFailed,
+                _restorer.DescribeCredentialRefusal(userId),
+                429);
+        }
+
+        using var workCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        workCts.CancelAfter(TimeSpan.FromMinutes(2));
+
+        try
+        {
+            var captured = await _credentialAuth.LoginAsync(
+                broker, request.Email, request.Password, workCts.Token);
+            _restorer.ClearAuthFailure(userId);
+            return captured;
+        }
+        catch (ApiException ex) when (IsBrokerIpBlock(ex))
+        {
+            _restorer.MarkCredentialLoginFailed(userId, blockedByBroker: true);
+            throw;
+        }
+        catch (ApiException)
+        {
+            _restorer.MarkCredentialLoginFailed(userId);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _restorer.MarkCredentialLoginFailed(userId);
+            _logger.LogWarning(ex, "{Broker} session capture failed for user {UserId}", broker, userId);
+            throw new ApiException(
+                ApiErrorCodes.BinollaLoginFailed,
+                $"Unable to sign into {broker} with the provided credentials.",
+                400);
+        }
     }
 
     private static bool IsBrokerIpBlock(ApiException ex) =>

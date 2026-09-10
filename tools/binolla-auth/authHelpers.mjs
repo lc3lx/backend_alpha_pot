@@ -44,13 +44,19 @@ export function normalizeToken(raw) {
   return s;
 }
 
-/** Build Cookie header for Binolla domains — never printed to logs. */
-export async function buildCookieHeader(context) {
+/**
+ * Cookie header for the broker's own domains — never printed to logs.
+ *
+ * `hosts` names the registrable domains to keep. It used to be hardcoded to binolla.com,
+ * which meant a Quotex capture returned no cookies at all and the session it produced
+ * could not be reused.
+ */
+export async function buildCookieHeader(context, hosts = ['binolla.com']) {
   try {
     const cookies = await context.cookies();
     const relevant = cookies.filter((c) => {
       const d = (c.domain || '').replace(/^\./, '');
-      return d === 'binolla.com' || d.endsWith('.binolla.com');
+      return hosts.some((h) => d === h || d.endsWith(`.${h}`));
     });
     if (!relevant.length) return undefined;
     return relevant.map((c) => `${c.name}=${c.value}`).join('; ');
@@ -59,9 +65,20 @@ export async function buildCookieHeader(context) {
   }
 }
 
+/**
+ * The session token from a Socket.IO authorization frame.
+ *
+ * Brokers name the field differently for the same thing:
+ *
+ *   Binolla  42["authorization",{"isDemo":true,"token":"…"}]
+ *   Quotex   42["authorization",{"session":"…","isDemo":0,"tournamentId":0}]
+ *
+ * Reading only `token` silently returned nothing on Quotex — a capture that looked like
+ * it simply never saw an auth frame, rather than one that saw it and did not recognise
+ * the field.
+ */
 export function extractWsAuthorizationToken(payload) {
   if (!payload || typeof payload !== 'string') return null;
-  // Outbound/inbound Socket.IO: 42["authorization",{"isDemo":true,"token":"..."}]
   const idx = payload.indexOf('[');
   if (idx < 0) return null;
   try {
@@ -71,10 +88,60 @@ export function extractWsAuthorizationToken(payload) {
     const data = arr[1];
     if (!/authorization|authorize|^auth$/i.test(event)) return null;
     if (!data || typeof data !== 'object') return null;
-    return normalizeToken(typeof data.token === 'string' ? data.token : null);
+
+    for (const field of ['token', 'session', 'ssid', 'sessionId']) {
+      const value = normalizeToken(typeof data[field] === 'string' ? data[field] : null);
+      if (value) return value;
+    }
+    return null;
   } catch {
     return null;
   }
+}
+
+/**
+ * Per-broker capture settings.
+ *
+ * Kept here rather than in the caller so the two brokers cannot drift into different
+ * ideas of where a login page is — the .NET side passes a name, not a pile of URLs.
+ */
+export const BROKER_PRESETS = {
+  binolla: {
+    loginUrl: 'https://binolla.com/login/',
+    signupUrl: 'https://binolla.com/signup/?lid=15968',
+    tradingUrl: 'https://binolla.com/trading',
+    // Extra spellings tried in order if the first navigation lands somewhere unexpected.
+    tradingUrls: ['https://binolla.com/trading/', 'https://binolla.com/en/trading'],
+    // Binolla accepts a JSON login from inside the page, which is much faster and more
+    // reliable than driving the form, so the capture prefers it.
+    loginApiPaths: ['/api/auth/login', '/api/v1/auth/login'],
+    signupApiPaths: ['/api/auth/register', '/api/v1/auth/register', '/api/auth/signup'],
+    cookieHosts: ['binolla.com'],
+    label: 'Binolla',
+  },
+  quotex: {
+    loginUrl: 'https://qxbroker.com/en/sign-in',
+    signupUrl: 'https://broker-qx.pro/?lid=2345315',
+    // The SSID only appears once the trading socket authorises, so the capture has to
+    // reach this page — the sign-in response alone does not carry it.
+    tradingUrl: 'https://qxbroker.com/en/trade',
+    tradingUrls: ['https://qxbroker.com/trade', 'https://qxbroker.com/en/trade/'],
+    // Deliberately empty. Quotex signs in through a server-rendered form carrying a CSRF
+    // token, not a JSON endpoint; posting to a guessed path just burns seconds and can
+    // trip the rate limiter before the real form is ever filled. The capture goes
+    // straight to the DOM path for this broker.
+    loginApiPaths: [],
+    signupApiPaths: [],
+    // Quotex serves the app and the socket from separate hosts, and the session cookie
+    // is set on the parent domain — keeping only one of them loses it.
+    cookieHosts: ['qxbroker.com', 'quotex.com', 'broker-qx.pro'],
+    label: 'Quotex',
+  },
+};
+
+export function brokerPreset(name) {
+  const key = String(name || '').trim().toLowerCase();
+  return BROKER_PRESETS[key] ?? BROKER_PRESETS.binolla;
 }
 
 export function extractToken(text) {

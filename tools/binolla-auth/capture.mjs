@@ -21,6 +21,7 @@ import { chromium } from 'playwright';
 // Token recognition and proxy parsing are shared with interactive-server.mjs so both
 // login paths accept exactly the same sessions.
 import {
+  brokerPreset,
   buildCookieHeader,
   extractToken,
   extractWsAuthorizationToken,
@@ -124,15 +125,19 @@ async function readPageDiagnostics(page) {
 }
 
 /**
- * Call Binolla auth API from inside the page so Cloudflare cookies apply.
+ * Call the broker's JSON auth endpoint from inside the page so Cloudflare cookies apply.
+ *
+ * `paths` comes from the broker preset. An empty list means this broker has no such
+ * endpoint (Quotex signs in through a CSRF-bearing form), and the capture falls through
+ * to the DOM path without wasting requests on guesses.
  */
-async function tryInPageAuthApi(page, { isSignup, email, password, lid }) {
-  return page.evaluate(
-    async ({ isSignup, email, password, lid }) => {
-      const paths = isSignup
-        ? ['/api/auth/register', '/api/v1/auth/register', '/api/auth/signup']
-        : ['/api/auth/login', '/api/v1/auth/login'];
+async function tryInPageAuthApi(page, { isSignup, email, password, lid, paths }) {
+  if (!Array.isArray(paths) || paths.length === 0) {
+    return { attempts: [], okStatus: false, skipped: true };
+  }
 
+  return page.evaluate(
+    async ({ isSignup, email, password, lid, paths }) => {
       const bodies = isSignup
         ? [
             {
@@ -196,7 +201,7 @@ async function tryInPageAuthApi(page, { isSignup, email, password, lid }) {
       }
       return { attempts, okStatus: false };
     },
-    { isSignup, email, password, lid },
+    { isSignup, email, password, lid, paths },
   );
 }
 
@@ -218,12 +223,23 @@ async function main() {
   const email = arg('email') || process.env.BINOLLA_AUTH_EMAIL || '';
   const password = arg('password') || process.env.BINOLLA_AUTH_PASSWORD || '';
   const headless = arg('headless', 'true') !== 'false';
-  const loginUrl = arg('loginUrl', 'https://binolla.com/login/');
-  const signupUrl = arg('signupUrl', 'https://binolla.com/signup/?lid=15968');
-  const tradingUrl = arg('tradingUrl', 'https://binolla.com/trading');
+  // Which venue to capture for. The URLs come from one table in authHelpers so the two
+  // brokers cannot drift into different ideas of where a login page is; an explicit
+  // --loginUrl still wins for a one-off.
+  const broker = arg('broker', 'binolla');
+  const preset = brokerPreset(broker);
+  const loginUrl = arg('loginUrl', preset.loginUrl);
+  const signupUrl = arg('signupUrl', preset.signupUrl);
+  const tradingUrl = arg('tradingUrl', preset.tradingUrl);
   const timeoutMs = Number(arg('timeoutMs', '45000')) || 45000;
   // Leave headroom so C# WaitForExit (timeoutMs+15s) does not kill us mid-exit.
-  const waitBudgetMs = Math.max(3_000, Math.min(timeoutMs - 20_000, 5_000));
+  //
+  // A broker with a JSON login answers in well under a second, so five seconds is plenty.
+  // One without it — Quotex — has to submit the form, follow the redirect and let the
+  // trading app boot before anything provable happens, and cutting that short reads as a
+  // failed login when it was only a slow one.
+  const submitBudgetCap = (preset.loginApiPaths || []).length > 0 ? 5_000 : 12_000;
+  const waitBudgetMs = Math.max(3_000, Math.min(timeoutMs - 20_000, submitBudgetCap));
   // Wait for Socket.IO authorization frame after navigating to trading (API token ≠ WS token).
   const wsAuthWaitMs = Math.max(8_000, Math.min(Number(arg('wsAuthWaitMs', '20000')) || 20_000, 25_000));
   const captureStarted = Date.now();
@@ -324,7 +340,7 @@ async function main() {
         {
           name: 'NEXT_LOCALE',
           value: 'en',
-          domain: 'binolla.com',
+          domain: preset.cookieHosts[0],
           path: '/',
           secure: true,
           sameSite: 'Lax',
@@ -396,7 +412,13 @@ async function main() {
     // #endregion
 
     // --- Preferred path: in-page auth API (CF cookies already set) ---
-    const apiResult = await tryInPageAuthApi(page, { isSignup, email, password, lid });
+    const apiResult = await tryInPageAuthApi(page, {
+      isSignup,
+      email,
+      password,
+      lid,
+      paths: isSignup ? preset.signupApiPaths : preset.loginApiPaths,
+    });
     for (const attempt of apiResult.attempts || []) {
       if (attempt.body) tryCaptureApi(extractToken(attempt.body), `api:${attempt.path}:${attempt.status}`);
     }
@@ -434,7 +456,7 @@ async function main() {
         ],
         email,
       );
-      if (!emailOk) throw new Error('Could not find Binolla email field');
+      if (!emailOk) throw new Error(`Could not find the ${preset.label} email field`);
 
       const passOk = await fillFirst(
         page,
@@ -446,7 +468,7 @@ async function main() {
         ],
         password,
       );
-      if (!passOk) throw new Error('Could not find Binolla password field');
+      if (!passOk) throw new Error(`Could not find the ${preset.label} password field`);
 
       if (isSignup) {
         await fillFirst(
@@ -496,14 +518,22 @@ async function main() {
       tryCaptureApi(await scanStorage(page), 'storage-final');
     }
 
-    // After API/session login, open trading so the live Socket.IO client sends authorization.
-    if ((apiResult.okStatus || apiToken) && !wsToken) {
-      const tradingCandidates = [
-        tradingUrl,
-        'https://binolla.com/trading',
-        'https://binolla.com/trading/',
-        'https://binolla.com/en/trading',
-      ];
+    // Whether the sign-in went through. An API 200 or a stored token proves it outright;
+    // for a form login that returns neither — Quotex — the only evidence available before
+    // the socket speaks is that the browser is no longer sitting on the sign-in page.
+    const leftLoginPage = (() => {
+      try {
+        return new URL(page.url()).pathname !== new URL(url).pathname;
+      } catch {
+        return false;
+      }
+    })();
+
+    // Open trading so the live Socket.IO client sends its authorization frame. For Quotex
+    // that frame IS the session; skipping this step is why a successful login still came
+    // back empty-handed.
+    if ((apiResult.okStatus || apiToken || leftLoginPage) && !wsToken) {
+      const tradingCandidates = [tradingUrl, ...(preset.tradingUrls || [])];
       let navigated = false;
       for (const tUrl of tradingCandidates) {
         try {
@@ -527,7 +557,7 @@ async function main() {
         }
       }
 
-      if (navigated || apiToken) {
+      if (navigated || apiToken || leftLoginPage) {
         const wsStarted = Date.now();
         while (!wsToken && Date.now() - wsStarted < wsAuthWaitMs) {
           await page.waitForTimeout(200);
@@ -563,8 +593,8 @@ async function main() {
         .join(', ');
 
       let error = isSignup
-        ? 'Binolla signup did not return a session token'
-        : 'Binolla login failed or token was not captured';
+        ? `${preset.label} signup did not return a session token`
+        : `${preset.label} login failed or the session token was not captured`;
 
       const lastBody = redactAuthBody(
         [...(apiResult.attempts || [])].reverse().find((a) => a.body)?.body || '',
@@ -572,30 +602,30 @@ async function main() {
       if (/invalid|incorrect|wrong|credentials|not found|already/i.test(lastBody)) {
         error = lastBody.slice(0, 180) || error;
       } else if (diag?.hasCfChallenge) {
-        error = 'Binolla Cloudflare challenge blocked auth on the server';
+        error = `${preset.label} showed a Cloudflare challenge instead of the sign-in form`;
       } else if (
         /not available in your current location/i.test(lastBody) ||
         /United Kingdom|\(GB\)/i.test(lastBody) ||
         (diag?.alerts || []).some((a) => /current location|United Kingdom|\(GB\)/i.test(a))
       ) {
         error =
-          'Binolla blocked this server IP by location (geo-restriction). ' +
-          'Set BINOLLA_AUTH_PROXY in scaralpha.env to a proxy in an allowed country, or paste SSID from Edit Profile.';
+          `${preset.label} blocked this server IP by location (geo-restriction). ` +
+          'Set BINOLLA_AUTH_PROXY in scaralpha.env to a proxy in an allowed country, or paste the SSID from the broker profile page.';
       } else if (diag?.alerts?.length) {
         error = diag.alerts[0].slice(0, 180);
-      } else if (/Registration \| Binolla/i.test(diag?.title || '')) {
+      } else if (/registration|sign ?up/i.test(diag?.title || '')) {
         error =
-          'Binolla signup stayed on registration page (form/API did not create a session)';
+          `${preset.label} stayed on the registration page (the form did not create a session)`;
       } else if ((apiResult.attempts || []).some((a) => a.status === 403)) {
         // 403 on an auth endpoint is an edge/WAF refusal, not a credential problem —
         // wrong credentials come back as 401 with a message. Saying so plainly stops the
         // hours otherwise spent re-checking a password that was never the issue.
         const snippet = lastBody ? ` Server said: ${lastBody.slice(0, 120)}` : '';
         error =
-          'Binolla refused the login from this server (HTTP 403 — blocked before the ' +
-          'password was checked). This is an IP/location or bot-protection block, not a ' +
-          'wrong password. Set BINOLLA_AUTH_PROXY in scaralpha.env to a proxy in an ' +
-          'allowed country, or paste the SSID from Binolla Edit Profile.' +
+          `${preset.label} refused the login from this server (HTTP 403 — blocked before ` +
+          'the password was checked). This is an IP/location or bot-protection block, not ' +
+          'a wrong password. Set BINOLLA_AUTH_PROXY in scaralpha.env to a proxy in an ' +
+          'allowed country, or paste the SSID from the broker profile page.' +
           snippet +
           (apiHint ? ` [${apiHint}]` : '');
       } else if (apiHint) {
@@ -609,7 +639,7 @@ async function main() {
       process.exit(1);
     }
 
-    const cookies = await buildCookieHeader(context);
+    const cookies = await buildCookieHeader(context, preset.cookieHosts);
     // #region agent log
     agentLog('H103', 'capture.mjs:done', 'token_captured', {
       elapsedMs: Date.now() - captureStarted,
@@ -625,6 +655,7 @@ async function main() {
     process.stdout.write(
       JSON.stringify({
         ok: true,
+        broker,
         token,
         tokenSource,
         cookies,

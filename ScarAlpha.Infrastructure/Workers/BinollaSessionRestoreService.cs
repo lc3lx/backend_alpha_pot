@@ -367,14 +367,15 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
     }
 
     /// <summary>
-    /// Whether a link can be brought back up without the user typing anything: an SSID for
-    /// Binolla, a stored credential pair for a gateway broker.
+    /// Whether a link can be brought back up without the user typing anything: a captured
+    /// session, or - for a gateway broker that can connect without one - a credential pair.
     /// </summary>
     private static bool HasRestorableSecret(Domain.Entities.BinollaLink link) =>
         Brokers.Normalize(link.Broker) == Brokers.Binolla
             ? !string.IsNullOrWhiteSpace(link.EncryptedSsid)
-            : !string.IsNullOrWhiteSpace(link.EncryptedBinollaEmail)
-              && !string.IsNullOrWhiteSpace(link.EncryptedBinollaPassword);
+            : !string.IsNullOrWhiteSpace(link.EncryptedSsid)
+              || (!string.IsNullOrWhiteSpace(link.EncryptedBinollaEmail)
+                  && !string.IsNullOrWhiteSpace(link.EncryptedBinollaPassword));
 
     /// <summary>
     /// Reconnects one gateway-backed broker session. Single attempt on purpose: the gateway
@@ -385,6 +386,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
         Guid userId,
         Guid linkId,
         string broker,
+        string? ssidCipher,
         string? emailCipher,
         string? passwordCipher,
         EngineAccount accountType)
@@ -397,26 +399,53 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
             return true;
         }
 
-        if (string.IsNullOrWhiteSpace(emailCipher) || string.IsNullOrWhiteSpace(passwordCipher))
-            return false;
-
-        string email, password;
-        try
+        // The session captured at sign-in comes first. On Quotex it is the only thing that
+        // works: its Cloudflare refuses the WebSocket upgrade for a connection that did not
+        // actually sign in through a browser, so a restore built from email and password
+        // alone reconnects into a session that dies on first use. Credentials stay as the
+        // fallback for a venue that does not need the browser.
+        string? ssid = null;
+        if (!string.IsNullOrWhiteSpace(ssidCipher))
         {
-            email = _protector.Decrypt(emailCipher);
-            password = _protector.Decrypt(passwordCipher);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(
-                ex, "Session restore: {Broker} credential decrypt failed for user {UserId}", broker, userId);
-            await MarkLinkDisconnectedAsync(userId, "DECRYPT_FAILED", CancellationToken.None)
-                .ConfigureAwait(false);
-            return false;
+            try
+            {
+                ssid = _protector.Decrypt(ssidCipher);
+            }
+            catch (Exception ex)
+            {
+                // Not fatal on its own - the credentials below may still work - but the key
+                // having changed is worth saying out loud rather than silently degrading.
+                _logger.LogWarning(
+                    ex, "Session restore: {Broker} session decrypt failed for user {UserId}", broker, userId);
+            }
         }
 
-        if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(password))
+        string? email = null, password = null;
+        if (!string.IsNullOrWhiteSpace(emailCipher) && !string.IsNullOrWhiteSpace(passwordCipher))
+        {
+            try
+            {
+                email = _protector.Decrypt(emailCipher);
+                password = _protector.Decrypt(passwordCipher);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex, "Session restore: {Broker} credential decrypt failed for user {UserId}", broker, userId);
+                if (string.IsNullOrWhiteSpace(ssid))
+                {
+                    await MarkLinkDisconnectedAsync(userId, "DECRYPT_FAILED", CancellationToken.None)
+                        .ConfigureAwait(false);
+                    return false;
+                }
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(ssid) &&
+            (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(password)))
+        {
             return false;
+        }
 
         try
         {
@@ -424,7 +453,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                     userId,
                     broker,
                     new BrokerCredentials(
-                        Email: email, Password: password, AccountType: accountType),
+                        Ssid: ssid, Email: email, Password: password, AccountType: accountType),
                     CancellationToken.None)
                 .ConfigureAwait(false);
 
@@ -582,14 +611,13 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
             if (!connectedLink)
                 return false;
 
-            // Gateway brokers reconnect on their stored credentials, not on an SSID, so they
-            // branch off before every check below - all of which are about a captured Binolla
-            // session. Without this a Quotex user is logged out by every API restart, holding
-            // a link that still says Connected.
+            // Gateway brokers branch off before every check below - all of which are about a
+            // captured Binolla session. Without this a Quotex user is logged out by every API
+            // restart, holding a link that still says Connected.
             if (broker != Brokers.Binolla)
             {
                 return await RestoreGatewayLinkAsync(
-                    userId, linkId, broker, emailCipher, passwordCipher, gatewayAccountType)
+                    userId, linkId, broker, ciphertext, emailCipher, passwordCipher, gatewayAccountType)
                     .ConfigureAwait(false);
             }
 

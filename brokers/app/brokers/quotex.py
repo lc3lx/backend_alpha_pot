@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import time
 from typing import Any
 
@@ -157,6 +158,8 @@ class QuotexSession(BrokerSession):
     ) -> None:
         if not ssid and not (email and password):
             raise AuthError("Quotex needs either an SSID or an email/password pair.")
+
+        ssid = _normalize_ssid(ssid)
 
         cls = _load_client_cls()
         self.lifecycle = LifecycleState.CONNECTING
@@ -542,6 +545,42 @@ class QuotexSession(BrokerSession):
             close_price=_num(_attr(trade, "close_price")),
             closed_at=time.time(),
         )
+
+
+def _normalize_ssid(ssid: str | None) -> str | None:
+    """
+    Reduces an SSID to the bare session value the library expects.
+
+    The browser capture sees the authorisation the site itself sends, which is a whole
+    Socket.IO frame::
+
+        42["authorization",{"session":"abc…","isDemo":0,"tournamentId":0}]
+
+    The library builds that frame itself, from the session value and the balance the
+    caller asked for. Passing the frame through would double-wrap it, and would also let a
+    captured `isDemo` override the account the user chose — which is how a demo request
+    ends up placing a real trade. So the value is unwrapped here, and a bare token is
+    already in the right shape and passes through untouched.
+    """
+    if not ssid:
+        return None
+
+    text = ssid.strip()
+    if not text:
+        return None
+
+    start = text.find("[")
+    if start >= 0:
+        try:
+            frame = json.loads(text[start:])
+        except (ValueError, TypeError):
+            return text
+        if isinstance(frame, list) and len(frame) >= 2 and isinstance(frame[1], dict):
+            for field in ("session", "ssid", "token"):
+                value = frame[1].get(field)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return text
 
 
 def _find_data_service(client: Any) -> Any:

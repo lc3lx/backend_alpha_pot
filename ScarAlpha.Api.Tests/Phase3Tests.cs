@@ -67,9 +67,9 @@ public sealed class RateLimitedApiFactory : WebApplicationFactory<Program>
             // Never run real Playwright Binolla login in tests.
             services.RemoveAll<IBinollaCredentialAuth>();
             var credAuth = new Mock<IBinollaCredentialAuth>();
-            credAuth.Setup(c => c.LoginAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            credAuth.Setup(c => c.LoginAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync(new BinollaCapturedSession("""42["authorization",{"isDemo":true,"token":"cred-login-token-abcdef"}]""", null));
-            credAuth.Setup(c => c.SignUpAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            credAuth.Setup(c => c.SignUpAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync(new BinollaCapturedSession("""42["authorization",{"isDemo":true,"token":"cred-signup-token-abcdef"}]""", null));
             services.AddSingleton(credAuth.Object);
 

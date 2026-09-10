@@ -10,9 +10,13 @@ using ScarAlpha.Application.Common;
 namespace ScarAlpha.Infrastructure.Binolla;
 
 /// <summary>
-/// Runs backend/tools/binolla-auth/capture.mjs (A11ksa/API-Binolla login.py port)
-/// to obtain a Binolla session token from email/password, then builds an SSID frame.
+/// Runs backend/tools/binolla-auth/capture.mjs — a real Chromium driven through the
+/// broker's own sign-in page — to obtain a session token from email/password.
 /// Password is never logged or persisted.
+///
+/// <para>Serves every broker whose session can only be obtained this way. The script
+/// knows each venue's URLs and login shape; this class picks the broker, runs it, and
+/// converts the captured token into whatever that venue's client expects to send.</para>
 /// </summary>
 public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
 {
@@ -21,8 +25,8 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
     private readonly bool _headless;
     private readonly string _toolDirectory;
     private readonly string _nodeExecutable;
-    private readonly string _loginUrl;
-    private readonly string _signupUrl;
+    /// <summary>Per-broker URL overrides from configuration; empty means "use the script's own".</summary>
+    private readonly IConfiguration _configuration;
     private readonly int _timeoutMs;
     private readonly string? _proxyServer;
     private readonly SemaphoreSlim _gate = new(1, 1);
@@ -36,9 +40,7 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         _enabled = configuration.GetValue("Binolla:CredentialLogin:Enabled", true);
         _headless = configuration.GetValue("Binolla:CredentialLogin:Headless", true);
         _nodeExecutable = configuration["Binolla:CredentialLogin:NodeExecutable"] ?? "node";
-        _loginUrl = configuration["Binolla:CredentialLogin:LoginUrl"] ?? "https://binolla.com/login/";
-        _signupUrl = configuration["Binolla:CredentialLogin:SignupUrl"]
-                     ?? "https://binolla.com/signup/?lid=15968";
+        _configuration = configuration;
         _timeoutMs = Math.Clamp(
             configuration.GetValue("Binolla:CredentialLogin:TimeoutSeconds", 60) * 1000,
             15_000,
@@ -52,13 +54,22 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
             : ResolveDefaultToolDirectory(hostEnvironment.ContentRootPath);
     }
 
-    public Task<BinollaCapturedSession> LoginAsync(string email, string password, CancellationToken cancellationToken = default)
-        => CaptureAsync("login", email, password, cancellationToken);
+    public Task<BinollaCapturedSession> LoginAsync(
+        string broker,
+        string email,
+        string password,
+        CancellationToken cancellationToken = default)
+        => CaptureAsync(Brokers.Normalize(broker), "login", email, password, cancellationToken);
 
-    public Task<BinollaCapturedSession> SignUpAsync(string email, string password, CancellationToken cancellationToken = default)
-        => CaptureAsync("signup", email, password, cancellationToken);
+    public Task<BinollaCapturedSession> SignUpAsync(
+        string broker,
+        string email,
+        string password,
+        CancellationToken cancellationToken = default)
+        => CaptureAsync(Brokers.Normalize(broker), "signup", email, password, cancellationToken);
 
     private async Task<BinollaCapturedSession> CaptureAsync(
+        string broker,
         string mode,
         string email,
         string password,
@@ -86,13 +97,9 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         await _gate.WaitAsync(cancellationToken);
         try
         {
-            var captured = await RunNodeCaptureAsync(mode, email.Trim(), password, cancellationToken);
+            var captured = await RunNodeCaptureAsync(broker, mode, email.Trim(), password, cancellationToken);
             var token = NormalizeSessionToken(captured.Token!);
-            // Escape for embedding inside a JSON string literal in the SSID frame.
-            var safe = token.Replace("\\", "\\\\", StringComparison.Ordinal)
-                .Replace("\"", "\\\"", StringComparison.Ordinal);
-            var frame = $$"""42["authorization",{"isDemo":true,"token":"{{safe}}"}]""";
-            return new BinollaCapturedSession(frame, captured.Cookies);
+            return new BinollaCapturedSession(BuildSessionPayload(broker, token), captured.Cookies);
         }
         finally
         {
@@ -100,7 +107,28 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         }
     }
 
+    /// <summary>
+    /// Turns the captured token into the exact thing the venue's client sends.
+    ///
+    /// <para>Binolla's client transmits the frame verbatim, so it is built here. The
+    /// Quotex library builds its own <c>authorization</c> frame around the session value
+    /// and decides <c>isDemo</c> from the account the caller asked for — handing it a
+    /// pre-built frame would either be double-wrapped or would silently override the
+    /// balance choice, which is how a real-money trade gets placed on a demo request.</para>
+    /// </summary>
+    private static string BuildSessionPayload(string broker, string token)
+    {
+        if (broker == Brokers.Quotex)
+            return token;
+
+        // Escape for embedding inside a JSON string literal in the SSID frame.
+        var safe = token.Replace("\\", "\\\\", StringComparison.Ordinal)
+            .Replace("\"", "\\\"", StringComparison.Ordinal);
+        return $$"""42["authorization",{"isDemo":true,"token":"{{safe}}"}]""";
+    }
+
     private async Task<CaptureResult> RunNodeCaptureAsync(
+        string broker,
         string mode,
         string email,
         string password,
@@ -125,14 +153,18 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
             psi.Environment["BINOLLA_AUTH_PROXY"] = _proxyServer;
 
         psi.ArgumentList.Add("capture.mjs");
+        psi.ArgumentList.Add("--broker");
+        psi.ArgumentList.Add(broker);
         psi.ArgumentList.Add("--mode");
         psi.ArgumentList.Add(mode);
         psi.ArgumentList.Add("--headless");
         psi.ArgumentList.Add(_headless ? "true" : "false");
-        psi.ArgumentList.Add("--loginUrl");
-        psi.ArgumentList.Add(_loginUrl);
-        psi.ArgumentList.Add("--signupUrl");
-        psi.ArgumentList.Add(_signupUrl);
+        // Only override the script's own URLs when this deployment has been told to. The
+        // defaults live in one table beside the login logic, so a new venue does not need
+        // a matching set of appsettings keys before it can be used at all.
+        AddUrlOverride(psi, "--loginUrl", broker, "LoginUrl");
+        AddUrlOverride(psi, "--signupUrl", broker, "SignupUrl");
+        AddUrlOverride(psi, "--tradingUrl", broker, "TradingUrl");
         psi.ArgumentList.Add("--timeoutMs");
         psi.ArgumentList.Add(_timeoutMs.ToString());
         if (!string.IsNullOrWhiteSpace(_proxyServer))
@@ -141,7 +173,8 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
             psi.ArgumentList.Add(_proxyServer);
         }
 
-        _logger.LogInformation("Starting Binolla credential {Mode} capture from {ToolDir}", mode, _toolDirectory);
+        _logger.LogInformation(
+            "Starting {Broker} credential {Mode} capture from {ToolDir}", broker, mode, _toolDirectory);
 
         using var process = new Process { StartInfo = psi, EnableRaisingEvents = true };
         if (!process.Start())
@@ -214,12 +247,33 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
 
         // tokenSource is optional (older capture.mjs may omit it); token field remains required.
         _logger.LogInformation(
-            "Binolla credential {Mode} captured session token (cookiesPresent={HasCookies}, tokenSource={TokenSource}, tokenLen={TokenLen})",
+            "{Broker} credential {Mode} captured session token (cookiesPresent={HasCookies}, tokenSource={TokenSource}, tokenLen={TokenLen})",
+            broker,
             mode,
             !string.IsNullOrWhiteSpace(result.Cookies),
             string.IsNullOrWhiteSpace(result.TokenSource) ? "unspecified" : result.TokenSource,
             result.Token.Length);
         return result;
+    }
+
+    /// <summary>
+    /// Adds a URL override only if this deployment configured one for this broker.
+    ///
+    /// <para>Reads <c>Binolla:CredentialLogin:{broker}:{key}</c> first, then the legacy
+    /// unprefixed <c>Binolla:CredentialLogin:{key}</c> for Binolla, so existing servers
+    /// keep whatever they already set.</para>
+    /// </summary>
+    private void AddUrlOverride(ProcessStartInfo psi, string flag, string broker, string key)
+    {
+        var value = _configuration[$"Binolla:CredentialLogin:{broker}:{key}"];
+        if (string.IsNullOrWhiteSpace(value) && broker == Brokers.Binolla)
+            value = _configuration[$"Binolla:CredentialLogin:{key}"];
+
+        if (string.IsNullOrWhiteSpace(value))
+            return;
+
+        psi.ArgumentList.Add(flag);
+        psi.ArgumentList.Add(value.Trim());
     }
 
     private static void TryKill(Process process)
