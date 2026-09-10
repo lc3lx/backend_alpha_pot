@@ -825,6 +825,21 @@ public sealed class BinollaAppService
         if (broker != Brokers.Quotex)
             return null;
 
+        // Already connected: nothing to capture. GetOrCreateAsync below reuses a live
+        // session and ignores whatever credentials it is handed, so paying forty seconds
+        // of browser to produce a session that will be discarded is pure cost — and it is
+        // what made a second click report "a sign-in is already running" instead of simply
+        // showing the account that was connected the whole time.
+        var live = _brokers.Get(userId, broker);
+        if (live is not null &&
+            live.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
+        {
+            _logger.LogInformation(
+                "{Broker} session already live for user {UserId}; skipping browser capture",
+                broker, userId);
+            return null;
+        }
+
         // The same throttle as Binolla's capture, for the same reason: this launches a
         // headless browser, and a client retrying the login would otherwise stack them.
         if (!_restorer.CanAttemptCredentialLogin(userId))
