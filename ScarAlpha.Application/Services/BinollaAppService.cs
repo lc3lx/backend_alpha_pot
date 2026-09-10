@@ -565,10 +565,20 @@ public sealed class BinollaAppService
         var access = await _access.CheckAsync(_currentUser.UserId, ct);
         AccountAppService.EnsureConnectedForMarket(access);
 
-        IBinollaClient? client = null;
-        for (var i = 0; i < 15; i++)
+        // The user's own venue. Asking Binolla's manager unconditionally — as this did —
+        // never found a Quotex session, so every balance poll spun the full wait below
+        // and then reported a zero balance on a perfectly healthy account.
+        var link = await _links.GetByUserIdAsync(_currentUser.UserId, ct).ConfigureAwait(false);
+        var broker = Brokers.Normalize(link?.Broker);
+
+        IBrokerClient? client = null;
+        // Short, and deliberately so. The wait exists for the seconds right after a login
+        // while the socket finishes its handshake; this endpoint is also POLLED by every
+        // open page, and the old 15 x 200ms spin cost three seconds of a request thread
+        // on every one of those polls whenever a session was not up.
+        for (var i = 0; i < 4; i++)
         {
-            client = _sessions.Get(_currentUser.UserId.ToString());
+            client = _brokers.Get(_currentUser.UserId, broker);
             if (client is not null &&
                 client.IsTransportConnected &&
                 client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
@@ -577,8 +587,15 @@ public sealed class BinollaAppService
             }
 
             client = null;
-            try { await Task.Delay(200, ct); }
+            try { await Task.Delay(150, ct); }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+        }
+
+        if (client is null)
+        {
+            // Nothing live: get a restore moving so the NEXT poll can succeed, instead of
+            // making this one wait for it.
+            _restorer.EnsureBackgroundRestore(_currentUser.UserId);
         }
 
         if (client is null)
@@ -643,7 +660,7 @@ public sealed class BinollaAppService
         var accountType = ParseAccountType(request.AccountType);
         await EnsureAccountTypeAllowedAsync(_currentUser.UserId, accountType, ct);
 
-        var client = RequireConnectedClient();
+        var client = await RequireConnectedClientAsync(ct).ConfigureAwait(false);
         var engineType = accountType == DomainAccount.Real ? EngineAccount.Real : EngineAccount.Demo;
         await client.ChangeAccountAsync(engineType, ct);
 
@@ -662,9 +679,12 @@ public sealed class BinollaAppService
     {
         await EnsureNotMarketingDemoAsync(ct);
         var userId = _currentUser.UserId;
-        await _sessions.DisconnectAsync(userId.ToString(), ct);
 
         var link = await _links.GetByUserIdAsync(userId, ct);
+        // Closing Binolla's session for a Quotex user left the Quotex socket open and
+        // still trading while the UI showed the account as disconnected.
+        await _brokers.RemoveAsync(userId, Brokers.Normalize(link?.Broker), ct);
+
         if (link is not null)
         {
             link.Status = BinollaLinkStatus.Disconnected;
@@ -889,13 +909,24 @@ public sealed class BinollaAppService
         }
     }
 
-    private IBinollaClient RequireConnectedClient()
+    /// <summary>
+    /// The user's live client on whichever venue they trade, or a 409.
+    ///
+    /// <para>Broker-aware because switching a Quotex user's balance has to reach Quotex.
+    /// Looking the session up on Binolla's manager reported "not connected" to an account
+    /// whose session was perfectly healthy.</para>
+    /// </summary>
+    private async Task<IBrokerClient> RequireConnectedClientAsync(CancellationToken ct)
     {
-        var client = _sessions.Get(_currentUser.UserId.ToString());
+        var link = await _links.GetByUserIdAsync(_currentUser.UserId, ct).ConfigureAwait(false);
+        var broker = Brokers.Normalize(link?.Broker);
+
+        var client = _brokers.Get(_currentUser.UserId, broker);
         if (client is null ||
             client.Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected))
         {
-            throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Connect Binolla before continuing.", 409);
+            throw new ApiException(
+                ApiErrorCodes.BinollaNotConnected, $"Connect {broker} before continuing.", 409);
         }
 
         return client;
