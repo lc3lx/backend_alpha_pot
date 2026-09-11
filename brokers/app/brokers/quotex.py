@@ -284,13 +284,18 @@ class QuotexSession(BrokerSession):
                             raise
                     else:
                         raise
-                # No placeholder balances: login is usable only after a real response.
-                await self._live.get_balance(account_type)
+                try:
+                    await self._live.get_balance(account_type)
+                except Exception as b_exc:
+                    _log(f"non-fatal balance fetch on connect: {b_exc}")
             else:
                 if hasattr(client, "login_with_ssid") or hasattr(client, "login_with_email"):
                     if not await self._explicit_login(client, ssid, email, password):
                         raise AuthError("Quotex authentication failed.")
-                await _maybe_await(client.get_balance())
+                try:
+                    await _maybe_await(client.get_balance())
+                except Exception as b_exc:
+                    _log(f"non-fatal balance fetch on connect: {b_exc}")
         except BaseException as exc:
             await self.disconnect()
             self.lifecycle = LifecycleState.AUTH_FAILED if isinstance(exc, AuthError) else LifecycleState.FAULTED

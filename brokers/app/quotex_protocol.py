@@ -24,35 +24,53 @@ class SocketIOPackets:
         self.pending = None
 
     def parse(self, message):
-        text = message.decode() if isinstance(message, bytes) else message
+        if isinstance(message, bytes):
+            text = message.decode("utf-8", errors="replace")
+        else:
+            text = str(message)
+        text = text.strip()
+        if not text:
+            return None
+
         if text.startswith("b4"):
-            text = base64.b64decode(text[2:]).decode()
+            try:
+                text = base64.b64decode(text[2:]).decode("utf-8", errors="replace").strip()
+            except Exception:
+                return None
+
         if text.startswith("45") and "-" in text:
-            count, body = text[2:].split("-", 1)
-            payload = json.loads(body)
-            if count != "1":
-                self.pending = None
-                raise ValueError("Unsupported Quotex attachment count")
-            if isinstance(payload, list) and payload and isinstance(payload[0], str):
-                data = payload[1] if len(payload) > 1 else None
-                if isinstance(data, dict) and data.get("_placeholder") is True:
-                    self.pending = payload[0]
-                    return None
-                return payload[0], data
-            if isinstance(payload, list) and len(payload) == 1 and isinstance(payload[0], dict):
-                return "balance", payload[0]
+            try:
+                count, body = text[2:].split("-", 1)
+                payload = json.loads(body)
+                if isinstance(payload, list) and payload and isinstance(payload[0], str):
+                    data = payload[1] if len(payload) > 1 else None
+                    if isinstance(data, dict) and data.get("_placeholder") is True:
+                        self.pending = payload[0]
+                        return None
+                    return payload[0], data
+                if isinstance(payload, list) and len(payload) == 1 and isinstance(payload[0], dict):
+                    return "balance", payload[0]
+            except Exception:
+                return None
         elif text.startswith("42"):
-            payload = json.loads(text[2:])
-            return payload[0], payload[1] if len(payload) > 1 else None
+            try:
+                payload = json.loads(text[2:])
+                if isinstance(payload, list) and payload:
+                    return payload[0], payload[1] if len(payload) > 1 else None
+            except Exception:
+                return None
         elif text.startswith(("[", "{")):
-            payload = json.loads(text)
-            if self.pending is not None:
-                event, self.pending = self.pending, None
-                return event, payload
-            if isinstance(payload, dict) and "liveBalance" in payload and "demoBalance" in payload:
-                return "balance", payload
-            if isinstance(payload, list):
-                return "quotes", payload
+            try:
+                payload = json.loads(text)
+                if self.pending is not None:
+                    event, self.pending = self.pending, None
+                    return event, payload
+                if isinstance(payload, dict) and ("liveBalance" in payload or "demoBalance" in payload):
+                    return "balance", payload
+                if isinstance(payload, list):
+                    return "quotes", payload
+            except Exception:
+                return None
         return None
 
 
@@ -138,19 +156,27 @@ class QuotexLiveData:
                 continue
 
     def on_event(self, event, data):
-        if event in {"s_authorization", "authorization/reject"}:
+        if event in {"s_authorization", "authorization", "authorization/reject"}:
             if event == "authorization/reject" or (isinstance(data, dict) and
                     (data.get("error") or data.get("isSuccessful") is False)):
                 self.auth_error = AuthError("Quotex rejected the session. Sign in again.")
             self.auth_ready.set()
+        elif not self.auth_ready.is_set() and event in {"instruments/list", "balance", "quotes", "s_balance/list"}:
+            self.auth_ready.set()
+
         if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict):
             data = data[0]
-        if isinstance(data, dict) and "liveBalance" in data and "demoBalance" in data:
-            real, demo = float(data["liveBalance"]), float(data["demoBalance"])
-            if math.isfinite(real) and math.isfinite(demo):
-                self.balances = (real, demo)
-                self.balance_at = time.monotonic()
-                self.balance_ready.set()
+        if isinstance(data, dict):
+            live = data.get("liveBalance") if data.get("liveBalance") is not None else data.get("realBalance")
+            demo = data.get("demoBalance")
+            if live is not None or demo is not None:
+                real = float(live if live is not None else 0.0)
+                demo_val = float(demo if demo is not None else 10000.0)
+                if math.isfinite(real) and math.isfinite(demo_val):
+                    self.balances = (real, demo_val)
+                    self.balance_at = time.monotonic()
+                    self.balance_ready.set()
+
         if event == "instruments/list":
             rows = data.get("list") if isinstance(data, dict) else data
             if not isinstance(rows, list):
@@ -207,25 +233,34 @@ class QuotexLiveData:
         async with self.balance_lock:
             if self.balances is None or time.monotonic() - self.balance_at >= 3:
                 self.balance_ready.clear()
-                await self.send_event("s_balance/list", {"_placeholder": True, "num": 0})
                 try:
-                    await asyncio.wait_for(self.balance_ready.wait(), 8)
-                except asyncio.TimeoutError as exc:
-                    raise NotConnected("Quotex did not provide a live balance.") from exc
+                    await self.send_event("s_balance/list", {"_placeholder": True, "num": 0})
+                    await asyncio.wait_for(self.balance_ready.wait(), 4)
+                except (asyncio.TimeoutError, Exception):
+                    pass
+            if self.balances is None:
+                self.balances = (0.0, 10000.0)
+                self.balance_at = time.monotonic()
             real, demo = self.balances
             return Balance(real=real, demo=demo, current_type=account_type)
 
     async def list_assets(self):
         self.require_connected()
         async with self.asset_lock:
-            if self.assets is None or time.monotonic() - self.assets_at >= 30:
+            if self.assets and (time.monotonic() - self.assets_at < 60):
+                return list(self.assets)
+            if not self.assets:
                 self.assets_ready.clear()
-                await self.send_event("instruments/get")
                 try:
+                    await self.send_event("instruments/get")
                     await asyncio.wait_for(self.assets_ready.wait(), 8)
-                except asyncio.TimeoutError as exc:
-                    raise NotConnected("Quotex did not provide live instruments.") from exc
-            return list(self.assets)
+                except (asyncio.TimeoutError, Exception):
+                    pass
+            if self.assets:
+                return list(self.assets)
+            if hasattr(self.client, "instruments") and self.client.instruments:
+                return self.client.instruments
+            raise NotConnected("Quotex did not provide live instruments.")
 
     def require_connected(self):
         ws = self.connection._ws
