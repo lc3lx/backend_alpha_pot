@@ -58,9 +58,9 @@ def default_root() -> Path:
 
 
 def keep_count(period_seconds: int) -> int:
-    """How many bars the window holds for this timeframe."""
+    """How many bars the window holds for this timeframe (3 hours)."""
     by_time = (RETENTION_HOURS * 3600) // max(period_seconds, 1)
-    return max(int(by_time), MIN_BARS)
+    return max(int(by_time), 180)
 
 
 def trim(series: Series, period_seconds: int) -> Series:
@@ -68,13 +68,22 @@ def trim(series: Series, period_seconds: int) -> Series:
     Drop the oldest bars that no longer fit the window.
 
     Called on every write, so adding N bars removes N from the far end and the series
-    holds its size.
+    holds its size (FIFO rolling window).
     """
     limit = keep_count(period_seconds)
-    if len(series) <= limit:
-        return series
-    for old in sorted(series)[: len(series) - limit]:
-        series.pop(old, None)
+    cutoff = int(time.time()) - (RETENTION_HOURS * 3600)
+
+    if len(series) > limit:
+        for old in sorted(series)[: len(series) - limit]:
+            series.pop(old, None)
+
+    if len(series) > 180:
+        for old in sorted(series):
+            if old < cutoff and len(series) > 180:
+                series.pop(old, None)
+            elif old >= cutoff:
+                break
+
     return series
 
 
