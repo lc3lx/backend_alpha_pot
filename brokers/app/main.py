@@ -167,7 +167,7 @@ async def health() -> dict[str, object]:
 
 #: How long a second caller waits for an in-flight connect before giving up on joining
 #: it. Comfortably longer than a healthy handshake, short enough not to hold a request.
-_JOIN_WAIT_SECONDS = 25.0
+_JOIN_WAIT_SECONDS = 45.0
 
 
 async def _await_session(user_id: str, broker: str, account_type: AccountType) -> BrokerSession | None:

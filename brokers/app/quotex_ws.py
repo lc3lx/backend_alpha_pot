@@ -30,7 +30,7 @@ _MAX_CONSECUTIVE_FAILURES = 3
 
 #: How long to stay on polling after giving up. Long enough not to matter, short enough
 #: that a venue which starts allowing upgrades is picked up the same day.
-_BACKOFF_SECONDS = 1800
+_BACKOFF_SECONDS = 30
 
 #: Longest a single upgrade attempt may take. A broker either accepts the handshake
 #: quickly or is not going to; anything beyond this is a misconfiguration hanging, and
@@ -524,22 +524,22 @@ def _open_with_curl(ws_url: str, headers: dict[str, str]) -> Any:
         except Exception:
             pass
 
-    sid = _warm_session(session, ws_url)
-
-    connect = getattr(session, "ws_connect", None)
-    if connect is None:
-        # curl_cffi predates WebSocket support. Not an error — the fallback handles it.
-        _log("curl_cffi has no ws_connect; trying websocket-client")
-        try:
-            session.close()
-        except Exception:
-            pass
-        return None
-
     # Strip custom User-Agent so curl_cffi uses its matched TLS browser profile
     ws_headers = {k: v for k, v in headers.items() if k.lower() != "user-agent"}
 
-    # Forward cookies from warm session if available
+    # Try direct ws_connect first — Quotex accepts direct WebSocket connections with Chrome impersonation
+    try:
+        try:
+            socket = connect(ws_url, headers=ws_headers, timeout=_CONNECT_TIMEOUT)
+        except TypeError:
+            socket = connect(ws_url, headers=ws_headers)
+        _log("upgraded on the impersonating session")
+        return _CurlSocket(session, socket)
+    except Exception as exc_direct:
+        _log(f"direct upgrade failed ({_short(exc_direct)}); trying with warmed session")
+
+    # Fallback to warmed session if direct upgrade did not succeed
+    sid = _warm_session(session, ws_url)
     if hasattr(session, "cookies") and session.cookies:
         try:
             cookie_items = [f"{c.name}={c.value}" for c in session.cookies]
@@ -559,21 +559,14 @@ def _open_with_curl(ws_url: str, headers: dict[str, str]) -> Any:
         except TypeError:
             socket = connect(target_url, headers=ws_headers)
     except Exception as exc:
-        _log(f"impersonated upgrade with sid refused ({_short(exc)}); trying direct ws_url")
+        _log(f"impersonated upgrade with sid refused ({_short(exc)})")
         try:
-            try:
-                socket = connect(ws_url, headers=ws_headers, timeout=_CONNECT_TIMEOUT)
-            except TypeError:
-                socket = connect(ws_url, headers=ws_headers)
-        except Exception as exc2:
-            _log(f"impersonated upgrade refused ({_short(exc2)})")
-            try:
-                session.close()
-            except Exception:
-                pass
-            return None
+            session.close()
+        except Exception:
+            pass
+        return None
 
-    _log("upgraded on the impersonating session")
+    _log("upgraded on the impersonating session (warmed)")
     return _CurlSocket(session, socket)
 
 
