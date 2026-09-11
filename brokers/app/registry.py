@@ -45,6 +45,8 @@ class _Throttle:
     #: Connects allowed at once. More than one so users do not queue behind each other;
     #: bounded so a restart cannot open a hundred handshakes at the broker together.
     max_concurrent: int = 3
+    #: Cooldown lockout on failed attempts (disabled by default so user is not blocked).
+    enable_user_cooldown: bool = False
 
     _user_retry_after: dict[str, float] = field(default_factory=dict)
     _user_failures: dict[str, int] = field(default_factory=dict)
@@ -57,7 +59,7 @@ class _Throttle:
 
     def can_attempt(self, user_id: str) -> bool:
         now = time.monotonic()
-        if now < self._user_retry_after.get(user_id, 0.0):
+        if self.enable_user_cooldown and now < self._user_retry_after.get(user_id, 0.0):
             return False
         # The broker refused the SERVER. Nobody's attempt can succeed, so nobody attempts.
         if now < self._global_retry_after:
@@ -85,8 +87,11 @@ class _Throttle:
 
         failures = self._user_failures.get(user_id, 0) + 1
         self._user_failures[user_id] = failures
-        delay = min(self.base_seconds * (2 ** min(failures - 1, 6)), self.max_seconds)
-        self._user_retry_after[user_id] = time.monotonic() + delay
+        if self.enable_user_cooldown:
+            delay = min(self.base_seconds * (2 ** min(failures - 1, 6)), self.max_seconds)
+            self._user_retry_after[user_id] = time.monotonic() + delay
+        else:
+            self._user_retry_after.pop(user_id, None)
 
         if not blocked_by_broker:
             return
@@ -117,7 +122,7 @@ class _Throttle:
         """Why an attempt was refused, in words a user can act on."""
         now = time.monotonic()
         wait = self._user_retry_after.get(user_id, 0.0) - now
-        if wait > 0:
+        if self.enable_user_cooldown and wait > 0:
             return (
                 f"This account's last sign-in was refused. Try again in {int(wait) + 1}s."
             )

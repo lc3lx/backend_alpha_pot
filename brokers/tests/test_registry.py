@@ -83,7 +83,7 @@ def test_success_clears_backoff_and_spacing():
 
 
 def test_backoff_grows_with_consecutive_failures():
-    t = _Throttle(base_seconds=1.0, min_interval_seconds=0.0)
+    t = _Throttle(base_seconds=1.0, min_interval_seconds=0.0, enable_user_cooldown=True)
     delays = []
     for _ in range(3):
         t._holder = None

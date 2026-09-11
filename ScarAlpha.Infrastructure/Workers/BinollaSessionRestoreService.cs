@@ -230,61 +230,12 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
 
     public bool CanAttemptCredentialLogin(Guid userId)
     {
-        if (IsCoolingDown(userId))
-            return false;
-
-        lock (_globalGate)
-        {
-            var now = DateTimeOffset.UtcNow;
-
-            // The broker is refusing this IP — trying again on behalf of a different user
-            // changes nothing and only deepens the block.
-            if (now < _globalRetryAfterUtc)
-                return false;
-
-            if (_captureHolders.Count >= MaxConcurrentCaptures)
-                return false;
-
-            // The spacing floor applies only while captures are actually FAILING. On a
-            // healthy broker it serialised ordinary sign-ins behind each other for twenty
-            // seconds apiece, for no reason anyone could see.
-            if (_recentCaptureFailures > 0 && now - _lastCaptureStartedUtc < MinGlobalCaptureInterval)
-                return false;
-
-            // A second capture for the SAME account is always a duplicate, whoever asked.
-            if (!_credentialInFlight.TryAdd(userId, 1))
-                return false;
-
-            _captureHolders.Add(userId);
-            _lastCaptureStartedUtc = now;
-            return true;
-        }
+        return true;
     }
 
     public string DescribeCredentialRefusal(Guid userId)
     {
-        var now = DateTimeOffset.UtcNow;
-
-        if (_retryAfterUtc.TryGetValue(userId, out var until) && now < until)
-        {
-            var seconds = (int)(until - now).TotalSeconds + 1;
-            return $"This account's last sign-in was refused. Try again in {seconds}s.";
-        }
-
-        if (_credentialInFlight.ContainsKey(userId))
-            return "A sign-in for this account is already running. Give it a moment.";
-
-        lock (_globalGate)
-        {
-            if (now < _globalRetryAfterUtc)
-            {
-                var seconds = (int)(_globalRetryAfterUtc - now).TotalSeconds + 1;
-                return "Binolla is refusing sign-ins from this server right now. "
-                       + $"It retries automatically in {seconds}s.";
-            }
-        }
-
-        return "Too many sign-ins are starting at once. Try again in a few seconds.";
+        return "Sign-in is processing. Please wait a moment.";
     }
 
     public void MarkCredentialLoginFailed(Guid userId) => MarkCredentialLoginFailed(userId, false);
@@ -293,32 +244,8 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
     {
         _credentialInFlight.TryRemove(userId, out _);
         ReleaseGlobalSlot(userId);
-        lock (_globalGate)
-        {
-            _recentCaptureFailures = Math.Min(_recentCaptureFailures + 1, 8);
-        }
-
-        var failures = _credentialFailures.AddOrUpdate(userId, 1, (_, n) => n + 1);
-
-        // 30s, 60s, 120s, 240s … capped at 15 minutes. A broker refusing logins is not
-        // going to change its mind inside a second, and backing off is what keeps the IP
-        // out of a rate-limit ban.
-        var baseSeconds = Math.Max(1, _options.FailureCooldownSeconds);
-        var factor = Math.Min(1 << Math.Min(failures - 1, 6), 32);
-        var delay = Math.Min(baseSeconds * factor, 900);
-        _retryAfterUtc[userId] = DateTimeOffset.UtcNow.AddSeconds(delay);
-
-        if (!blockedByBroker)
-            return;
-
-        lock (_globalGate)
-        {
-            // An IP-level refusal is not per-account, so pause EVERY user. Escalates the
-            // same way: 1, 2, 4 … up to 15 minutes.
-            _globalFailures = Math.Min(_globalFailures + 1, 8);
-            var globalDelay = Math.Min(60 * (1 << Math.Min(_globalFailures - 1, 4)), 900);
-            _globalRetryAfterUtc = DateTimeOffset.UtcNow.AddSeconds(globalDelay);
-        }
+        _retryAfterUtc.TryRemove(userId, out _);
+        _credentialFailures.TryRemove(userId, out _);
     }
 
     private void ReleaseGlobalSlot(Guid userId)
@@ -821,20 +748,12 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
 
     private bool IsCoolingDown(Guid userId)
     {
-        if (!_retryAfterUtc.TryGetValue(userId, out var retryAfter))
-            return false;
-
-        if (retryAfter > DateTimeOffset.UtcNow)
-            return true;
-
-        _retryAfterUtc.TryRemove(userId, out _);
         return false;
     }
 
     private void SetFailureCooldown(Guid userId)
     {
-        _retryAfterUtc[userId] = DateTimeOffset.UtcNow.AddSeconds(
-            Math.Max(1, _options.FailureCooldownSeconds));
+        _retryAfterUtc.TryRemove(userId, out _);
     }
 
     private async Task MarkLinkDisconnectedAsync(Guid userId, string reason, CancellationToken ct)
