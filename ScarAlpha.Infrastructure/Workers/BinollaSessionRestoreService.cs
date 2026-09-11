@@ -396,17 +396,19 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
         }
         catch (Exception ex)
         {
-            // Back off before anyone tries again. Without this there was NO cooldown on
-            // this path at all: every status poll queued another restore, each failed in
-            // milliseconds, and the retries piled up fast enough to exhaust the gateway's
-            // own connect limit — so the person actually signing in was refused too.
-            MarkGatewayRestoreFailed(userId);
-
-            // Left Connected deliberately: the link is still valid and the next sweep or the
-            // next page load retries. Marking it Disconnected on a transient gateway failure
-            // would push a working account back to the login screen.
             _logger.LogWarning(
-                ex, "Session restore: {Broker} reconnect failed for user {UserId}", broker, userId);
+                ex, "Session restore: {Broker} reconnect failed for user {UserId}; trying stored credentials", broker, userId);
+
+            var relogged = await TryCredentialReloginAsync(userId, CancellationToken.None).ConfigureAwait(false);
+            if (relogged)
+            {
+                _authFailed.TryRemove(userId, out _);
+                _retryAfterUtc.TryRemove(userId, out _);
+                _credentialFailures.TryRemove(userId, out _);
+                return true;
+            }
+
+            MarkGatewayRestoreFailed(userId);
             return false;
         }
     }

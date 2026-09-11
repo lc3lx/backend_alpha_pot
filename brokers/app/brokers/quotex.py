@@ -138,53 +138,55 @@ def _enum_member(enum_cls: Any, *names: str) -> Any:
 
 
 async def _auto_extract_ssid(email: str, password: str) -> str | None:
-    """Performs automated HTTP login to Quotex via curl_cffi and extracts the SSID session token."""
-    import re
-    from curl_cffi import requests
+    """Performs automated login to Quotex via capture.mjs and extracts the SSID session token."""
+    import json
+    import os
+    import subprocess
+    from pathlib import Path
     from app.proxy import proxy_url
 
+    script_path = Path(__file__).resolve().parents[3] / "tools" / "binolla-auth" / "capture.mjs"
+    if not script_path.exists():
+        script_path = Path("/home/web/backend/tools/binolla-auth/capture.mjs")
+    if not script_path.exists():
+        return None
+
     proxy = proxy_url()
-    extra: dict[str, Any] = {"impersonate": "chrome120"}
-    if proxy:
-        extra["proxy"] = proxy
+    env = {
+        **os.environ,
+        "BINOLLA_AUTH_EMAIL": email,
+        "BINOLLA_AUTH_PASSWORD": password,
+    }
+    auth_proxy = os.getenv("BINOLLA_AUTH_PROXY") or proxy
+    if auth_proxy:
+        env["BINOLLA_AUTH_PROXY"] = auth_proxy
 
-    def _sync_flow() -> str | None:
-        s = requests.Session(impersonate="chrome120")
-        headers = {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Origin": "https://qxbroker.com",
-            "Referer": "https://qxbroker.com/en/sign-in",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        }
+    cmd = [
+        "node",
+        str(script_path),
+        "--broker", "quotex",
+        "--mode", "login",
+        "--headless", "true",
+        "--timeoutMs", "45000",
+    ]
+
+    def _run() -> str | None:
         try:
-            r = s.get("https://qxbroker.com/en/sign-in", headers=headers, timeout=20, verify=False, **extra)
-            if r.status_code != 200:
-                return None
-            token_match = re.search(r'name=["\']_token["\']\s+value=["\']([^"\']+)["\']', r.text)
-            if not token_match:
-                token_match = re.search(r'value=["\']([^"\']+)["\']\s+name=["\']_token["\']', r.text)
-            if not token_match:
-                return None
-            csrf_token = token_match.group(1)
-
-            data = {
-                "_token": csrf_token,
-                "email": email,
-                "password": password,
-                "remember": "1",
-            }
-            s.post("https://qxbroker.com/en/sign-in/", data=data, headers=headers, timeout=25, verify=False, **extra)
-
-            for target_url in ["https://qxbroker.com/en/trade", "https://qxbroker.com/trade"]:
-                trade_resp = s.get(target_url, headers=headers, timeout=20, verify=False, **extra)
-                settings_match = re.search(r'window\.settings\s*=\s*({.*?});', trade_resp.text, re.DOTALL)
-                if settings_match:
+            res = subprocess.run(
+                cmd,
+                cwd=str(script_path.parent),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=50,
+            )
+            for line in res.stdout.strip().split("\n"):
+                if "{" in line and "}" in line:
                     try:
-                        parsed = json.loads(settings_match.group(1))
-                        token = parsed.get("token")
-                        if token:
-                            return str(token)
+                        data = json.loads(line)
+                        if data.get("ok") and data.get("token"):
+                            return str(data["token"])
                     except Exception:
                         pass
         except Exception:
@@ -192,9 +194,10 @@ async def _auto_extract_ssid(email: str, password: str) -> str | None:
         return None
 
     try:
-        return await asyncio.to_thread(_sync_flow)
+        return await asyncio.to_thread(_run)
     except Exception:
         return None
+
 
 
 class QuotexSession(BrokerSession):
@@ -269,7 +272,18 @@ class QuotexSession(BrokerSession):
             if connected is False:
                 raise NotConnected("Quotex connection failed.")
             if self._live is not None:
-                await self._live.authenticate(ssid, account_type)
+                try:
+                    await self._live.authenticate(ssid, account_type)
+                except AuthError:
+                    if email and password:
+                        new_ssid = await _auto_extract_ssid(email, password)
+                        if new_ssid:
+                            self.ssid = ssid = new_ssid
+                            await self._live.authenticate(ssid, account_type)
+                        else:
+                            raise
+                    else:
+                        raise
                 # No placeholder balances: login is usable only after a real response.
                 await self._live.get_balance(account_type)
             else:
