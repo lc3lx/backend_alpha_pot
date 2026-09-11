@@ -90,11 +90,11 @@ public sealed class TradeAppService
         AccountAppService.EnsureAllowed(access);
 
         var link = await _links.GetByUserIdAsync(userId, ct);
+        var broker = Brokers.Normalize(link?.Broker);
         if (link is null || link.Status != BinollaLinkStatus.Connected)
-            throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Connect Binolla before trading.", 409);
+            throw new ApiException(ApiErrorCodes.BinollaNotConnected, $"Connect {broker} before trading.", 409);
 
         // Trade on whichever venue this user is linked to — the link is the record of it.
-        var broker = Brokers.Normalize(link.Broker);
         var client = _brokers.Get(userId, broker);
         if (client is null ||
             client.Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected))
@@ -105,7 +105,7 @@ public sealed class TradeAppService
                 409);
         }
 
-        // Authoritative balance check from live Binolla session (not a local wallet).
+        // Authoritative balance check from live broker session (not a local wallet).
         BalanceInfo balance;
         try
         {
@@ -116,12 +116,12 @@ public sealed class TradeAppService
         catch (ApiException) { throw; }
         catch (BinollaAuthenticationException)
         {
-            throw new ApiException(ApiErrorCodes.BinollaSessionExpired, "Binolla session expired.", 401);
+            throw new ApiException(ApiErrorCodes.BinollaSessionExpired, $"{broker} session expired.", 401);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Balance check failed for user {UserId}", userId);
-            throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Unable to verify Binolla balance.", 409);
+            throw new ApiException(ApiErrorCodes.BinollaNotConnected, $"Unable to verify {broker} balance.", 409);
         }
 
         try

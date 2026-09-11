@@ -212,8 +212,16 @@ class QuotexLiveData:
                         continue
                     tick = {"time": ts, "price": price}
                     self.market.apply_quote(symbol, tick)
+                    if symbol.endswith("_otc"):
+                        self.market.apply_quote(symbol[:-4], tick)
+                    else:
+                        self.market.apply_quote(f"{symbol}_otc", tick)
                     for asset, period in self.periods:
-                        if asset == symbol:
+                        if (
+                            asset == symbol
+                            or (symbol.endswith("_otc") and asset == symbol[:-4])
+                            or (not symbol.endswith("_otc") and f"{symbol}_otc" == asset)
+                        ):
                             self.market.apply_candle(asset, period, tick)
                 except (ValueError, TypeError):
                     continue
@@ -275,7 +283,14 @@ class QuotexLiveData:
         key = (asset, period)
         self.periods.add(key)
         try:
-            await self.send_event("instruments/update", {"asset": asset, "period": period})
+            formatted = asset if asset.endswith("_otc") else f"{asset}_otc"
+            await self.send_event("depth/follow", formatted)
+            if formatted != asset:
+                try:
+                    await self.send_event("depth/follow", asset)
+                except Exception:
+                    pass
+            await self.send_event("instruments/update", {"asset": formatted, "period": period})
         except BaseException:
             self.periods.discard(key)
             raise

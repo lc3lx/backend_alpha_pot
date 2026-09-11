@@ -113,19 +113,20 @@ public sealed class AccountAppService
     /// </summary>
     internal static void EnsureAllowed(BotAccessResult access)
     {
+        var broker = string.IsNullOrWhiteSpace(access.Broker) ? "broker" : access.Broker;
         switch (access.Access)
         {
             case BotAccessState.Allowed:
                 return;
             case BotAccessState.SessionExpired:
-                throw new ApiException(ApiErrorCodes.BinollaSessionExpired, "Binolla session expired.", 401);
+                throw new ApiException(ApiErrorCodes.BinollaSessionExpired, $"{broker} session expired.", 401);
             case BotAccessState.NotEligible:
                 throw new ApiException(ApiErrorCodes.NotEligible, "Account was rejected by an administrator.", 403);
             case BotAccessState.AdminApprovalRequired:
                 throw new ApiException(ApiErrorCodes.AdminApprovalRequired,
                     "Administrator has not approved your account yet. Trading is locked until approval.", 403);
             default:
-                throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Connect your Binolla account first.", 409);
+                throw new ApiException(ApiErrorCodes.BinollaNotConnected, $"Connect your {broker} account first.", 409);
         }
     }
 
@@ -135,17 +136,18 @@ public sealed class AccountAppService
     /// </summary>
     internal static void EnsureConnectedForMarket(BotAccessResult access)
     {
+        var broker = string.IsNullOrWhiteSpace(access.Broker) ? "broker" : access.Broker;
         switch (access.Access)
         {
             case BotAccessState.Allowed:
             case BotAccessState.AdminApprovalRequired:
                 return;
             case BotAccessState.SessionExpired:
-                throw new ApiException(ApiErrorCodes.BinollaSessionExpired, "Binolla session expired.", 401);
+                throw new ApiException(ApiErrorCodes.BinollaSessionExpired, $"{broker} session expired.", 401);
             case BotAccessState.NotEligible:
                 throw new ApiException(ApiErrorCodes.NotEligible, "Account was rejected by an administrator.", 403);
             default:
-                throw new ApiException(ApiErrorCodes.BinollaNotConnected, "Connect your Binolla account first.", 409);
+                throw new ApiException(ApiErrorCodes.BinollaNotConnected, $"Connect your {broker} account first.", 409);
         }
     }
 }

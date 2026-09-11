@@ -193,7 +193,21 @@ async def _await_session(user_id: str, broker: str, account_type: AccountType) -
 
 
 @app.post("/sessions/connect", response_model=SessionStatus, dependencies=[Guarded])
-async def connect(body: ConnectRequest) -> SessionStatus:
+async def connect(
+    body: ConnectRequest | None = None,
+    user_id: str | None = None,
+    broker: str | None = None,
+    account_type: AccountType | None = None,
+) -> SessionStatus:
+    if body is None:
+        if not user_id or not broker:
+            raise HTTPException(status_code=422, detail="Missing user_id or broker in connect request")
+        body = ConnectRequest(
+            user_id=user_id,
+            broker=broker,
+            account_type=account_type or AccountType.REAL,
+        )
+
     broker = body.broker.strip().lower()
     cls = _adapter(broker)
     throttle = registry.throttle(broker)
@@ -204,22 +218,16 @@ async def connect(body: ConnectRequest) -> SessionStatus:
     # clicking "log in" was turned away.
     existing = registry.get(body.user_id, broker)
     # Reuse a live session — unless the caller brought a session the existing one was not
-    # built from.
-    #
-    # Reuse alone was wrong, and it is what made the whole browser-capture work invisible.
-    # A Quotex session opened from a password reports transport_connected quite happily and
-    # then answers every poll with {"code":1,"message":"Session ID unknown"}, because
-    # Cloudflare refused the socket upgrade for a connection that never signed in. The API
-    # would go and capture a real SSID, send it here, and this branch handed straight back
-    # the poisoned session it was meant to replace. Nothing downstream could recover: the
-    # session looked healthy from every angle except the data, which stayed empty.
-    if (
-        existing is not None
-        and existing.transport_connected
-        and existing.account_type == body.account_type
-        and not (body.ssid and body.ssid != getattr(existing, "ssid", None))
-    ):
-        return _status(existing)
+    # built from. If the caller asks for a different account type (Real <-> Demo),
+    # switch it directly on the existing session in-memory without disconnecting.
+    if existing is not None and existing.transport_connected:
+        if existing.account_type != body.account_type:
+            try:
+                await existing.change_account(body.account_type)
+            except Exception as change_err:
+                print(f"change_account on existing session: {change_err}")
+        if not (body.ssid and body.ssid != getattr(existing, "ssid", None)):
+            return _status(existing)
 
     # A connect for this same account is already under way — from another device, or
     # from a background restore. WAIT for it rather than refusing: one account has one
@@ -331,6 +339,18 @@ async def subscribe_sync(
 async def balance(user_id: str, broker: str) -> Balance:
     try:
         return await _session(user_id, broker).get_balance()
+    except Exception as exc:
+        raise _fail(exc)
+
+
+@app.post("/account/account-type", response_model=SessionStatus, dependencies=[Guarded])
+async def change_account_type(
+    user_id: str, broker: str, account_type: AccountType
+) -> SessionStatus:
+    try:
+        sess = _session(user_id, broker)
+        await sess.change_account(account_type)
+        return _status(sess)
     except Exception as exc:
         raise _fail(exc)
 

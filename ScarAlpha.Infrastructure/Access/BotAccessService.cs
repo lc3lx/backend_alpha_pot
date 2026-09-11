@@ -149,7 +149,8 @@ public sealed class BotAccessService : IBotAccessService
                 BinollaConnected: false,
                 AdminApproved: adminApproved,
                 AccountType: accountType,
-                ApprovalStatus: approvalStatus);
+                ApprovalStatus: approvalStatus,
+                Broker: broker);
         }
 
         if (link is null)
@@ -159,7 +160,8 @@ public sealed class BotAccessService : IBotAccessService
                 BinollaConnected: false,
                 AdminApproved: false,
                 AccountType: accountType,
-                ApprovalStatus: approvalStatus);
+                ApprovalStatus: approvalStatus,
+                Broker: broker);
         }
 
         if (link.Status == BinollaLinkStatus.Disconnected &&
@@ -172,7 +174,8 @@ public sealed class BotAccessService : IBotAccessService
                 BinollaConnected: false,
                 AdminApproved: adminApproved,
                 AccountType: accountType,
-                ApprovalStatus: approvalStatus);
+                ApprovalStatus: approvalStatus,
+                Broker: broker);
         }
 
         // Link still Connected in DB: keep the user inside the bot while WS restores.
@@ -186,7 +189,8 @@ public sealed class BotAccessService : IBotAccessService
                     BinollaConnected: connected,
                     AdminApproved: false,
                     AccountType: accountType,
-                    ApprovalStatus: approvalStatus);
+                    ApprovalStatus: approvalStatus,
+                    Broker: broker);
             }
 
             if (link.AdminApproved && link.ApprovalStatus == AdminApprovalStatus.Approved)
@@ -196,7 +200,8 @@ public sealed class BotAccessService : IBotAccessService
                     BinollaConnected: connected,
                     AdminApproved: true,
                     AccountType: accountType,
-                    ApprovalStatus: approvalStatus);
+                    ApprovalStatus: approvalStatus,
+                    Broker: broker);
             }
 
             return new BotAccessResult(
@@ -204,7 +209,8 @@ public sealed class BotAccessService : IBotAccessService
                 BinollaConnected: connected,
                 AdminApproved: false,
                 AccountType: accountType,
-                ApprovalStatus: approvalStatus);
+                ApprovalStatus: approvalStatus,
+                Broker: broker);
         }
 
         return new BotAccessResult(
@@ -212,7 +218,8 @@ public sealed class BotAccessService : IBotAccessService
             BinollaConnected: connected,
             AdminApproved: adminApproved,
             AccountType: accountType,
-            ApprovalStatus: approvalStatus);
+            ApprovalStatus: approvalStatus,
+            Broker: broker);
     }
 
     private readonly record struct CacheEntry(DateTimeOffset At, BotAccessResult Result);

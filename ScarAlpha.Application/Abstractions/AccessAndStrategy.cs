@@ -17,7 +17,8 @@ public sealed record BotAccessResult(
     bool BinollaConnected,
     bool AdminApproved,
     string AccountType,
-    string ApprovalStatus);
+    string ApprovalStatus,
+    string? Broker = null);
 
 public interface IBotAccessService
 {

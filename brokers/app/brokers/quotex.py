@@ -423,10 +423,22 @@ class QuotexSession(BrokerSession):
         client = self._require()
         if account_type is self.account_type:
             return
+        self.account_type = account_type
         if self._live is not None:
-            # The gateway session manager reconnects with credentials for a different
-            # balance. Do not send the vendor's unsupported generic switch_account.
-            raise NotConnected("Reconnect the Quotex session to change account type.")
+            if self.ssid:
+                try:
+                    await self._live.authenticate(self.ssid, account_type)
+                except Exception as ex:
+                    _log(f"live change_account authenticate: {ex}")
+            try:
+                await self._live.send_event("switch_account", {"account_type": "demo" if account_type is AccountType.DEMO else "real"})
+            except Exception:
+                pass
+            try:
+                await self._live.get_balance(account_type)
+            except Exception:
+                pass
+            return
         switch = getattr(client, "switch_account", None) or getattr(
             client, "change_account", None
         )
@@ -438,7 +450,6 @@ class QuotexSession(BrokerSession):
                 else _enum_member(enums.AccountType, "REAL", "LIVE")
             )
             await _maybe_await(switch(target))
-        self.account_type = account_type
 
     # ---- market data -------------------------------------------------------
 
