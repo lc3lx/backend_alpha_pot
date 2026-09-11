@@ -157,11 +157,14 @@ class QuotexLiveData:
                 return
             assets = []
             for row in rows:
-                if not isinstance(row, list) or len(row) < 15 or not isinstance(row[1], str):
+                if not isinstance(row, list) or len(row) < 3 or not isinstance(row[1], str):
                     continue
                 try:
+                    payout = int(float(row[5] or 0)) if len(row) > 5 and row[5] is not None else 80
+                    is_open = (row[14] in (True, 1)) if len(row) > 14 and row[14] is not None else True
+                    category = str(row[0]) if len(row) > 0 and row[0] is not None else None
                     assets.append(TradingAsset(symbol=row[1], name=str(row[2]).replace("\n", ""),
-                        payout=int(float(row[5] or 0)), is_open=row[14] in (True, 1)))
+                        payout=payout, is_open=is_open, category=category))
                 except (ValueError, TypeError):
                     continue
             if rows and not assets:

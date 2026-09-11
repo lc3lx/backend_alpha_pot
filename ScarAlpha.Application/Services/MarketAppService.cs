@@ -63,10 +63,12 @@ public sealed class MarketAppService
                 "Market assets for user {UserId}: count={Count} elapsedMs={ElapsedMs}",
                 _currentUser.UserId, assets.Count, sw.ElapsedMilliseconds);
 
-            // Currency pairs only — drop crypto, equities, indices, commodities.
+            // Load all available assets from the broker (currency pairs, OTC, crypto, metals, and open assets)
             var filtered = assets
-                .Where(a => FxCurrencyAssets.IsCurrencyPair(a.Symbol, a.Category))
+                .Where(a => FxCurrencyAssets.IsCurrencyPair(a.Symbol, a.Category) || a.IsOpen)
                 .ToList();
+            if (filtered.Count == 0)
+                filtered = assets.ToList();
 
             // #region agent log
             ScarAlpha.Binolla.Diagnostics.LoginTrace.Write(

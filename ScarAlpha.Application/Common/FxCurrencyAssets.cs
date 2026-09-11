@@ -115,7 +115,10 @@ public static partial class FxCurrencyAssets
     private static readonly string[] OtcSuffixes = { "_otc", "-otc", " otc", "otc" };
 
     public static IReadOnlyList<string> FilterSymbols(IEnumerable<string> symbols) =>
-        symbols.Where(s => IsCurrencyPair(s)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        symbols
+            .Where(s => !string.IsNullOrWhiteSpace(s))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
 
     [GeneratedRegex("^[A-Za-z]{6}$")]
     private static partial Regex FxSymbolRegex();
