@@ -59,18 +59,22 @@ class SocketIOPackets:
                     return payload[0], payload[1] if len(payload) > 1 else None
             except Exception:
                 return None
-        elif text.startswith(("[", "{")):
-            try:
-                payload = json.loads(text)
-                if self.pending is not None:
-                    event, self.pending = self.pending, None
-                    return event, payload
-                if isinstance(payload, dict) and ("liveBalance" in payload or "demoBalance" in payload):
-                    return "balance", payload
-                if isinstance(payload, list):
-                    return "quotes", payload
-            except Exception:
-                return None
+        # Find start of JSON array or object (handles Engine.IO binary prefix \x04)
+        indices = [text.find(c) for c in ("[", "{") if text.find(c) != -1]
+        if indices:
+            start_idx = min(indices)
+            if start_idx <= 4:
+                try:
+                    payload = json.loads(text[start_idx:])
+                    if self.pending is not None:
+                        event, self.pending = self.pending, None
+                        return event, payload
+                    if isinstance(payload, dict) and ("liveBalance" in payload or "demoBalance" in payload):
+                        return "balance", payload
+                    if isinstance(payload, list):
+                        return "quotes", payload
+                except Exception:
+                    pass
         return None
 
 
@@ -188,7 +192,7 @@ class QuotexLiveData:
                 try:
                     payout = int(float(row[5] or 0)) if len(row) > 5 and row[5] is not None else 80
                     is_open = (row[14] in (True, 1)) if len(row) > 14 and row[14] is not None else True
-                    category = str(row[0]) if len(row) > 0 and row[0] is not None else None
+                    category = str(row[3]) if len(row) > 3 and row[3] is not None else None
                     assets.append(TradingAsset(symbol=row[1], name=str(row[2]).replace("\n", ""),
                         payout=payout, is_open=is_open, category=category))
                 except (ValueError, TypeError):

@@ -167,7 +167,7 @@ async def _auto_extract_ssid(email: str, password: str) -> str | None:
         "--broker", "quotex",
         "--mode", "login",
         "--headless", "true",
-        "--timeoutMs", "45000",
+        "--timeoutMs", "60000",
     ]
 
     def _run() -> str | None:
@@ -179,12 +179,14 @@ async def _auto_extract_ssid(email: str, password: str) -> str | None:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=50,
+                timeout=75,
             )
             for line in res.stdout.strip().split("\n"):
-                if "{" in line and "}" in line:
+                s = line.find("{")
+                e = line.rfind("}")
+                if s != -1 and e != -1 and e > s:
                     try:
-                        data = json.loads(line)
+                        data = json.loads(line[s:e + 1])
                         if data.get("ok") and data.get("token"):
                             return str(data["token"])
                     except Exception:
