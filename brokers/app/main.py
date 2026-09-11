@@ -259,6 +259,12 @@ async def connect(
         # about whether the problem was theirs, the broker's, or just timing.
         raise HTTPException(status_code=429, detail=throttle.describe(body.user_id))
 
+    if not (body.ssid or (body.email and body.password)):
+        raise HTTPException(
+            status_code=409,
+            detail=f"{broker.capitalize()} session is not connected and no credentials were provided to reconnect.",
+        )
+
     await registry.remove(body.user_id, broker)
     session = cls(body.user_id)
     try:

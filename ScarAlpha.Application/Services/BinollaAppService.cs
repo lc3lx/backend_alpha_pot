@@ -634,7 +634,7 @@ public sealed class BinollaAppService
 
         try
         {
-            using var balCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            using var balCts = new CancellationTokenSource(TimeSpan.FromSeconds(6));
             var balance = await client.GetBalanceAsync(balCts.Token);
             var accountType = balance.CurrentType == EngineAccount.Real ? "Real" : "Demo";
             var current =
@@ -652,13 +652,12 @@ public sealed class BinollaAppService
         }
         catch (Exception ex) when (ex is OperationCanceledException or BinollaTimeoutException)
         {
-            // Do not block Home/Trading for a missing balance push — return a connected empty Demo snapshot.
             _logger.LogInformation(
                 "Binolla balance not ready for user {UserId}; returning placeholder ({Error})",
                 _currentUser.UserId, ex.GetType().Name);
             return new BinollaBalanceDto(
-                Connected: true,
-                AccountType: "Demo",
+                Connected: false,
+                AccountType: (link?.AccountType ?? DomainAccount.Real).ToString(),
                 DemoBalance: 0m,
                 RealBalance: 0m,
                 CurrentBalance: 0m);
@@ -667,8 +666,8 @@ public sealed class BinollaAppService
         {
             _logger.LogWarning(ex, "Balance fetch failed for user {UserId}", _currentUser.UserId);
             return new BinollaBalanceDto(
-                Connected: true,
-                AccountType: "Demo",
+                Connected: false,
+                AccountType: (link?.AccountType ?? DomainAccount.Real).ToString(),
                 DemoBalance: 0m,
                 RealBalance: 0m,
                 CurrentBalance: 0m);
@@ -926,6 +925,28 @@ public sealed class BinollaAppService
                 "{Broker} session already live for user {UserId}; skipping browser capture",
                 broker, userId);
             return null;
+        }
+
+        if (!string.IsNullOrWhiteSpace(link.EncryptedSsid))
+        {
+            try
+            {
+                var storedSsid = _protector.Decrypt(link.EncryptedSsid);
+                var storedCookie = !string.IsNullOrWhiteSpace(link.EncryptedCookieHeader)
+                    ? _protector.Decrypt(link.EncryptedCookieHeader)
+                    : null;
+                if (!string.IsNullOrWhiteSpace(storedSsid))
+                {
+                    _logger.LogInformation(
+                        "{Broker} found stored SSID for user {UserId}; reusing stored session instead of headless browser",
+                        broker, userId);
+                    return new BinollaCapturedSession(storedSsid, storedCookie ?? string.Empty);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed decrypting stored SSID for user {UserId}", userId);
+            }
         }
 
         // The same throttle as Binolla's capture, for the same reason: this launches a

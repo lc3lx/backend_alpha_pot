@@ -67,6 +67,8 @@ public sealed class BrokerGatewayClient : IBrokerClient
         UserId = userId.ToString();
     }
 
+    private BrokerCredentials? _credentials;
+
     public string Broker { get; }
 
     public string UserId { get; }
@@ -78,6 +80,7 @@ public sealed class BrokerGatewayClient : IBrokerClient
     /// <summary>Opens the session on the gateway. Called by the session manager, not by app code.</summary>
     internal async Task ConnectAsync(BrokerCredentials credentials, CancellationToken ct)
     {
+        _credentials = credentials;
         Lifecycle = SessionLifecycleState.Connecting;
 
         var payload = new
@@ -121,17 +124,31 @@ public sealed class BrokerGatewayClient : IBrokerClient
 
     public async Task ChangeAccountAsync(AccountType accountType, CancellationToken ct = default)
     {
-        // Re-connecting is how the balance is switched: the gateway applies the account
-        // type during the handshake, because switching afterwards races the broker's own
-        // setup and can leave the socket on the other balance.
-        var url = $"/sessions/connect?user_id={Uri.EscapeDataString(UserId)}&broker={Broker}"
-                  + $"&account_type={accountType}";
+        if (_credentials != null)
+        {
+            _credentials = _credentials with { AccountType = accountType };
+        }
+
+        var payload = new
+        {
+            user_id = UserId,
+            broker = Broker,
+            ssid = _credentials?.Ssid,
+            email = _credentials?.Email,
+            password = _credentials?.Password,
+            account_type = accountType.ToString()
+        };
         var response = await SendAsync(
-                token => _http.PostAsync(url, content: null, token), ct, TimeSpan.FromSeconds(90))
+                token => _http.PostAsJsonAsync("/sessions/connect", payload, Json, token),
+                ct,
+                TimeSpan.FromSeconds(90))
             .ConfigureAwait(false);
 
         if (!response.IsSuccessStatusCode)
             throw await TranslateAsync(response, ct).ConfigureAwait(false);
+
+        Lifecycle = SessionLifecycleState.Connected;
+        IsTransportConnected = true;
     }
 
     public async Task<IReadOnlyList<TradingAsset>> GetTradingAssetsAsync(CancellationToken ct = default)
