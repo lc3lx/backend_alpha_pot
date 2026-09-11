@@ -468,7 +468,14 @@ class _CurlSocket:
 
     def send(self, message: str) -> None:
         # curl_cffi defaults to BINARY for bytes, but Socket.IO commands are TEXT.
-        self._socket.send_str(message)
+        if hasattr(self._socket, "send_str"):
+            self._socket.send_str(message)
+        elif hasattr(self._socket, "send"):
+            try:
+                from curl_cffi.curl import CurlWsFlag
+                self._socket.send(message, CurlWsFlag.TEXT)
+            except Exception:
+                self._socket.send(message.encode("utf-8") if isinstance(message, str) else message)
 
     def close(self) -> None:
         try:
@@ -524,15 +531,28 @@ def _open_with_curl(ws_url: str, headers: dict[str, str]) -> Any:
         except Exception:
             pass
 
+    connect = getattr(session, "ws_connect", None)
+    if connect is None:
+        _log("curl_cffi has no ws_connect; trying websocket-client")
+        try:
+            session.close()
+        except Exception:
+            pass
+        return None
+
     # Strip custom User-Agent so curl_cffi uses its matched TLS browser profile
     ws_headers = {k: v for k, v in headers.items() if k.lower() != "user-agent"}
+
+    extra_kwargs: dict[str, Any] = {}
+    if proxy:
+        extra_kwargs["proxy"] = proxy
 
     # Try direct ws_connect first — Quotex accepts direct WebSocket connections with Chrome impersonation
     try:
         try:
-            socket = connect(ws_url, headers=ws_headers, timeout=_CONNECT_TIMEOUT)
+            socket = connect(ws_url, headers=ws_headers, timeout=_CONNECT_TIMEOUT, **extra_kwargs)
         except TypeError:
-            socket = connect(ws_url, headers=ws_headers)
+            socket = connect(ws_url, headers=ws_headers, **extra_kwargs)
         _log("upgraded on the impersonating session")
         return _CurlSocket(session, socket)
     except Exception as exc_direct:
@@ -555,9 +575,9 @@ def _open_with_curl(ws_url: str, headers: dict[str, str]) -> Any:
 
     try:
         try:
-            socket = connect(target_url, headers=ws_headers, timeout=_CONNECT_TIMEOUT)
+            socket = connect(target_url, headers=ws_headers, timeout=_CONNECT_TIMEOUT, **extra_kwargs)
         except TypeError:
-            socket = connect(target_url, headers=ws_headers)
+            socket = connect(target_url, headers=ws_headers, **extra_kwargs)
     except Exception as exc:
         _log(f"impersonated upgrade with sid refused ({_short(exc)})")
         try:
@@ -622,10 +642,14 @@ def _warm_session(session: Any, ws_url: str) -> str | None:
             timeout=_CONNECT_TIMEOUT,
             headers={"Origin": origin, "Referer": f"{origin}/"},
         )
-        if resp.status_code == 200 and resp.text.startswith("0{"):
+        text = resp.text
+        if resp.status_code == 200 and ("sid" in text):
             try:
-                data = json.loads(resp.text[1:])
-                return data.get("sid")
+                idx = text.find("{")
+                end_idx = text.rfind("}")
+                if idx != -1 and end_idx != -1:
+                    data = json.loads(text[idx:end_idx + 1])
+                    return data.get("sid")
             except Exception:
                 pass
     except Exception as exc:

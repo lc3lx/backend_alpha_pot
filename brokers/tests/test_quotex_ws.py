@@ -309,3 +309,52 @@ def test_unknown_polling_sid_stops_receiving_and_marks_transport_dead():
     transport._delegate = delegate
     transport._poll_loop(delegate)
     assert not transport.is_connected()
+
+
+def test_warm_session_extracts_sid_with_length_prefix():
+    from types import SimpleNamespace
+    from app.quotex_ws import _warm_session
+
+    session = SimpleNamespace(
+        get=lambda url, **kw: SimpleNamespace(
+            status_code=200,
+            text='96:0{"sid":"g-test-sid-123","upgrades":["websocket"],"pingInterval":25000,"pingTimeout":5000}',
+        )
+    )
+    sid = _warm_session(session, "wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket")
+    assert sid == "g-test-sid-123"
+
+
+def test_open_with_curl_calls_ws_connect(monkeypatch):
+    from types import SimpleNamespace
+    from app import quotex_ws
+
+    connected_urls = []
+    fake_socket = SimpleNamespace(send_str=lambda msg: None, recv=lambda: "0")
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            self.proxies = {}
+            self.cookies = {}
+
+        def ws_connect(self, url, **kwargs):
+            connected_urls.append((url, kwargs))
+            return fake_socket
+
+        def close(self):
+            pass
+
+    fake_requests = SimpleNamespace(Session=FakeSession)
+    monkeypatch.setattr("curl_cffi.requests", fake_requests, raising=False)
+
+    import sys
+    monkeypatch.setitem(sys.modules, "curl_cffi.requests", fake_requests)
+
+    res = quotex_ws._open_with_curl(
+        "wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket",
+        {"Origin": "https://qxbroker.com"},
+    )
+    assert res is not None
+    assert len(connected_urls) == 1
+    assert "wss://ws2.qxbroker.com" in connected_urls[0][0]
+
