@@ -76,6 +76,10 @@ def proxy_url() -> str | None:
     parts = raw.split(":")
     if len(parts) >= 4:
         host, port, user, *rest = parts
+        if "quantumproxies.io" in host and port == "12000" and not os.environ.get("BROKER_PROXY_SCHEME"):
+            scheme = "socks5h"
+        elif "quantumproxies.io" in host and port == "10000" and not os.environ.get("BROKER_PROXY_SCHEME"):
+            scheme = "http"
         # The remainder is the password, kept whole so one containing ':' survives.
         return f"{scheme}://{user}:{':'.join(rest)}@{host}:{port}"
     if len(parts) == 2:

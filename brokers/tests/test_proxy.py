@@ -127,3 +127,9 @@ def test_an_unknown_scheme_falls_back_to_http(monkeypatch):
     monkeypatch.setenv("BROKER_PROXY", VENDOR_LINE)
     monkeypatch.setenv("BROKER_PROXY_SCHEME", "carrier-pigeon")
     assert proxy_url() == VENDOR_URL
+
+
+def test_quantumproxies_port_12000_becomes_socks5h(monkeypatch):
+    monkeypatch.setenv("BROKER_PROXY", "residentialboson.quantumproxies.io:12000:u:p")
+    assert proxy_url() == "socks5h://u:p@residentialboson.quantumproxies.io:12000"
+
