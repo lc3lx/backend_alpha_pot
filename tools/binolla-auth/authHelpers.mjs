@@ -120,12 +120,12 @@ export const BROKER_PRESETS = {
     label: 'Binolla',
   },
   quotex: {
-    loginUrl: 'https://qxbroker.com/en/sign-in',
+    loginUrl: 'https://broker-qx.pro/en/sign-in',
     signupUrl: 'https://broker-qx.pro/?lid=2345315',
     // The SSID only appears once the trading socket authorises, so the capture has to
     // reach this page — the sign-in response alone does not carry it.
-    tradingUrl: 'https://qxbroker.com/en/trade',
-    tradingUrls: ['https://qxbroker.com/trade', 'https://qxbroker.com/en/trade/'],
+    tradingUrl: 'https://broker-qx.pro/en/trade',
+    tradingUrls: ['https://broker-qx.pro/trade', 'https://qxbroker.com/trade', 'https://qxbroker.com/en/trade/'],
     // Deliberately empty. Quotex signs in through a server-rendered form carrying a CSRF
     // token, not a JSON endpoint; posting to a guessed path just burns seconds and can
     // trip the rate limiter before the real form is ever filled. The capture goes
@@ -272,7 +272,12 @@ export function parseProxy(raw) {
   // password so one containing ':' still survives.
   const parts = value.split(':');
   if (parts.length >= 4) {
-    const [host, port, username, ...passwordParts] = parts;
+    let [host, port, username, ...passwordParts] = parts;
+    // Chromium cannot authenticate to SOCKS5 proxies directly. Quantum Proxies serves
+    // HTTP proxy on port 10000.
+    if (host.includes('quantumproxies.io') && port === '12000') {
+      port = '10000';
+    }
     return {
       server: `http://${host}:${port}`,
       username,

@@ -327,6 +327,7 @@ async function main() {
   const mode = arg('mode', 'login');
   const email = arg('email') || process.env.BINOLLA_AUTH_EMAIL || '';
   const password = arg('password') || process.env.BINOLLA_AUTH_PASSWORD || '';
+  const pinCode = arg('pinCode') || process.env.BINOLLA_AUTH_PIN || process.env.QUOTEX_PIN_CODE || '';
   const headless = arg('headless', 'true') !== 'false';
   // Which venue to capture for. The URLs come from one table in authHelpers so the two
   // brokers cannot drift into different ideas of where a login page is; an explicit
@@ -550,80 +551,184 @@ async function main() {
 
     if (!apiToken && !wsToken) {
       // --- Fallback: DOM form ---
-      const emailOk = await fillFirst(
-        page,
-        [
-          'input[name="email"]',
-          'input[inputmode="email"]',
-          'input[type="email"]',
-          'input[autocomplete="username"]',
-          'input[placeholder*="mail" i]',
-        ],
-        email,
-      );
-      if (!emailOk) {
-        throw new Error(
-          `Could not find the ${preset.label} email field (${await describeInputs(page)})`,
-        );
-      }
+      if (broker.trim().toLowerCase() === 'quotex') {
+        const formSel = isSignup ? 'form[action*="sign-up"]' : 'form[action*="sign-in"]';
+        const targetForm = page.locator(formSel).first();
+        if ((await targetForm.count()) > 0) {
+          await targetForm.locator('input[name="email"]').first().fill(email);
+          await targetForm.locator('input[name="password"]').first().fill(password);
+          if (!isSignup) {
+            try {
+              const rem = targetForm.locator('input[name="remember"]');
+              if ((await rem.count()) > 0) await rem.check({ timeout: 1500 });
+            } catch {}
+          } else {
+            try {
+              const rules = targetForm.locator('input[name="rules"]');
+              if ((await rules.count()) > 0) await rules.check({ timeout: 1500 });
+              const nonUs = targetForm.locator('input[name="not-us-citizen"]');
+              if ((await nonUs.count()) > 0) await nonUs.check({ timeout: 1500 });
+            } catch {}
+          }
+          const submitBtn = targetForm.locator('button[type="submit"], button.modal-sign__block-button').first();
+          await submitBtn.click();
+        } else {
+          const emailOk = await fillFirst(
+            page,
+            [
+              'input[name="email"]',
+              'input[inputmode="email"]',
+              'input[type="email"]',
+              'input[autocomplete="username"]',
+              'input[placeholder*="mail" i]',
+            ],
+            email,
+          );
+          if (!emailOk) {
+            throw new Error(
+              `Could not find the ${preset.label} email field (${await describeInputs(page)})`,
+            );
+          }
+          const passOk = await fillFirst(
+            page,
+            [
+              'input[name="password"]',
+              'input[type="password"]',
+              'input[autocomplete="current-password"]',
+              'input[autocomplete="new-password"]',
+              'input[id*="pass" i]',
+              'input[placeholder*="pass" i]',
+              '[data-testid*="password" i] input',
+            ],
+            password,
+          );
+          if (!passOk) {
+            throw new Error(
+              `Could not find the ${preset.label} password field (${await describeInputs(page)})`,
+            );
+          }
+          await clickSubmit(page, isSignup);
+        }
 
-      const passOk = await fillFirst(
-        page,
-        [
-          'input[name="password"]',
-          'input[type="password"]',
-          'input[autocomplete="current-password"]',
-          'input[autocomplete="new-password"]',
-          // Quotex renders its own control rather than a plainly named input, and the
-          // field can appear a moment after the email one is filled.
-          'input[id*="pass" i]',
-          'input[placeholder*="pass" i]',
-          '[data-testid*="password" i] input',
-        ],
-        password,
-      );
-      if (!passOk) {
-        throw new Error(
-          `Could not find the ${preset.label} password field (${await describeInputs(page)})`,
-        );
-      }
+        // Post-submit Quotex PIN handling
+        if (!isSignup) {
+          const pinWaitStarted = Date.now();
+          let pinPromptDetected = false;
+          while (Date.now() - pinWaitStarted < 6000) {
+            if (wsToken || apiToken) break;
+            const pinBox = page.locator('input[name="code"], input[placeholder*="code" i]').first();
+            if ((await pinBox.count()) > 0 && (await pinBox.isVisible())) {
+              pinPromptDetected = true;
+              break;
+            }
+            const bodyText = await page.evaluate(() => document.body?.innerText || '').catch(() => '');
+            if (/enter the pin-code|pin-code/i.test(bodyText)) {
+              pinPromptDetected = true;
+              break;
+            }
+            if (page.url().includes('/trade')) break;
+            await page.waitForTimeout(200);
+          }
 
-      if (isSignup) {
-        await fillFirst(
+          if (pinPromptDetected) {
+            if (pinCode) {
+              const pinBox = page.locator('input[name="code"], input[placeholder*="code" i]').first();
+              if ((await pinBox.count()) > 0) {
+                await pinBox.fill(pinCode.trim());
+              } else {
+                await page.fill('input[name="code"]', pinCode.trim());
+              }
+              const pinSubmit = page.locator('button:has-text("Sign in"), button[type="submit"]').first();
+              await pinSubmit.click();
+              await page.waitForTimeout(2500);
+            } else {
+              process.stdout.write(
+                JSON.stringify({
+                  ok: false,
+                  pinRequired: true,
+                  error: `Quotex PIN code required. A 6-digit PIN has been sent to ${email}. Please enter the code to complete connection.`,
+                }),
+              );
+              process.exit(1);
+            }
+          }
+        }
+      } else {
+        const emailOk = await fillFirst(
           page,
           [
-            'input[name="passwordConfirm"]',
-            'input[name="confirmPassword"]',
-            'input[name="password_confirmation"]',
+            'input[name="email"]',
+            'input[inputmode="email"]',
+            'input[type="email"]',
+            'input[autocomplete="username"]',
+            'input[placeholder*="mail" i]',
+          ],
+          email,
+        );
+        if (!emailOk) {
+          throw new Error(
+            `Could not find the ${preset.label} email field (${await describeInputs(page)})`,
+          );
+        }
+
+        const passOk = await fillFirst(
+          page,
+          [
+            'input[name="password"]',
+            'input[type="password"]',
+            'input[autocomplete="current-password"]',
             'input[autocomplete="new-password"]',
+            // Quotex renders its own control rather than a plainly named input, and the
+            // field can appear a moment after the email one is filled.
+            'input[id*="pass" i]',
+            'input[placeholder*="pass" i]',
+            '[data-testid*="password" i] input',
           ],
           password,
         );
-        // Required Binolla checkboxes (from live DOM: agreement + isNotUsCitizen).
-        for (const name of ['agreement', 'isNotUsCitizen']) {
-          try {
-            await page.locator(`input[type="checkbox"][name="${name}"]`).check({ timeout: 2000 });
-          } catch {
-            /* try generic below */
-          }
+        if (!passOk) {
+          throw new Error(
+            `Could not find the ${preset.label} password field (${await describeInputs(page)})`,
+          );
         }
-        try {
-          const boxes = page.locator('input[type="checkbox"]');
-          const count = await boxes.count();
-          for (let i = 0; i < Math.min(count, 6); i++) {
+
+        if (isSignup) {
+          await fillFirst(
+            page,
+            [
+              'input[name="passwordConfirm"]',
+              'input[name="confirmPassword"]',
+              'input[name="password_confirmation"]',
+              'input[autocomplete="new-password"]',
+            ],
+            password,
+          );
+          // Required Binolla checkboxes (from live DOM: agreement + isNotUsCitizen).
+          for (const name of ['agreement', 'isNotUsCitizen']) {
             try {
-              await boxes.nth(i).check({ timeout: 1500 });
+              await page.locator(`input[type="checkbox"][name="${name}"]`).check({ timeout: 2000 });
             } catch {
-              /* optional */
+              /* try generic below */
             }
           }
-        } catch {
-          /* optional */
+          try {
+            const boxes = page.locator('input[type="checkbox"]');
+            const count = await boxes.count();
+            for (let i = 0; i < Math.min(count, 6); i++) {
+              try {
+                await boxes.nth(i).check({ timeout: 1500 });
+              } catch {
+                /* optional */
+              }
+            }
+          } catch {
+            /* optional */
+          }
         }
-      }
 
-      const clicked = await clickSubmit(page, isSignup);
-      void clicked;
+        const clicked = await clickSubmit(page, isSignup);
+        void clicked;
+      }
 
       const started = Date.now();
       while (!apiToken && !wsToken && Date.now() - started < waitBudgetMs) {
@@ -653,26 +758,31 @@ async function main() {
     if ((apiResult.okStatus || apiToken || leftLoginPage) && !wsToken) {
       const tradingCandidates = [tradingUrl, ...(preset.tradingUrls || [])];
       let navigated = false;
-      for (const tUrl of tradingCandidates) {
-        try {
-          await page.goto(tUrl, { waitUntil: 'domcontentloaded', timeout: Math.min(timeoutMs, 25_000) });
-          navigated = true;
-          // #region agent log
-          agentLog('H1', 'capture.mjs:trading', 'navigated_trading', {
-            elapsedMs: Date.now() - captureStarted,
-            urlHost: (() => {
-              try {
-                return new URL(page.url()).pathname;
-              } catch {
-                return 'unknown';
-              }
-            })(),
-          });
-          // #endregion
-          break;
-        } catch {
-          /* try next */
+      const alreadyOnTrading = page.url().includes('/trade');
+      if (!alreadyOnTrading) {
+        for (const tUrl of tradingCandidates) {
+          try {
+            await page.goto(tUrl, { waitUntil: 'domcontentloaded', timeout: Math.min(timeoutMs, 25_000) });
+            navigated = true;
+            // #region agent log
+            agentLog('H1', 'capture.mjs:trading', 'navigated_trading', {
+              elapsedMs: Date.now() - captureStarted,
+              urlHost: (() => {
+                try {
+                  return new URL(page.url()).pathname;
+                } catch {
+                  return 'unknown';
+                }
+              })(),
+            });
+            // #endregion
+            break;
+          } catch {
+            /* try next */
+          }
         }
+      } else {
+        navigated = true;
       }
 
       if (navigated || apiToken || leftLoginPage) {

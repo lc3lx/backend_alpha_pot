@@ -333,6 +333,17 @@ public sealed class BinollaAppService
         var accountType = ParseAccountType(request.AccountType);
         await EnsureAccountTypeAllowedAsync(userId, accountType, ct);
 
+        var broker = Brokers.IsKnown(request.Broker)
+            ? Brokers.Normalize(request.Broker)
+            : (await _links.GetByUserIdAsync(userId, ct).ConfigureAwait(false))?.Broker is { } b && Brokers.IsKnown(b)
+                ? Brokers.Normalize(b)
+                : Brokers.Binolla;
+
+        if (broker == Brokers.Quotex)
+        {
+            return await ConnectGatewayWithSsidAsync(userId, broker, request, ct, cookieHeader).ConfigureAwait(false);
+        }
+
         var encrypted = _protector.Encrypt(request.Ssid.Trim());
 
         try
@@ -803,6 +814,74 @@ public sealed class BinollaAppService
             Balance: balance);
     }
 
+    private async Task<BinollaConnectResponse> ConnectGatewayWithSsidAsync(
+        Guid userId,
+        string broker,
+        BinollaConnectRequest request,
+        CancellationToken ct,
+        string? cookieHeader)
+    {
+        var accountType = ParseAccountType(request.AccountType);
+        var engineType = accountType == DomainAccount.Demo ? EngineAccount.Demo : EngineAccount.Real;
+
+        var now = DateTimeOffset.UtcNow;
+        var link = await _links.GetByUserIdAsync(userId, ct).ConfigureAwait(false) ?? new BinollaLink
+        {
+            Id = Guid.NewGuid(),
+            UserId = userId,
+            CreatedAt = now,
+            AdminApproved = false,
+            ApprovalStatus = AdminApprovalStatus.Pending
+        };
+
+        var client = await _brokers.GetOrCreateAsync(
+            userId,
+            broker,
+            new BrokerCredentials(
+                Ssid: request.Ssid.Trim(),
+                CookieHeader: cookieHeader,
+                Email: string.Empty,
+                Password: string.Empty,
+                AccountType: engineType),
+            ct).ConfigureAwait(false);
+
+        link.Broker = broker;
+        link.AccountType = accountType;
+        link.Status = BinollaLinkStatus.Connected;
+        link.LastConnectedAt = now;
+        link.UpdatedAt = now;
+        link.EncryptedSsid = _protector.Encrypt(request.Ssid.Trim());
+        if (!string.IsNullOrWhiteSpace(cookieHeader))
+            link.EncryptedCookieHeader = _protector.Encrypt(cookieHeader.Trim());
+
+        await _links.UpsertAsync(link, ct).ConfigureAwait(false);
+        _brokerResolver.Invalidate(userId);
+        _access.Invalidate(userId);
+
+        decimal? balance = null;
+        try
+        {
+            balance = (await client.GetBalanceAsync(ct).ConfigureAwait(false)).CurrentBalance;
+        }
+        catch
+        {
+            // Balance is optional on connect; the next market call fetches it.
+        }
+
+        _logger.LogInformation("Broker {Broker} connected via SSID for user {UserId}", broker, userId);
+
+        var access = await _access.CheckAsync(userId, ct).ConfigureAwait(false);
+
+        return new BinollaConnectResponse(
+            Connected: true,
+            AccountType: accountType.ToString(),
+            Access: AccountAppService.MapAccess(access.Access),
+            AdminApproved: access.AdminApproved,
+            ApprovalStatus: access.ApprovalStatus,
+            LastConnectedAt: link.LastConnectedAt,
+            Balance: balance);
+    }
+
     /// <summary>
     /// Obtains a browser session for a gateway broker that cannot connect without one.
     ///
@@ -865,7 +944,7 @@ public sealed class BinollaAppService
         try
         {
             var captured = await _credentialAuth.LoginAsync(
-                broker, request.Email, request.Password, workCts.Token);
+                broker, request.Email, request.Password, request.PinCode, workCts.Token);
             _restorer.ClearAuthFailure(userId);
             return captured;
         }

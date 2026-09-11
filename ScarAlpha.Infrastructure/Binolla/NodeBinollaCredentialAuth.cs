@@ -59,20 +59,29 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         string email,
         string password,
         CancellationToken cancellationToken = default)
-        => CaptureAsync(Brokers.Normalize(broker), "login", email, password, cancellationToken);
+        => CaptureAsync(Brokers.Normalize(broker), "login", email, password, pinCode: null, cancellationToken);
+
+    public Task<BinollaCapturedSession> LoginAsync(
+        string broker,
+        string email,
+        string password,
+        string? pinCode,
+        CancellationToken cancellationToken = default)
+        => CaptureAsync(Brokers.Normalize(broker), "login", email, password, pinCode, cancellationToken);
 
     public Task<BinollaCapturedSession> SignUpAsync(
         string broker,
         string email,
         string password,
         CancellationToken cancellationToken = default)
-        => CaptureAsync(Brokers.Normalize(broker), "signup", email, password, cancellationToken);
+        => CaptureAsync(Brokers.Normalize(broker), "signup", email, password, pinCode: null, cancellationToken);
 
     private async Task<BinollaCapturedSession> CaptureAsync(
         string broker,
         string mode,
         string email,
         string password,
+        string? pinCode,
         CancellationToken cancellationToken)
     {
         if (!_enabled)
@@ -97,7 +106,7 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         await _gate.WaitAsync(cancellationToken);
         try
         {
-            var captured = await RunNodeCaptureAsync(broker, mode, email.Trim(), password, cancellationToken);
+            var captured = await RunNodeCaptureAsync(broker, mode, email.Trim(), password, pinCode, cancellationToken);
             var token = NormalizeSessionToken(captured.Token!);
             return new BinollaCapturedSession(BuildSessionPayload(broker, token), captured.Cookies);
         }
@@ -132,6 +141,7 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         string mode,
         string email,
         string password,
+        string? pinCode,
         CancellationToken cancellationToken)
     {
         var psi = new ProcessStartInfo
@@ -171,6 +181,11 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         {
             psi.ArgumentList.Add("--proxy");
             psi.ArgumentList.Add(_proxyServer);
+        }
+        if (!string.IsNullOrWhiteSpace(pinCode))
+        {
+            psi.ArgumentList.Add("--pinCode");
+            psi.ArgumentList.Add(pinCode.Trim());
         }
 
         _logger.LogInformation(
@@ -235,6 +250,11 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
 
         if (!result.Ok || string.IsNullOrWhiteSpace(result.Token) || result.Token.Length < 16)
         {
+            if (result.PinRequired == true || (result.Error?.Contains("PIN", StringComparison.OrdinalIgnoreCase) == true))
+            {
+                throw new ApiException(ApiErrorCodes.QuotexPinRequired, result.Error ?? "Quotex PIN code required.", 400);
+            }
+
             var safeError = SanitizeCaptureError(result.Error, stderr);
             // A CAPTCHA carries its own code: nothing is wrong with the credentials, and
             // the caller can offer the user the guided login rather than an error.
@@ -446,5 +466,6 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         string? Token,
         string? Cookies,
         string? Error,
-        string? TokenSource = null);
+        string? TokenSource = null,
+        bool? PinRequired = null);
 }

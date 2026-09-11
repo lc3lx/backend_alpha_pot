@@ -18,6 +18,15 @@ public interface IBinollaCredentialAuth
         string broker,
         string email,
         string password,
+        CancellationToken cancellationToken = default)
+        => LoginAsync(broker, email, password, null, cancellationToken);
+
+    /// <summary>Log into an existing account on <paramref name="broker"/> with optional 2FA PIN and return its session.</summary>
+    Task<BinollaCapturedSession> LoginAsync(
+        string broker,
+        string email,
+        string password,
+        string? pinCode,
         CancellationToken cancellationToken = default);
 
     /// <summary>Register a new account (partner referral) on <paramref name="broker"/>.</summary>

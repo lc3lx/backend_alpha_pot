@@ -21,6 +21,8 @@ public static class ApiErrorCodes
     /// challenge — not to tell them their password is wrong.
     /// </summary>
     public const string BinollaCaptchaRequired = "BINOLLA_CAPTCHA_REQUIRED";
+    /// <summary>Quotex sent a 2FA PIN code to the user's email address.</summary>
+    public const string QuotexPinRequired = "QUOTEX_PIN_REQUIRED";
     public const string BinollaMarketUnavailable = "BINOLLA_MARKET_UNAVAILABLE";
     public const string MarketUnavailable = "MARKET_UNAVAILABLE";
     public const string InsufficientBalance = "INSUFFICIENT_BALANCE";

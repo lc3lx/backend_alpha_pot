@@ -69,7 +69,11 @@ public sealed record BinollaCredentialRequest(
     /// Which venue to sign in to — "binolla" or "quotex". Omitted means Binolla, so every
     /// client that predates the choice keeps working unchanged.
     /// </summary>
-    string? Broker = null);
+    string? Broker = null,
+    /// <summary>
+    /// Optional 2FA PIN code sent by Quotex to the account email.
+    /// </summary>
+    string? PinCode = null);
 
 public sealed record BinollaAccountTypeRequest(string AccountType);
 
