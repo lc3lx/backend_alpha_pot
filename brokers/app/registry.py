@@ -38,13 +38,13 @@ class _Throttle:
     """
 
     #: Seconds for the first failure; doubles per consecutive failure.
-    base_seconds: float = 30.0
-    max_seconds: float = 900.0
+    base_seconds: float = 5.0
+    max_seconds: float = 60.0
     #: Floor between attempts, applied only while attempts are actually failing.
-    min_interval_seconds: float = 20.0
+    min_interval_seconds: float = 1.0
     #: Connects allowed at once. More than one so users do not queue behind each other;
     #: bounded so a restart cannot open a hundred handshakes at the broker together.
-    max_concurrent: int = 3
+    max_concurrent: int = 15
     #: Cooldown lockout on failed attempts (disabled by default so user is not blocked).
     enable_user_cooldown: bool = False
 

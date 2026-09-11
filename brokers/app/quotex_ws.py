@@ -33,9 +33,8 @@ _MAX_CONSECUTIVE_FAILURES = 3
 _BACKOFF_SECONDS = 30
 
 #: Longest a single upgrade attempt may take. A broker either accepts the handshake
-#: quickly or is not going to; anything beyond this is a misconfiguration hanging, and
-#: waiting it out blocks a connect slot that other sign-ins are queued behind.
-_CONNECT_TIMEOUT = 6
+#: quickly or is not going to; residential proxy routing needs adequate headroom.
+_CONNECT_TIMEOUT = 25
 
 #: Engine.IO v3 packet types used here.
 _OPEN = "0"
@@ -86,7 +85,7 @@ class _UpgradeHealth:
         self._failures = 0
         _log(
             f"upgrade refused {_MAX_CONSECUTIVE_FAILURES}x; staying on polling for "
-            f"{_BACKOFF_SECONDS // 60} minutes"
+            f"{_BACKOFF_SECONDS} seconds"
         )
 
 
@@ -547,19 +546,8 @@ def _open_with_curl(ws_url: str, headers: dict[str, str]) -> Any:
     if proxy:
         extra_kwargs["proxy"] = proxy
 
-    # Try direct ws_connect first — Quotex accepts direct WebSocket connections with Chrome impersonation
-    try:
-        try:
-            socket = connect(ws_url, headers=ws_headers, timeout=_CONNECT_TIMEOUT, **extra_kwargs)
-        except TypeError:
-            socket = connect(ws_url, headers=ws_headers, **extra_kwargs)
-        _log("upgraded on the impersonating session")
-        return _CurlSocket(session, socket)
-    except Exception as exc_direct:
-        _log(f"direct upgrade failed ({_short(exc_direct)}); trying with warmed session")
-
-    # Fallback to warmed session if direct upgrade did not succeed
-    sid = _warm_session(session, ws_url)
+    # 1. Warm session first with polling GET to earn Cloudflare cookies
+    _warm_session(session, ws_url)
     if hasattr(session, "cookies") and session.cookies:
         try:
             cookie_items = [f"{c.name}={c.value}" for c in session.cookies]
@@ -568,26 +556,32 @@ def _open_with_curl(ws_url: str, headers: dict[str, str]) -> Any:
         except Exception:
             pass
 
-    target_url = ws_url
-    if sid and "sid=" not in target_url:
-        separator = "&" if "?" in target_url else "?"
-        target_url = f"{target_url}{separator}sid={sid}"
-
+    # 2. Connect directly to ws_url with the earned cookies (DO NOT append sid=!)
     try:
         try:
-            socket = connect(target_url, headers=ws_headers, timeout=_CONNECT_TIMEOUT, **extra_kwargs)
+            socket = connect(ws_url, headers=ws_headers, timeout=_CONNECT_TIMEOUT, **extra_kwargs)
         except TypeError:
-            socket = connect(target_url, headers=ws_headers, **extra_kwargs)
+            socket = connect(ws_url, headers=ws_headers, **extra_kwargs)
+        _log("upgraded on the impersonating session (warmed)")
+        return _CurlSocket(session, socket)
+    except Exception as exc_warmed:
+        _log(f"warmed upgrade failed ({_short(exc_warmed)}); trying direct without warm-up")
+
+    # 3. Fallback: try raw connect without warming
+    try:
+        try:
+            socket = connect(ws_url, headers=ws_headers, timeout=_CONNECT_TIMEOUT, **extra_kwargs)
+        except TypeError:
+            socket = connect(ws_url, headers=ws_headers, **extra_kwargs)
+        _log("upgraded on the impersonating session (direct)")
+        return _CurlSocket(session, socket)
     except Exception as exc:
-        _log(f"impersonated upgrade with sid refused ({_short(exc)})")
+        _log(f"impersonated upgrade refused ({_short(exc)})")
         try:
             session.close()
         except Exception:
             pass
         return None
-
-    _log("upgraded on the impersonating session (warmed)")
-    return _CurlSocket(session, socket)
 
 
 def _open_with_websocket_client(ws_url: str, headers: dict[str, str]) -> Any:
