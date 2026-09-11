@@ -120,12 +120,12 @@ export const BROKER_PRESETS = {
     label: 'Binolla',
   },
   quotex: {
-    loginUrl: 'https://broker-qx.pro/en/sign-in',
-    signupUrl: 'https://broker-qx.pro/?lid=2345315',
+    loginUrl: 'https://qxbroker.com/en/sign-in',
+    signupUrl: 'https://qxbroker.com/?lid=2345315',
     // The SSID only appears once the trading socket authorises, so the capture has to
     // reach this page — the sign-in response alone does not carry it.
-    tradingUrl: 'https://broker-qx.pro/en/trade',
-    tradingUrls: ['https://broker-qx.pro/trade', 'https://qxbroker.com/trade', 'https://qxbroker.com/en/trade/'],
+    tradingUrl: 'https://qxbroker.com/en/trade',
+    tradingUrls: ['https://qxbroker.com/en/trade', 'https://qxbroker.com/trade'],
     // Deliberately empty. Quotex signs in through a server-rendered form carrying a CSRF
     // token, not a JSON endpoint; posting to a guessed path just burns seconds and can
     // trip the rate limiter before the real form is ever filled. The capture goes
@@ -218,6 +218,15 @@ export async function scanStorage(page) {
       if (s.length < 16 || s.includes('{') || s.includes('}')) return null;
       return s;
     };
+
+    try {
+      if (typeof window !== 'undefined' && window.settings && typeof window.settings.token === 'string') {
+        const n = unwrap(window.settings.token);
+        if (n) return n;
+      }
+    } catch {
+      /* ignore */
+    }
 
     try {
       for (let i = 0; i < localStorage.length; i++) {

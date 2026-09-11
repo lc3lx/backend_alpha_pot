@@ -653,6 +653,31 @@ async function main() {
             }
           }
         }
+      } else if (preset.label === 'Quotex' && !isSignup) {
+        const submitted = await page.evaluate(({ email, password }) => {
+          const form = document.querySelector('form[action*="sign-in"]');
+          if (!form) return false;
+          const emailInput = form.querySelector('input[name="email"]');
+          const passInput = form.querySelector('input[name="password"]');
+          if (!emailInput || !passInput) return false;
+
+          emailInput.value = email;
+          emailInput.dispatchEvent(new Event('input', { bubbles: true }));
+          emailInput.dispatchEvent(new Event('change', { bubbles: true }));
+
+          passInput.value = password;
+          passInput.dispatchEvent(new Event('input', { bubbles: true }));
+          passInput.dispatchEvent(new Event('change', { bubbles: true }));
+
+          const btn = form.querySelector('button[type="submit"]');
+          if (btn) btn.click();
+          else form.submit();
+          return true;
+        }, { email, password });
+
+        if (!submitted) {
+          throw new Error(`Could not submit the Quotex sign-in form (${await describeInputs(page)})`);
+        }
       } else {
         const emailOk = await fillFirst(
           page,

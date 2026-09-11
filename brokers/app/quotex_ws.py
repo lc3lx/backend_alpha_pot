@@ -513,11 +513,11 @@ def _open_with_curl(ws_url: str, headers: dict[str, str]) -> Any:
     # MINUTES before giving up — holding a connect slot the whole time, which is what
     # turned one bad setting into a storm of refused sign-ins everywhere else.
     try:
-        session = session_factory(impersonate="chrome110", timeout=_CONNECT_TIMEOUT)
+        session = session_factory(impersonate="chrome120", timeout=_CONNECT_TIMEOUT)
     except TypeError:
         # Older curl_cffi takes the timeout per request rather than per session.
         try:
-            session = session_factory(impersonate="chrome110")
+            session = session_factory(impersonate="chrome120")
         except Exception:
             return None
     except Exception:
@@ -542,15 +542,22 @@ def _open_with_curl(ws_url: str, headers: dict[str, str]) -> Any:
     # Strip custom User-Agent so curl_cffi uses its matched TLS browser profile
     ws_headers = {k: v for k, v in headers.items() if k.lower() != "user-agent"}
 
-    extra_kwargs: dict[str, Any] = {}
+    extra_kwargs: dict[str, Any] = {
+        "impersonate": "chrome120",
+    }
     if proxy:
         extra_kwargs["proxy"] = proxy
 
     # 1. Warm session first with polling GET to earn Cloudflare cookies
-    _warm_session(session, ws_url)
+    _warm_session(session, ws_url, extra_kwargs)
     if hasattr(session, "cookies") and session.cookies:
         try:
-            cookie_items = [f"{c.name}={c.value}" for c in session.cookies]
+            if hasattr(session.cookies, "items"):
+                cookie_items = [f"{k}={v}" for k, v in session.cookies.items()]
+            elif hasattr(session.cookies, "jar"):
+                cookie_items = [f"{c.name}={c.value}" for c in session.cookies.jar]
+            else:
+                cookie_items = [f"{k}={v}" for k, v in dict(session.cookies).items()]
             if cookie_items and "Cookie" not in ws_headers and "cookie" not in ws_headers:
                 ws_headers["Cookie"] = "; ".join(cookie_items)
         except Exception:
@@ -619,7 +626,7 @@ def _open_with_websocket_client(ws_url: str, headers: dict[str, str]) -> Any:
         return None
 
 
-def _warm_session(session: Any, ws_url: str) -> str | None:
+def _warm_session(session: Any, ws_url: str, extra_kwargs: dict[str, Any] | None = None) -> str | None:
     """
     Earns Cloudflare's clearance cookie on this session, so the upgrade carries it.
 
@@ -630,11 +637,14 @@ def _warm_session(session: Any, ws_url: str) -> str | None:
     http_url = http_url.replace("transport=websocket", "transport=polling")
 
     origin = _origin(ws_url)
+    req_kwargs = dict(extra_kwargs or {})
     try:
         resp = session.get(
             http_url,
             timeout=_CONNECT_TIMEOUT,
-            headers={"Origin": origin, "Referer": f"{origin}/"},
+            headers={"Origin": origin, "Referer": f"{origin}/en/trade"},
+            verify=False,
+            **req_kwargs,
         )
         text = resp.text
         if resp.status_code == 200 and ("sid" in text):
@@ -706,11 +716,11 @@ def _cloudflare_cookies(ws_url: str) -> str | None:
     http_url = http_url.replace("transport=websocket", "transport=polling")
 
     try:
-        session = curl_requests.Session(impersonate="chrome110")
+        session = curl_requests.Session(impersonate="chrome120")
         proxy = proxy_url()
         if proxy:
             session.proxies = {"http": proxy, "https": proxy}
-        session.get(http_url, timeout=15)
+        session.get(http_url, timeout=15, verify=False)
         jar = getattr(session, "cookies", None)
         if not jar:
             return None

@@ -59,22 +59,13 @@ class _Throttle:
 
     def can_attempt(self, user_id: str) -> bool:
         now = time.monotonic()
-        if self.enable_user_cooldown and now < self._user_retry_after.get(user_id, 0.0):
-            return False
-        # The broker refused the SERVER. Nobody's attempt can succeed, so nobody attempts.
-        if now < self._global_retry_after:
-            return False
-
-        # Already connecting for this user: a second concurrent attempt for the same
-        # account is always a duplicate, whoever asked for it.
+        # Cooldown removed per user request: allow immediate retries without artificial delay
         if user_id in self._in_flight:
-            return False
+            if now - self._last_started > 15.0:
+                self._in_flight.discard(user_id)
+            else:
+                return False
         if len(self._in_flight) >= self.max_concurrent:
-            return False
-
-        # Spacing applies only while things are failing. On a healthy broker it would
-        # serialise ordinary logins behind each other for no reason.
-        if self._recent_failures > 0 and now - self._last_started < self.min_interval_seconds:
             return False
 
         self._in_flight.add(user_id)
@@ -83,22 +74,11 @@ class _Throttle:
 
     def mark_failed(self, user_id: str, *, blocked_by_broker: bool = False) -> None:
         self._release(user_id)
-        self._recent_failures = min(self._recent_failures + 1, 8)
-
-        failures = self._user_failures.get(user_id, 0) + 1
-        self._user_failures[user_id] = failures
-        if self.enable_user_cooldown:
-            delay = min(self.base_seconds * (2 ** min(failures - 1, 6)), self.max_seconds)
-            self._user_retry_after[user_id] = time.monotonic() + delay
-        else:
-            self._user_retry_after.pop(user_id, None)
-
-        if not blocked_by_broker:
-            return
-
-        self._global_failures = min(self._global_failures + 1, 8)
-        global_delay = min(60.0 * (2 ** min(self._global_failures - 1, 4)), self.max_seconds)
-        self._global_retry_after = time.monotonic() + global_delay
+        self._recent_failures = 0
+        self._user_failures.pop(user_id, None)
+        self._user_retry_after.pop(user_id, None)
+        self._global_failures = 0
+        self._global_retry_after = 0.0
 
     def mark_succeeded(self, user_id: str) -> None:
         self._release(user_id)
@@ -106,8 +86,6 @@ class _Throttle:
         self._user_retry_after.pop(user_id, None)
         self._global_failures = 0
         self._global_retry_after = 0.0
-        # The spacing floor throttles FAILED attempts. A success proves the broker is
-        # reachable, so it must not hold other users back.
         self._recent_failures = 0
         self._last_started = 0.0
 
@@ -120,20 +98,9 @@ class _Throttle:
 
     def describe(self, user_id: str) -> str:
         """Why an attempt was refused, in words a user can act on."""
-        now = time.monotonic()
-        wait = self._user_retry_after.get(user_id, 0.0) - now
-        if self.enable_user_cooldown and wait > 0:
-            return (
-                f"This account's last sign-in was refused. Try again in {int(wait) + 1}s."
-            )
-        if now < self._global_retry_after:
-            return (
-                "The broker is currently refusing logins from this server. "
-                f"Retrying automatically in {int(self._global_retry_after - now) + 1}s."
-            )
         if user_id in self._in_flight:
             return "A sign-in for this account is already running. Give it a moment."
-        return "Too many sign-ins are starting at once. Try again in a few seconds."
+        return "Sign-in in progress. Please wait a moment."
 
 
 class SessionRegistry:

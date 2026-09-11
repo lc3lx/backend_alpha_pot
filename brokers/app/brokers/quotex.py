@@ -137,6 +137,66 @@ def _enum_member(enum_cls: Any, *names: str) -> Any:
     )
 
 
+async def _auto_extract_ssid(email: str, password: str) -> str | None:
+    """Performs automated HTTP login to Quotex via curl_cffi and extracts the SSID session token."""
+    import re
+    from curl_cffi import requests
+    from app.proxy import proxy_url
+
+    proxy = proxy_url()
+    extra: dict[str, Any] = {"impersonate": "chrome120"}
+    if proxy:
+        extra["proxy"] = proxy
+
+    def _sync_flow() -> str | None:
+        s = requests.Session(impersonate="chrome120")
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": "https://qxbroker.com",
+            "Referer": "https://qxbroker.com/en/sign-in",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        }
+        try:
+            r = s.get("https://qxbroker.com/en/sign-in", headers=headers, timeout=20, verify=False, **extra)
+            if r.status_code != 200:
+                return None
+            token_match = re.search(r'name=["\']_token["\']\s+value=["\']([^"\']+)["\']', r.text)
+            if not token_match:
+                token_match = re.search(r'value=["\']([^"\']+)["\']\s+name=["\']_token["\']', r.text)
+            if not token_match:
+                return None
+            csrf_token = token_match.group(1)
+
+            data = {
+                "_token": csrf_token,
+                "email": email,
+                "password": password,
+                "remember": "1",
+            }
+            s.post("https://qxbroker.com/en/sign-in/", data=data, headers=headers, timeout=25, verify=False, **extra)
+
+            for target_url in ["https://qxbroker.com/en/trade", "https://qxbroker.com/trade"]:
+                trade_resp = s.get(target_url, headers=headers, timeout=20, verify=False, **extra)
+                settings_match = re.search(r'window\.settings\s*=\s*({.*?});', trade_resp.text, re.DOTALL)
+                if settings_match:
+                    try:
+                        parsed = json.loads(settings_match.group(1))
+                        token = parsed.get("token")
+                        if token:
+                            return str(token)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return None
+
+    try:
+        return await asyncio.to_thread(_sync_flow)
+    except Exception:
+        return None
+
+
 class QuotexSession(BrokerSession):
     broker = "quotex"
 
@@ -166,6 +226,10 @@ class QuotexSession(BrokerSession):
             raise AuthError("Quotex needs either an SSID or an email/password pair.")
 
         ssid = _normalize_ssid(ssid)
+
+        # Automatically extract SSID from Quotex HTTP login if missing
+        if not ssid and (email and password):
+            ssid = await _auto_extract_ssid(email, password)
 
         cls = _load_client_cls()
         self.lifecycle = LifecycleState.CONNECTING
@@ -200,7 +264,7 @@ class QuotexSession(BrokerSession):
             self._live = QuotexLiveData(client, self._market)
         try:
             if self._live is not None and not ssid:
-                raise AuthError("Quotex requires a browser-captured session before connecting.")
+                raise AuthError("Quotex requires a valid session token. Please check your credentials.")
             connected = await _maybe_await(client.connect())
             if connected is False:
                 raise NotConnected("Quotex connection failed.")
