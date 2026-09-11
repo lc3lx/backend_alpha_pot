@@ -3,6 +3,8 @@ using Microsoft.Extensions.Logging;
 using ScarAlpha.Application.Abstractions;
 using ScarAlpha.Application.Common;
 using ScarAlpha.Binolla.Abstractions;
+using ScarAlpha.Binolla.Models;
+using ScarAlpha.Domain.Enums;
 
 namespace ScarAlpha.Infrastructure.BrokerGateway;
 
@@ -45,7 +47,17 @@ public sealed class BrokerSessionManager : IBrokerSessionManager
             return inner is null ? null : new BinollaBrokerAdapter(inner);
         }
 
-        return _gatewaySessions.TryGetValue(Key(userId, broker), out var client) ? client : null;
+        if (_gatewaySessions.TryGetValue(Key(userId, broker), out var client))
+        {
+            if (client.Lifecycle is SessionLifecycleState.Disconnected or SessionLifecycleState.AuthenticationFailed)
+            {
+                _gatewaySessions.TryRemove(Key(userId, broker), out _);
+                return null;
+            }
+            return client;
+        }
+
+        return null;
     }
 
     public async Task<IBrokerClient> GetOrCreateAsync(

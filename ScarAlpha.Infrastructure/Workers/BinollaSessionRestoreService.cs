@@ -397,15 +397,18 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
         catch (Exception ex)
         {
             _logger.LogWarning(
-                ex, "Session restore: {Broker} reconnect failed for user {UserId}; trying stored credentials", broker, userId);
+                ex, "Session restore: {Broker} reconnect failed for user {UserId}", broker, userId);
 
-            var relogged = await TryCredentialReloginAsync(userId, CancellationToken.None).ConfigureAwait(false);
-            if (relogged)
+            if (broker == Brokers.Binolla)
             {
-                _authFailed.TryRemove(userId, out _);
-                _retryAfterUtc.TryRemove(userId, out _);
-                _credentialFailures.TryRemove(userId, out _);
-                return true;
+                var relogged = await TryCredentialReloginAsync(userId, CancellationToken.None).ConfigureAwait(false);
+                if (relogged)
+                {
+                    _authFailed.TryRemove(userId, out _);
+                    _retryAfterUtc.TryRemove(userId, out _);
+                    _credentialFailures.TryRemove(userId, out _);
+                    return true;
+                }
             }
 
             MarkGatewayRestoreFailed(userId);

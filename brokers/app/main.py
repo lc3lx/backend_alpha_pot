@@ -107,6 +107,19 @@ def _session(user_id: str, broker: str) -> BrokerSession:
     return session
 
 
+def _market_session(user_id: str, broker: str) -> BrokerSession:
+    b_clean = broker.strip().lower()
+    session = registry.get(user_id, b_clean)
+    if session is not None and getattr(session, "transport_connected", False):
+        return session
+    fallback = registry.get_any(b_clean)
+    if fallback is not None:
+        return fallback
+    if session is not None:
+        return session
+    raise HTTPException(status_code=409, detail="No live session; connect first.")
+
+
 def _fail(exc: Exception) -> HTTPException:
     """
     Translate adapter errors into codes the .NET side already understands, so its existing
@@ -278,7 +291,7 @@ async def status(user_id: str, broker: str) -> SessionStatus:
 @app.get("/market/assets", response_model=list[TradingAsset], dependencies=[Guarded])
 async def assets(user_id: str, broker: str) -> list[TradingAsset]:
     try:
-        return await _session(user_id, broker).list_assets()
+        return await _market_session(user_id, broker).list_assets()
     except Exception as exc:
         raise _fail(exc)
 
@@ -288,7 +301,7 @@ async def candles(
     user_id: str, broker: str, asset: str, period_seconds: int = 60, count: int = 200
 ) -> list[Candle]:
     try:
-        return await _session(user_id, broker).get_candles(asset, period_seconds, count)
+        return await _market_session(user_id, broker).get_candles(asset, period_seconds, count)
     except Exception as exc:
         raise _fail(exc)
 
@@ -296,7 +309,7 @@ async def candles(
 @app.get("/market/quote", response_model=Quote | None, dependencies=[Guarded])
 async def quote(user_id: str, broker: str, asset: str) -> Quote | None:
     try:
-        return await _session(user_id, broker).get_quote(asset)
+        return await _market_session(user_id, broker).get_quote(asset)
     except Exception as exc:
         raise _fail(exc)
 
@@ -311,7 +324,7 @@ async def subscribe(
     # subscribe costs the broker a full round trip, and the warm-up worker asks for one
     # pair at a time. Waiting on each turned warming a 25-pair list into a 25-second
     # crawl that blocked an API thread the whole way.
-    session = _session(user_id, broker)
+    session = _market_session(user_id, broker)
 
     async def open_stream() -> None:
         try:
@@ -329,7 +342,7 @@ async def subscribe_sync(
 ) -> dict[str, bool]:
     """Subscribe and wait for it — for a caller that needs the stream open before it acts."""
     try:
-        await _session(user_id, broker).subscribe(asset, period_seconds)
+        await _market_session(user_id, broker).subscribe(asset, period_seconds)
         return {"ok": True}
     except Exception as exc:
         raise _fail(exc)

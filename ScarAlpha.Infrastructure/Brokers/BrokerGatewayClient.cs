@@ -489,6 +489,12 @@ public sealed class BrokerGatewayClient : IBrokerClient
     {
         var detail = await SafeReadAsync(response, ct).ConfigureAwait(false);
 
+        if (response.StatusCode is HttpStatusCode.Conflict or HttpStatusCode.Unauthorized)
+        {
+            Lifecycle = SessionLifecycleState.Disconnected;
+            IsTransportConnected = false;
+        }
+
         return response.StatusCode switch
         {
             // 428: a human check. Intermittent — the caller should retry, not tell the

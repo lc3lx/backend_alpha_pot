@@ -118,6 +118,17 @@ class SessionRegistry:
     def get(self, user_id: str, broker: str) -> BrokerSession | None:
         return self._sessions.get((user_id, broker))
 
+    def get_any(self, broker: str) -> BrokerSession | None:
+        b_clean = broker.strip().lower()
+        # Prefer transport-connected sessions
+        for (u, b), s in self._sessions.items():
+            if b == b_clean and getattr(s, "transport_connected", False):
+                return s
+        for (u, b), s in self._sessions.items():
+            if b == b_clean:
+                return s
+        return None
+
     async def put(self, session: BrokerSession) -> None:
         async with self._lock:
             if len(self._sessions) >= self._max_sessions:

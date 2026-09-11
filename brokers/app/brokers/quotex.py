@@ -653,6 +653,13 @@ class QuotexSession(BrokerSession):
                 closed_at=time.time(),
             )
         except Exception as exc:
+            if "not found" in str(exc).lower():
+                return Outcome(
+                    order_id=order_id,
+                    result=TradeResult.UNKNOWN,
+                    profit_loss=0.0,
+                    closed_at=time.time(),
+                )
             raise _translate(exc)
 
         pnl = _num(_attr(trade, "profit")) or 0.0
