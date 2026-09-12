@@ -291,6 +291,8 @@ class QuotexLiveData:
             return Balance(real=real, demo=demo, current_type=account_type)
 
     async def list_assets(self):
+        if self.assets:
+            return list(self.assets)
         self.require_connected()
         async with self.asset_lock:
             if self.assets and (time.monotonic() - self.assets_at < 60):
@@ -317,6 +319,9 @@ class QuotexLiveData:
         key = (asset, period)
         self.periods.add(key)
         try:
+            ws = getattr(self.connection, "_ws", None)
+            if ws is None or not getattr(ws, "is_connected", lambda: False)():
+                return
             formatted = asset if asset.endswith("_otc") else f"{asset}_otc"
             await self.send_event("depth/follow", formatted)
             if formatted != asset:

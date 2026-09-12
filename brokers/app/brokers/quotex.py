@@ -224,19 +224,7 @@ class QuotexSession(BrokerSession):
         self._email: str | None = None
         self._password: str | None = None
         self._last_balance: Balance | None = None
-
-    async def _ensure_connected(self) -> None:
-        if not self.transport_connected and (self.ssid or (self._email and self._password)):
-            _log("Quotex transport dropped; attempting auto-reconnect...")
-            try:
-                await self.connect(
-                    ssid=self.ssid,
-                    email=self._email,
-                    password=self._password,
-                    account_type=self.account_type,
-                )
-            except Exception as e:
-                _log(f"Quotex auto-reconnect attempt failed: {e}")
+        self._connect_lock = asyncio.Lock()
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -248,97 +236,103 @@ class QuotexSession(BrokerSession):
         password: str | None = None,
         account_type: AccountType = AccountType.REAL,
     ) -> None:
-        if not ssid and not (email and password):
-            raise AuthError("Quotex needs either an SSID or an email/password pair.")
+        async with self._connect_lock:
+            if self.transport_connected and self._client is not None:
+                if self.account_type != account_type:
+                    await self.change_account(account_type)
+                return
 
-        ssid = _normalize_ssid(ssid)
+            if not ssid and not (email and password):
+                raise AuthError("Quotex needs either an SSID or an email/password pair.")
 
-        # Automatically extract SSID from Quotex HTTP login if missing
-        if not ssid and (email and password):
-            ssid = await _auto_extract_ssid(email, password)
+            ssid = _normalize_ssid(ssid)
 
-        cls = _load_client_cls()
-        self.lifecycle = LifecycleState.CONNECTING
+            # Automatically extract SSID from Quotex HTTP login if missing
+            if not ssid and (email and password):
+                ssid = await _auto_extract_ssid(email, password)
 
-        # Before the client is constructed, not after: its transport reads the proxy from
-        # the environment when it builds its session, and there is no object to set it on
-        # afterwards.
-        configure_process_proxy()
-        install_websocket_transport()
+            cls = _load_client_cls()
+            self.lifecycle = LifecycleState.CONNECTING
 
-        # The balance is chosen in the constructor, before the socket exists. Switching
-        # after the handshake races the broker's own setup and can leave the session on
-        # the other balance while the API reports this one.
-        client = cls(
-            email=email or None,
-            password=password or None,
-            ssid=ssid or None,
-            is_demo=account_type is AccountType.DEMO,
-        )
+            # Before the client is constructed, not after: its transport reads the proxy from
+            # the environment when it builds its session, and there is no object to set it on
+            # afterwards.
+            configure_process_proxy()
+            install_websocket_transport()
 
-        # Belt and braces for builds that DO expose a proxy attribute. The environment
-        # above is what actually carries it for this library.
-        url = proxy_url()
-        if url:
-            _apply_proxy(client, {"http": url, "https": url})
+            # The balance is chosen in the constructor, before the socket exists. Switching
+            # after the handshake races the broker's own setup and can leave the session on
+            # the other balance while the API reports this one.
+            client = cls(
+                email=email or None,
+                password=password or None,
+                ssid=ssid or None,
+                is_demo=account_type is AccountType.DEMO,
+            )
 
-        self._client = client
-        self.account_type = account_type
-        self.ssid = ssid
-        if email:
-            self._email = email
-        if password:
-            self._password = password
-        if hasattr(client, "config"):
-            try:
-                client.config.is_demo = (account_type is AccountType.DEMO)
-            except Exception:
-                pass
-        connection = getattr(client, "connection", None)
-        if connection is not None and hasattr(connection, "_route_socketio_event"):
-            self._live = QuotexLiveData(client, self._market)
-        try:
-            if self._live is not None and not ssid:
-                raise AuthError("Quotex requires a valid session token. Please check your credentials.")
-            connected = await _maybe_await(client.connect())
-            if connected is False:
-                raise NotConnected("Quotex connection failed.")
-            if self._live is not None:
+            # Belt and braces for builds that DO expose a proxy attribute. The environment
+            # above is what actually carries it for this library.
+            url = proxy_url()
+            if url:
+                _apply_proxy(client, {"http": url, "https": url})
+
+            self._client = client
+            self.account_type = account_type
+            self.ssid = ssid
+            if email:
+                self._email = email
+            if password:
+                self._password = password
+            if hasattr(client, "config"):
                 try:
-                    await self._live.authenticate(ssid, account_type)
-                except AuthError:
-                    if email and password:
-                        new_ssid = await _auto_extract_ssid(email, password)
-                        if new_ssid:
-                            self.ssid = ssid = new_ssid
-                            await self._live.authenticate(ssid, account_type)
+                    client.config.is_demo = (account_type is AccountType.DEMO)
+                except Exception:
+                    pass
+            connection = getattr(client, "connection", None)
+            if connection is not None and hasattr(connection, "_route_socketio_event"):
+                self._live = QuotexLiveData(client, self._market)
+            try:
+                if self._live is not None and not ssid:
+                    raise AuthError("Quotex requires a valid session token. Please check your credentials.")
+                connected = await _maybe_await(client.connect())
+                if connected is False:
+                    raise NotConnected("Quotex connection failed.")
+                if self._live is not None:
+                    try:
+                        await self._live.authenticate(ssid, account_type)
+                    except AuthError:
+                        if email and password:
+                            new_ssid = await _auto_extract_ssid(email, password)
+                            if new_ssid:
+                                self.ssid = ssid = new_ssid
+                                await self._live.authenticate(ssid, account_type)
+                            else:
+                                raise
                         else:
                             raise
-                    else:
-                        raise
-                try:
-                    await self._live.get_balance(account_type)
-                except Exception as b_exc:
-                    _log(f"non-fatal balance fetch on connect: {b_exc}")
-            else:
-                if hasattr(client, "login_with_ssid") or hasattr(client, "login_with_email"):
-                    if not await self._explicit_login(client, ssid, email, password):
-                        raise AuthError("Quotex authentication failed.")
-                try:
-                    await _maybe_await(client.get_balance())
-                except Exception as b_exc:
-                    _log(f"non-fatal balance fetch on connect: {b_exc}")
-        except BaseException as exc:
-            await self.disconnect()
-            self.lifecycle = LifecycleState.AUTH_FAILED if isinstance(exc, AuthError) else LifecycleState.FAULTED
-            if isinstance(exc, asyncio.CancelledError):
-                raise
-            if isinstance(exc, BrokerError):
-                raise
-            raise _translate(exc) from exc
+                    try:
+                        await self._live.get_balance(account_type)
+                    except Exception as b_exc:
+                        _log(f"non-fatal balance fetch on connect: {b_exc}")
+                else:
+                    if hasattr(client, "login_with_ssid") or hasattr(client, "login_with_email"):
+                        if not await self._explicit_login(client, ssid, email, password):
+                            raise AuthError("Quotex authentication failed.")
+                    try:
+                        await _maybe_await(client.get_balance())
+                    except Exception as b_exc:
+                        _log(f"non-fatal balance fetch on connect: {b_exc}")
+            except BaseException as exc:
+                await self.disconnect()
+                self.lifecycle = LifecycleState.AUTH_FAILED if isinstance(exc, AuthError) else LifecycleState.FAULTED
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                if isinstance(exc, BrokerError):
+                    raise
+                raise _translate(exc) from exc
 
-        self._data = _find_data_service(client)
-        self.lifecycle = LifecycleState.CONNECTED
+            self._data = _find_data_service(client)
+            self.lifecycle = LifecycleState.CONNECTED
 
     async def _explicit_login(
         self, client: Any, ssid: str | None, email: str | None, password: str | None
@@ -383,18 +377,21 @@ class QuotexSession(BrokerSession):
 
     @property
     def transport_connected(self) -> bool:
-        if self._client is None:
+        if self._client is None or self.lifecycle != LifecycleState.CONNECTED:
             return False
         try:
+            connected = getattr(self._client, "is_connected", None)
+            if connected is not None:
+                is_conn = bool(connected() if callable(connected) else connected)
+                if not is_conn:
+                    return False
             connection = getattr(self._client, "connection", None)
             if connection is not None and hasattr(connection, "_ws"):
                 ws = connection._ws
-                if ws is None or not ws.is_connected():
-                    return False
-            connected = getattr(self._client, "is_connected", None)
-            if connected is None:
-                return True
-            return bool(connected() if callable(connected) else connected)
+                if ws is not None and hasattr(ws, "is_connected"):
+                    if not ws.is_connected():
+                        return False
+            return True
         except Exception:
             return False
 
@@ -412,7 +409,6 @@ class QuotexSession(BrokerSession):
         return "polling"
 
     async def get_balance(self) -> Balance:
-        await self._ensure_connected()
         client = self._client
         if client is None:
             if self._last_balance is not None:
@@ -511,7 +507,6 @@ class QuotexSession(BrokerSession):
     # ---- market data -------------------------------------------------------
 
     async def list_assets(self) -> list[TradingAsset]:
-        await self._ensure_connected()
         client = self._require()
         if self._live is not None:
             return await self._live.list_assets()
@@ -581,7 +576,6 @@ class QuotexSession(BrokerSession):
         return Quote(asset=asset, timestamp=ts, price=price)
 
     async def subscribe(self, asset: str, period_seconds: int = 60) -> None:
-        await self._ensure_connected()
         client = self._require()
         key = (asset, period_seconds)
 
@@ -656,7 +650,6 @@ class QuotexSession(BrokerSession):
     async def place_order(
         self, asset: str, amount: float, duration_seconds: int, direction: str
     ) -> OrderResponse:
-        await self._ensure_connected()
         client = self._require()
         enums = _enums()
         side = (

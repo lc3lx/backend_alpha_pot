@@ -801,16 +801,44 @@ public sealed class BinollaAppService
 
         var captured = await CaptureGatewaySessionAsync(userId, broker, link, request, ct);
 
-        var client = await _brokers.GetOrCreateAsync(
-            userId,
-            broker,
-            new BrokerCredentials(
-                Ssid: captured?.SsidFrame,
-                CookieHeader: captured?.CookieHeader,
-                Email: request.Email.Trim(),
-                Password: request.Password,
-                AccountType: engineType),
-            ct);
+        IBrokerClient client;
+        try
+        {
+            client = await _brokers.GetOrCreateAsync(
+                userId,
+                broker,
+                new BrokerCredentials(
+                    Ssid: captured?.SsidFrame,
+                    CookieHeader: captured?.CookieHeader,
+                    Email: request.Email.Trim(),
+                    Password: request.Password,
+                    AccountType: engineType),
+                ct);
+        }
+        catch (Exception ex) when (broker == Brokers.Quotex && captured is not null && !string.IsNullOrWhiteSpace(link.EncryptedSsid))
+        {
+            _logger.LogWarning(ex, "Connecting with stored SSID failed for {UserId} on {Broker}. Clearing stale SSID and capturing fresh session with headless browser...", userId, broker);
+            link.EncryptedSsid = null;
+            link.EncryptedCookieHeader = null;
+            await _links.UpsertAsync(link, ct);
+
+            using var workCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            workCts.CancelAfter(TimeSpan.FromMinutes(2));
+            captured = await _credentialAuth.LoginAsync(
+                broker, request.Email, request.Password, request.PinCode, workCts.Token);
+            _restorer.ClearAuthFailure(userId);
+
+            client = await _brokers.GetOrCreateAsync(
+                userId,
+                broker,
+                new BrokerCredentials(
+                    Ssid: captured?.SsidFrame,
+                    CookieHeader: captured?.CookieHeader,
+                    Email: request.Email.Trim(),
+                    Password: request.Password,
+                    AccountType: engineType),
+                ct);
+        }
 
         link.Broker = broker;
         link.AccountType = accountType;

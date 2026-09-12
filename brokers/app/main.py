@@ -330,7 +330,10 @@ async def subscribe(
     # subscribe costs the broker a full round trip, and the warm-up worker asks for one
     # pair at a time. Waiting on each turned warming a 25-pair list into a 25-second
     # crawl that blocked an API thread the whole way.
-    session = _market_session(user_id, broker)
+    try:
+        session = _market_session(user_id, broker)
+    except HTTPException:
+        return {"ok": False}
 
     async def open_stream() -> None:
         try:
