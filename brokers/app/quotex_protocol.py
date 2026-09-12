@@ -241,7 +241,27 @@ class QuotexLiveData:
             raise self.auth_error
 
     async def get_balance(self, account_type):
-        self.require_connected()
+        ws = getattr(self.connection, "_ws", None)
+        is_conn = ws is not None and getattr(ws, "is_connected", lambda: False)()
+        if not is_conn:
+            if self.balances is not None:
+                real, demo = self.balances
+                return Balance(real=real, demo=demo, current_type=account_type)
+            if hasattr(self.client, "account"):
+                acc_balances = getattr(self.client.account, "_balances", None)
+                if acc_balances:
+                    real = 0.0
+                    demo_val = 10000.0
+                    for b in acc_balances:
+                        act = str(getattr(b, "account_type", "")).upper()
+                        amt = float(getattr(b, "amount", 0.0) or 0.0)
+                        if "REAL" in act:
+                            real = amt
+                        elif "DEMO" in act:
+                            demo_val = amt
+                    return Balance(real=real, demo=demo_val, current_type=account_type)
+            raise NotConnected("Quotex transport disconnected.")
+
         async with self.balance_lock:
             if self.balances is None or time.monotonic() - self.balance_at >= 15:
                 self.balance_ready.clear()

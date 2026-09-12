@@ -66,7 +66,7 @@ public sealed class MeAppService
                     ? nameof(BinollaLinkStatus.Connected)
                     : (link?.Status.ToString() ?? nameof(BinollaLinkStatus.Disconnected)),
                 LastConnectedAt: link?.LastConnectedAt,
-                Balance: null,
+                Balance: BinollaAppService.TryGetLastKnownBalance(user.Id)?.CurrentBalance,
                 Lifecycle: client?.Lifecycle.ToString() ?? "None",
                 WebSocketConnected: liveConnected,
                 Broker: broker);

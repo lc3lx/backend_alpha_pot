@@ -221,6 +221,22 @@ class QuotexSession(BrokerSession):
         self._subscribed: set[tuple[str, int]] = set()
         #: The session this connection was authenticated with, if any.
         self.ssid: str | None = None
+        self._email: str | None = None
+        self._password: str | None = None
+        self._last_balance: Balance | None = None
+
+    async def _ensure_connected(self) -> None:
+        if not self.transport_connected and (self.ssid or (self._email and self._password)):
+            _log("Quotex transport dropped; attempting auto-reconnect...")
+            try:
+                await self.connect(
+                    ssid=self.ssid,
+                    email=self._email,
+                    password=self._password,
+                    account_type=self.account_type,
+                )
+            except Exception as e:
+                _log(f"Quotex auto-reconnect attempt failed: {e}")
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -269,6 +285,10 @@ class QuotexSession(BrokerSession):
         self._client = client
         self.account_type = account_type
         self.ssid = ssid
+        if email:
+            self._email = email
+        if password:
+            self._password = password
         if hasattr(client, "config"):
             try:
                 client.config.is_demo = (account_type is AccountType.DEMO)
@@ -392,14 +412,22 @@ class QuotexSession(BrokerSession):
         return "polling"
 
     async def get_balance(self) -> Balance:
-        client = self._require()
+        await self._ensure_connected()
+        client = self._client
+        if client is None:
+            if self._last_balance is not None:
+                return self._last_balance
+            raise NotConnected("Quotex session is not connected.")
+
         if self._live is not None:
             try:
                 bal = await self._live.get_balance(self.account_type)
-                if bal.real > 0 or self.account_type is AccountType.DEMO:
+                if bal.real > 0 or self.account_type is AccountType.DEMO or self._live.balances is not None:
+                    self._last_balance = bal
                     return bal
-            except Exception:
-                pass
+            except Exception as ex:
+                _log(f"live get_balance fallback: {ex}")
+
         enums = _enums()
         demo_type = _enum_member(enums.AccountType, "DEMO", "PRACTICE")
 
@@ -423,12 +451,23 @@ class QuotexSession(BrokerSession):
                 seen = False
 
         if not seen:
-            current = await _maybe_await(client.get_balance())
-            amount = float(getattr(current, "amount", current) or 0.0)
-            if self.account_type is AccountType.DEMO:
-                demo = amount
-            else:
-                real = amount
+            try:
+                current = await _maybe_await(client.get_balance())
+                amount = float(getattr(current, "amount", current) or 0.0)
+                if self.account_type is AccountType.DEMO:
+                    demo = amount
+                else:
+                    real = amount
+                seen = True
+            except Exception:
+                pass
+
+        if seen:
+            self._last_balance = Balance(demo=demo, real=real, current_type=self.account_type)
+            return self._last_balance
+
+        if self._last_balance is not None:
+            return self._last_balance
 
         return Balance(demo=demo, real=real, current_type=self.account_type)
 
@@ -472,6 +511,7 @@ class QuotexSession(BrokerSession):
     # ---- market data -------------------------------------------------------
 
     async def list_assets(self) -> list[TradingAsset]:
+        await self._ensure_connected()
         client = self._require()
         if self._live is not None:
             return await self._live.list_assets()
@@ -541,6 +581,7 @@ class QuotexSession(BrokerSession):
         return Quote(asset=asset, timestamp=ts, price=price)
 
     async def subscribe(self, asset: str, period_seconds: int = 60) -> None:
+        await self._ensure_connected()
         client = self._require()
         key = (asset, period_seconds)
 
@@ -615,6 +656,7 @@ class QuotexSession(BrokerSession):
     async def place_order(
         self, asset: str, amount: float, duration_seconds: int, direction: str
     ) -> OrderResponse:
+        await self._ensure_connected()
         client = self._require()
         enums = _enums()
         side = (

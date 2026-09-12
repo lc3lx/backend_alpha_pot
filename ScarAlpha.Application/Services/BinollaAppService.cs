@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 using ScarAlpha.Application.Abstractions;
 using ScarAlpha.Application.Common;
@@ -25,6 +26,33 @@ public sealed class BinollaAppService
     private readonly IMarketingDemoService _demo;
     private readonly IUserRepository _users;
     private readonly ILogger<BinollaAppService> _logger;
+
+    private static readonly ConcurrentDictionary<Guid, BinollaBalanceDto> _lastKnownBalances = new();
+
+    public static void RecordLastKnownBalance(Guid userId, string accountType, decimal? balance)
+    {
+        if (balance is null or <= 0m) return;
+        var isDemo = accountType.Equals("Demo", StringComparison.OrdinalIgnoreCase);
+        _lastKnownBalances.AddOrUpdate(userId,
+            _ => new BinollaBalanceDto(
+                Connected: true,
+                AccountType: accountType,
+                DemoBalance: isDemo ? balance.Value : 0m,
+                RealBalance: isDemo ? 0m : balance.Value,
+                CurrentBalance: balance.Value),
+            (_, existing) => new BinollaBalanceDto(
+                Connected: true,
+                AccountType: accountType,
+                DemoBalance: isDemo ? balance.Value : existing.DemoBalance,
+                RealBalance: isDemo ? existing.RealBalance : balance.Value,
+                CurrentBalance: balance.Value)
+        );
+    }
+
+    public static BinollaBalanceDto? TryGetLastKnownBalance(Guid userId)
+    {
+        return _lastKnownBalances.TryGetValue(userId, out var b) ? b : null;
+    }
 
     public BinollaAppService(
         ICurrentUser currentUser,
@@ -387,6 +415,7 @@ public sealed class BinollaAppService
             {
                 using var balCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
                 balanceValue = (await client.GetBalanceAsync(balCts.Token)).CurrentBalance;
+                RecordLastKnownBalance(userId, accountType.ToString(), balanceValue);
             }
             catch
             {
@@ -621,12 +650,17 @@ public sealed class BinollaAppService
 
         if (client is null)
         {
+            if (_lastKnownBalances.TryGetValue(_currentUser.UserId, out var cached))
+            {
+                return cached with { Connected = false };
+            }
+
             // Background restore still warming — never 500 the shell.
             return new BinollaBalanceDto(
                 Connected: false,
                 // Placeholder while the session warms. Live is the product default, so a
                 // hardcoded "Demo" here would tell a live user they are on demo money.
-                AccountType: nameof(DomainAccount.Real),
+                AccountType: (link?.AccountType ?? DomainAccount.Real).ToString(),
                 DemoBalance: 0m,
                 RealBalance: 0m,
                 CurrentBalance: 0m);
@@ -639,12 +673,19 @@ public sealed class BinollaAppService
             var accountType = balance.CurrentType == EngineAccount.Real ? "Real" : "Demo";
             var current =
                 balance.CurrentType == EngineAccount.Real ? balance.RealBalance : balance.DemoBalance;
-            return new BinollaBalanceDto(
+            var dto = new BinollaBalanceDto(
                 Connected: true,
                 AccountType: accountType,
                 DemoBalance: balance.DemoBalance,
                 RealBalance: balance.RealBalance,
                 CurrentBalance: current);
+
+            if (current > 0 || balance.DemoBalance > 0 || balance.RealBalance > 0)
+            {
+                _lastKnownBalances[_currentUser.UserId] = dto;
+            }
+
+            return dto;
         }
         catch (BinollaAuthenticationException)
         {
@@ -655,6 +696,10 @@ public sealed class BinollaAppService
             _logger.LogInformation(
                 "Binolla balance not ready for user {UserId}; returning placeholder ({Error})",
                 _currentUser.UserId, ex.GetType().Name);
+            if (_lastKnownBalances.TryGetValue(_currentUser.UserId, out var cached))
+            {
+                return cached with { Connected = false };
+            }
             return new BinollaBalanceDto(
                 Connected: false,
                 AccountType: (link?.AccountType ?? DomainAccount.Real).ToString(),
@@ -665,6 +710,10 @@ public sealed class BinollaAppService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Balance fetch failed for user {UserId}", _currentUser.UserId);
+            if (_lastKnownBalances.TryGetValue(_currentUser.UserId, out var cached))
+            {
+                return cached with { Connected = false };
+            }
             return new BinollaBalanceDto(
                 Connected: false,
                 AccountType: (link?.AccountType ?? DomainAccount.Real).ToString(),
