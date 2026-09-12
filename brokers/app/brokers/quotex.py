@@ -54,6 +54,11 @@ from app.models import (
     TradingAsset,
 )
 
+
+def _log(message: str) -> None:
+    print(f"[Quotex] {message}", flush=True)
+
+
 #: Where the client class has been found to live, newest layout first.
 #:
 #: The library is vendored from git rather than PyPI, so its import path is whatever that
@@ -264,6 +269,11 @@ class QuotexSession(BrokerSession):
         self._client = client
         self.account_type = account_type
         self.ssid = ssid
+        if hasattr(client, "config"):
+            try:
+                client.config.is_demo = (account_type is AccountType.DEMO)
+            except Exception:
+                pass
         connection = getattr(client, "connection", None)
         if connection is not None and hasattr(connection, "_route_socketio_event"):
             self._live = QuotexLiveData(client, self._market)
@@ -381,12 +391,15 @@ class QuotexSession(BrokerSession):
             return "websocket"
         return "polling"
 
-    # ---- account -----------------------------------------------------------
-
     async def get_balance(self) -> Balance:
         client = self._require()
         if self._live is not None:
-            return await self._live.get_balance(self.account_type)
+            try:
+                bal = await self._live.get_balance(self.account_type)
+                if bal.real > 0 or self.account_type is AccountType.DEMO:
+                    return bal
+            except Exception:
+                pass
         enums = _enums()
         demo_type = _enum_member(enums.AccountType, "DEMO", "PRACTICE")
 
@@ -424,6 +437,11 @@ class QuotexSession(BrokerSession):
         if account_type is self.account_type:
             return
         self.account_type = account_type
+        if hasattr(client, "config"):
+            try:
+                client.config.is_demo = (account_type is AccountType.DEMO)
+            except Exception:
+                pass
         if self._live is not None:
             if self.ssid:
                 try:

@@ -250,6 +250,20 @@ class QuotexLiveData:
                     await asyncio.wait_for(self.balance_ready.wait(), 1.5)
                 except (asyncio.TimeoutError, Exception):
                     pass
+            if (self.balances is None or self.balances == (0.0, 10000.0)) and hasattr(self.client, "account"):
+                acc_balances = getattr(self.client.account, "_balances", None)
+                if acc_balances:
+                    real = 0.0
+                    demo_val = 10000.0
+                    for b in acc_balances:
+                        act = str(getattr(b, "account_type", "")).upper()
+                        amt = float(getattr(b, "amount", 0.0) or 0.0)
+                        if "REAL" in act:
+                            real = amt
+                        elif "DEMO" in act:
+                            demo_val = amt
+                    self.balances = (real, demo_val)
+                    self.balance_at = time.monotonic()
             if self.balances is None:
                 self.balances = (0.0, 10000.0)
                 self.balance_at = time.monotonic()
