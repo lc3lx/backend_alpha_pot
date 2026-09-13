@@ -105,7 +105,7 @@ public interface IBinollaSessionManager : IAsyncDisposable
 public sealed class BinollaSessionManagerOptions
 {
     /// <summary>Maximum simultaneous user sessions hosted in-process.</summary>
-    public int MaxConcurrentSessions { get; set; } = 50;
+    public int MaxConcurrentSessions { get; set; } = 5000;
 
     /// <summary>Idle sessions older than this are evicted.</summary>
     public TimeSpan IdleTimeout { get; set; } = TimeSpan.FromMinutes(30);

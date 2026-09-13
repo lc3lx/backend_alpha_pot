@@ -524,14 +524,14 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
 
             if (wasLoss)
             {
-                // Bench the pair so the bot stops re-entering a setup the market just
-                // punished. Strategy-wide, so every account benches it together.
+                // Bench the pair for this user so their bot stops re-entering a setup the market just
+                // punished, without interfering with other users' bots.
                 var strategyId = PairCooldownRegistry.StrategyFromBotKey(trade.IdempotencyKey);
-                PairCooldownRegistry.RecordLoss(strategyId, trade.Asset, DateTimeOffset.UtcNow);
+                PairCooldownRegistry.RecordLoss(trade.UserId, strategyId, trade.Asset, DateTimeOffset.UtcNow);
 
                 _logger.LogInformation(
-                    "Pair benched after loss strategy={Strategy} asset={Asset} forSeconds={Seconds}",
-                    strategyId, trade.Asset, PairCooldownRegistry.CooldownSeconds);
+                    "Pair benched after loss userId={UserId} strategy={Strategy} asset={Asset} forSeconds={Seconds}",
+                    trade.UserId, strategyId, trade.Asset, PairCooldownRegistry.CooldownSeconds);
             }
         }
 

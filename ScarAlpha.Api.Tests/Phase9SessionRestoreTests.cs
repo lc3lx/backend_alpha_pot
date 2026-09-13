@@ -1,4 +1,4 @@
-﻿using System.Net.Http.Headers;
+using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
 using FluentAssertions;
@@ -129,7 +129,7 @@ public sealed class Phase9SessionRestoreTests : IClassFixture<ApiFactory>
         // Reset mock for other tests sharing the factory.
         _factory.SessionManager
             .Setup(m => m.GetOrCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>(), It.IsAny<AccountType>()))
-            .ReturnsAsync((string userId, string _, CancellationToken _, string? __) =>
+            .ReturnsAsync((string userId, string _, CancellationToken _, string? __, AccountType ___) =>
             {
                 _factory.ConnectedUsers[userId] = 1;
                 return _factory.Client.Object;
@@ -164,7 +164,7 @@ public sealed class Phase9SessionRestoreTests : IClassFixture<ApiFactory>
 
         _factory.SessionManager
             .Setup(m => m.GetOrCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>(), It.IsAny<AccountType>()))
-            .ReturnsAsync((string uid, string _, CancellationToken _, string? __) =>
+            .ReturnsAsync((string uid, string _, CancellationToken _, string? __, AccountType ___) =>
             {
                 _factory.ConnectedUsers[uid] = 1;
                 return _factory.Client.Object;

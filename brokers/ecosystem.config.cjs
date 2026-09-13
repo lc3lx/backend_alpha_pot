@@ -30,7 +30,7 @@ module.exports = {
       exec_mode: 'fork',
       autorestart: true,
       watch: false,
-      max_memory_restart: '512M',
+      max_memory_restart: '1024M',
       kill_timeout: 8000,
       exp_backoff_restart_delay: 2000,
       error_file: path.join(__dirname, 'logs', 'pm2-error.log'),

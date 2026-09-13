@@ -47,7 +47,7 @@ public sealed class BotSignalWorker : IHostedService
     /// How many users are handed the decision at once. This is pure per-user bookkeeping
     /// plus one order placement, so it can be far wider than the scan.
     /// </summary>
-    private const int FanOutParallelism = 16;
+    private const int FanOutParallelism = 64;
 
     /// <summary>
     /// How many users may be tried as the scan's data source before the bar is given up
@@ -409,11 +409,9 @@ public sealed class BotSignalWorker : IHostedService
                 .ToList());
         if (assets.Count == 0) return null;
 
-        // A pair the strategy just lost on sits out its cooldown. Filtering here rather
-        // than per user keeps the benched set identical for the whole cohort.
-        var benchAt = DateTimeOffset.UtcNow;
+        // Scan all assets followed by cohort members. Per-user pair cooldowns are evaluated
+        // individually when picking the trade in ExecuteForBotAsync.
         var ordered = assets
-            .Where(a => !PairCooldownRegistry.IsBenched(cohort.StrategyId, a, benchAt))
             .OrderBy(a => a, StringComparer.OrdinalIgnoreCase)
             .ToList();
         if (ordered.Count == 0) return null;
@@ -572,7 +570,7 @@ public sealed class BotSignalWorker : IHostedService
         if (OpenTradeGate.IsUserHeld(userId) || ct.IsCancellationRequested)
             return false;
 
-        var pick = SelectForBot(bot.ResolvedAssets, decision);
+        var pick = SelectForBot(bot.ResolvedAssets, decision, userId, bot.StrategyId);
         if (pick is null) return false;
 
         // Re-checked here rather than at scan time: the decision is shared, but its TTL
@@ -674,15 +672,20 @@ public sealed class BotSignalWorker : IHostedService
     /// </summary>
     internal static CohortCandidate? SelectForBot(
         IReadOnlyList<string> selectedAssets,
-        CohortDecision decision)
+        CohortDecision decision,
+        Guid? userId = null,
+        string? strategyId = null)
     {
         if (decision.Candidates.Count == 0) return null;
 
-        // An empty selection means the bot follows whatever the cohort scanned.
-        if (selectedAssets.Count == 0) return decision.Candidates[0];
+        var selected = selectedAssets.Count > 0
+            ? new HashSet<string>(selectedAssets, StringComparer.OrdinalIgnoreCase)
+            : null;
 
-        var selected = new HashSet<string>(selectedAssets, StringComparer.OrdinalIgnoreCase);
-        return decision.Candidates.FirstOrDefault(c => selected.Contains(c.Asset));
+        var now = DateTimeOffset.UtcNow;
+        return decision.Candidates.FirstOrDefault(c =>
+            (selected == null || selected.Contains(c.Asset))
+            && (!userId.HasValue || !PairCooldownRegistry.IsBenched(userId.Value, strategyId, c.Asset, now)));
     }
 
     private static bool IsLiveSetup(StrategySignal signal, string? botStrategyId = null) =>

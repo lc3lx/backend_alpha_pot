@@ -42,12 +42,22 @@ try
         });
     });
 
-    var tradePermitLimit = builder.Configuration.GetValue("RateLimiting:Trades:PermitLimit", 30);
+    var tradePermitLimit = builder.Configuration.GetValue("RateLimiting:Trades:PermitLimit", 100);
     var tradeWindowSeconds = builder.Configuration.GetValue("RateLimiting:Trades:WindowSeconds", 60);
-    var authPermitLimit = builder.Configuration.GetValue("RateLimiting:Auth:PermitLimit", 20);
+    var authPermitLimit = builder.Configuration.GetValue("RateLimiting:Auth:PermitLimit", 100);
     var authWindowSeconds = builder.Configuration.GetValue("RateLimiting:Auth:WindowSeconds", 60);
-    var connectPermitLimit = builder.Configuration.GetValue("RateLimiting:Connect:PermitLimit", 10);
+    var connectPermitLimit = builder.Configuration.GetValue("RateLimiting:Connect:PermitLimit", 50);
     var connectWindowSeconds = builder.Configuration.GetValue("RateLimiting:Connect:WindowSeconds", 60);
+
+    static string GetClientIp(HttpContext ctx)
+    {
+        if (ctx.Request.Headers.TryGetValue("X-Forwarded-For", out var fwd) && !string.IsNullOrWhiteSpace(fwd))
+        {
+            var first = fwd.ToString().Split(',')[0].Trim();
+            if (!string.IsNullOrWhiteSpace(first)) return first;
+        }
+        return ctx.Connection.RemoteIpAddress?.ToString() ?? "anon";
+    }
 
     builder.Services.AddRateLimiter(options =>
     {
@@ -59,7 +69,7 @@ try
                 new { code = ApiErrorCodes.RateLimited, message = "Too many requests. Try again later." },
                 token);
             Log.Information("Rate limited request from {RemoteIp} path={Path}",
-                context.HttpContext.Connection.RemoteIpAddress?.ToString(),
+                GetClientIp(context.HttpContext),
                 context.HttpContext.Request.Path.Value);
         };
         options.AddPolicy("trades", httpContext =>
@@ -70,8 +80,7 @@ try
             var partitionKey =
                 httpContext.User?.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value
                 ?? httpContext.User?.FindFirst("sub")?.Value
-                ?? httpContext.Connection.RemoteIpAddress?.ToString()
-                ?? "anon";
+                ?? GetClientIp(httpContext);
 
             return RateLimitPartition.GetFixedWindowLimiter(
                 partitionKey,
@@ -87,7 +96,7 @@ try
             var config = httpContext.RequestServices.GetRequiredService<IConfiguration>();
             var permit = config.GetValue("RateLimiting:Auth:PermitLimit", authPermitLimit);
             var windowSec = config.GetValue("RateLimiting:Auth:WindowSeconds", authWindowSeconds);
-            var partitionKey = httpContext.Connection.RemoteIpAddress?.ToString() ?? "anon";
+            var partitionKey = GetClientIp(httpContext);
             return RateLimitPartition.GetFixedWindowLimiter(
                 partitionKey,
                 _ => new FixedWindowRateLimiterOptions
@@ -105,8 +114,7 @@ try
             var partitionKey =
                 httpContext.User?.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value
                 ?? httpContext.User?.FindFirst("sub")?.Value
-                ?? httpContext.Connection.RemoteIpAddress?.ToString()
-                ?? "anon";
+                ?? GetClientIp(httpContext);
             return RateLimitPartition.GetFixedWindowLimiter(
                 partitionKey,
                 _ => new FixedWindowRateLimiterOptions
@@ -119,6 +127,12 @@ try
     });
 
     var app = builder.Build();
+
+    app.UseForwardedHeaders(new ForwardedHeadersOptions
+    {
+        ForwardedHeaders = Microsoft.AspNetCore.HttpOverrides.ForwardedHeaders.XForwardedFor |
+                           Microsoft.AspNetCore.HttpOverrides.ForwardedHeaders.XForwardedProto
+    });
 
     ValidateProductionSecrets(app);
 

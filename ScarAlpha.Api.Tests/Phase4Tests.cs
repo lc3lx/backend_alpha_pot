@@ -1,4 +1,4 @@
-﻿using System.Net;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
@@ -60,6 +60,7 @@ public sealed class PendingApprovalApiFactory : WebApplicationFactory<Program>
         services.AddSingleton(credAuth.Object);
         var client = new Mock<IBinollaClient>(MockBehavior.Loose);
         client.SetupGet(c => c.Lifecycle).Returns(SessionLifecycleState.Connected);
+        client.SetupGet(c => c.IsTransportConnected).Returns(true);
         client.Setup(c => c.ConnectAsync(It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>())).Returns(Task.CompletedTask);
         client.Setup(c => c.ChangeAccountAsync(It.IsAny<AccountType>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
         client.Setup(c => c.GetBalanceAsync(It.IsAny<CancellationToken>())).ReturnsAsync(new BalanceInfo
@@ -76,7 +77,7 @@ public sealed class PendingApprovalApiFactory : WebApplicationFactory<Program>
         var mgr = new Mock<IBinollaSessionManager>(MockBehavior.Loose);
         var connected = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>();
         mgr.Setup(m => m.GetOrCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>(), It.IsAny<AccountType>()))
-            .ReturnsAsync((string uid, string _, CancellationToken _, string? __) => { connected[uid] = 1; return client.Object; });
+            .ReturnsAsync((string uid, string _, CancellationToken _, string? __, AccountType ___) => { connected[uid] = 1; return client.Object; });
         mgr.Setup(m => m.Get(It.IsAny<string>())).Returns((string uid) => connected.ContainsKey(uid) ? client.Object : null);
         services.AddSingleton(mgr.Object);
     }

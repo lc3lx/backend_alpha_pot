@@ -122,4 +122,22 @@ public sealed class PairCooldownTests : IDisposable
         // Trades a person placed by hand must never bench a pair for the bot.
         PairCooldownRegistry.StrategyFromBotKey(key).Should().BeNull();
     }
+
+    [Fact]
+    public void User_loss_benches_pair_only_for_that_specific_user()
+    {
+        var user1 = Guid.NewGuid();
+        var user2 = Guid.NewGuid();
+
+        PairCooldownRegistry.RecordLoss(user1, "rsi", "EURUSD_otc", Now);
+
+        // User 1 is benched
+        PairCooldownRegistry.IsBenched(user1, "rsi", "EURUSD_otc", Now.AddMinutes(5)).Should().BeTrue();
+
+        // User 2 is NOT benched on the same pair and strategy
+        PairCooldownRegistry.IsBenched(user2, "rsi", "EURUSD_otc", Now.AddMinutes(5)).Should().BeFalse();
+
+        // Global query without user ID is not benched
+        PairCooldownRegistry.IsBenched("rsi", "EURUSD_otc", Now.AddMinutes(5)).Should().BeFalse();
+    }
 }

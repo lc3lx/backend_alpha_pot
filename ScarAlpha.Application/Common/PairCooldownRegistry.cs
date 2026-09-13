@@ -38,31 +38,51 @@ public static class PairCooldownRegistry
     private static readonly ConcurrentDictionary<string, DateTimeOffset> BenchedUntil =
         new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>Benches <paramref name="asset"/> for this strategy, starting at <paramref name="now"/>.</summary>
-    public static void RecordLoss(string? strategyId, string asset, DateTimeOffset now)
+    /// <summary>Benches <paramref name="asset"/> for a specific user and strategy, starting at <paramref name="now"/>.</summary>
+    public static void RecordLoss(Guid? userId, string? strategyId, string asset, DateTimeOffset now)
     {
         if (CooldownSeconds <= 0) return;
         if (string.IsNullOrWhiteSpace(asset)) return;
 
         var until = now.AddSeconds(CooldownSeconds);
         // Extend, never shorten: a later loss must not be able to end an earlier bench.
-        BenchedUntil.AddOrUpdate(Key(strategyId, asset), until, (_, existing) => existing > until ? existing : until);
+        BenchedUntil.AddOrUpdate(Key(userId, strategyId, asset), until, (_, existing) => existing > until ? existing : until);
     }
 
-    /// <summary>True while the pair is still serving a cooldown for this strategy.</summary>
-    public static bool IsBenched(string? strategyId, string asset, DateTimeOffset now)
+    /// <summary>Benches <paramref name="asset"/> across all users for this strategy, starting at <paramref name="now"/>.</summary>
+    public static void RecordLoss(string? strategyId, string asset, DateTimeOffset now) =>
+        RecordLoss(null, strategyId, asset, now);
+
+    /// <summary>True while the pair is still serving a cooldown for this user and strategy.</summary>
+    public static bool IsBenched(Guid? userId, string? strategyId, string asset, DateTimeOffset now)
     {
         if (CooldownSeconds <= 0) return false;
         if (string.IsNullOrWhiteSpace(asset)) return false;
-        return BenchedUntil.TryGetValue(Key(strategyId, asset), out var until) && until > now;
+
+        if (userId.HasValue && BenchedUntil.TryGetValue(Key(userId.Value, strategyId, asset), out var userUntil) && userUntil > now)
+            return true;
+
+        return BenchedUntil.TryGetValue(Key(null, strategyId, asset), out var globalUntil) && globalUntil > now;
     }
 
+    /// <summary>True while the pair is still serving a global cooldown for this strategy.</summary>
+    public static bool IsBenched(string? strategyId, string asset, DateTimeOffset now) =>
+        IsBenched(null, strategyId, asset, now);
+
     /// <summary>When the pair is free again, or null when it is not benched.</summary>
-    public static DateTimeOffset? BenchedUntilTime(string? strategyId, string asset, DateTimeOffset now)
+    public static DateTimeOffset? BenchedUntilTime(Guid? userId, string? strategyId, string asset, DateTimeOffset now)
     {
-        if (!IsBenched(strategyId, asset, now)) return null;
-        return BenchedUntil.TryGetValue(Key(strategyId, asset), out var until) ? until : null;
+        if (CooldownSeconds <= 0 || string.IsNullOrWhiteSpace(asset)) return null;
+
+        if (userId.HasValue && BenchedUntil.TryGetValue(Key(userId.Value, strategyId, asset), out var userUntil) && userUntil > now)
+            return userUntil;
+
+        return BenchedUntil.TryGetValue(Key(null, strategyId, asset), out var globalUntil) && globalUntil > now ? globalUntil : null;
     }
+
+    /// <summary>When the pair is free again globally, or null when it is not benched.</summary>
+    public static DateTimeOffset? BenchedUntilTime(string? strategyId, string asset, DateTimeOffset now) =>
+        BenchedUntilTime(null, strategyId, asset, now);
 
     /// <summary>Drops expired entries. Safe to call on a timer.</summary>
     public static void Evict(DateTimeOffset now)
@@ -91,8 +111,8 @@ public static class PairCooldownRegistry
         return parts.Length >= 2 && parts[1].Length > 0 ? parts[1] : null;
     }
 
-    private static string Key(string? strategyId, string asset) =>
-        $"{(strategyId ?? "rsi").Trim().ToLowerInvariant()}:{asset.Trim().ToUpperInvariant()}";
+    private static string Key(Guid? userId, string? strategyId, string asset) =>
+        $"{(userId.HasValue ? userId.Value.ToString("N") : "global")}:{(strategyId ?? "rsi").Trim().ToLowerInvariant()}:{asset.Trim().ToUpperInvariant()}";
 }
 
 /// <summary>Reasons the bot runtime records when it stops a bot.</summary>

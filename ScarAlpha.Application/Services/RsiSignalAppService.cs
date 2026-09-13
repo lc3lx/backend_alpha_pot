@@ -105,7 +105,7 @@ public sealed class RsiSignalAppService
         }
 
         // While a live trade is open for this user: do not analyze / place.
-        if (await IsAnalysisPausedAsync(ct))
+        if (!skipMarketAccess && await IsAnalysisPausedAsync(ct))
         {
             return SoftNone(asset.Trim(), periodSeconds) with
             {
@@ -137,7 +137,7 @@ public sealed class RsiSignalAppService
             }
         }
 
-        if (await IsAnalysisPausedAsync(ct))
+        if (!skipMarketAccess && await IsAnalysisPausedAsync(ct))
         {
             return SoftNone(symbol, wirePeriod) with { AutomationError = "OPEN_TRADE_EXISTS" };
         }
@@ -152,7 +152,7 @@ public sealed class RsiSignalAppService
             client.EnsureMarketDataWarm(symbol, wirePeriod);
         try
         {
-            if (await IsAnalysisPausedAsync(ct))
+            if (!skipMarketAccess && await IsAnalysisPausedAsync(ct))
             {
                 return SoftNone(symbol, wirePeriod) with { AutomationError = "OPEN_TRADE_EXISTS" };
             }
@@ -181,7 +181,7 @@ public sealed class RsiSignalAppService
             // Pine's checkpoint + win/loss counters, advanced on the closed series.
             _emaTracker.Resolve(_currentUser.UserId, symbol, analysis.ClosedCandles, wirePeriod);
 
-            if (await IsAnalysisPausedAsync(ct))
+            if (!skipMarketAccess && await IsAnalysisPausedAsync(ct))
             {
                 return SoftNone(symbol, wirePeriod) with { AutomationError = "OPEN_TRADE_EXISTS" };
             }

@@ -1,4 +1,4 @@
-﻿using System.Net.Http.Headers;
+using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Text;
@@ -96,6 +96,7 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
 
             Client.SetupGet(c => c.UserId).Returns("mock");
             Client.SetupGet(c => c.Lifecycle).Returns(SessionLifecycleState.Connected);
+            Client.SetupGet(c => c.IsTransportConnected).Returns(true);
             Client.Setup(c => c.ConnectAsync(It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>()))
                 .Returns(Task.CompletedTask);
             Client.Setup(c => c.ChangeAccountAsync(It.IsAny<AccountType>(), It.IsAny<CancellationToken>()))
@@ -190,7 +191,7 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
                 });
 
             SessionManager.Setup(m => m.GetOrCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<string?>(), It.IsAny<AccountType>()))
-                .ReturnsAsync((string userId, string _, CancellationToken _, string? __) =>
+                .ReturnsAsync((string userId, string _, CancellationToken _, string? __, AccountType ___) =>
                 {
                     ConnectedUsers[userId] = 1;
                     return Client.Object;

@@ -44,7 +44,7 @@ class _Throttle:
     min_interval_seconds: float = 1.0
     #: Connects allowed at once. More than one so users do not queue behind each other;
     #: bounded so a restart cannot open a hundred handshakes at the broker together.
-    max_concurrent: int = 15
+    max_concurrent: int = 50
     #: Cooldown lockout on failed attempts (disabled by default so user is not blocked).
     enable_user_cooldown: bool = False
 
@@ -106,7 +106,7 @@ class _Throttle:
 class SessionRegistry:
     """Holds live sessions and serialises connect attempts per broker."""
 
-    def __init__(self, max_sessions: int = 500) -> None:
+    def __init__(self, max_sessions: int = 5000) -> None:
         self._sessions: dict[tuple[str, str], BrokerSession] = {}
         self._throttles: dict[str, _Throttle] = {}
         self._lock = asyncio.Lock()
