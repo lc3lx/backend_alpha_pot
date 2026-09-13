@@ -1,4 +1,4 @@
-﻿using System.Net.Http.Headers;
+using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -39,6 +39,9 @@ internal static class TestAccessHelpers
         link.ApprovedBy = "test-admin";
         link.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
+
+        var botAccess = scope.ServiceProvider.GetService<ScarAlpha.Application.Abstractions.IBotAccessService>();
+        botAccess?.Invalidate(userId);
     }
 }
 

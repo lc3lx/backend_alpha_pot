@@ -167,6 +167,7 @@ public sealed class BinollaLinkRepository : IBinollaLinkRepository
     public async Task UpsertAsync(BinollaLink link, CancellationToken ct = default)
     {
         var existing = await _db.BinollaLinks.FirstOrDefaultAsync(x => x.UserId == link.UserId, ct);
+        link.EncryptedSsid ??= string.Empty;
         if (existing is null)
         {
             _db.BinollaLinks.Add(link);

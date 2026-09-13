@@ -60,7 +60,12 @@ public class BinollaLink
     /// account that predates the broker choice keeps working untouched.
     /// </summary>
     public string Broker { get; set; } = "binolla";
-    public string EncryptedSsid { get; set; } = string.Empty;
+    private string _encryptedSsid = string.Empty;
+    public string EncryptedSsid
+    {
+        get => _encryptedSsid;
+        set => _encryptedSsid = value ?? string.Empty;
+    }
     /// <summary>Optional Playwright cookies (encrypted) — required for reliable WS restore after API restart.</summary>
     public string? EncryptedCookieHeader { get; set; }
     /// <summary>Encrypted Binolla login email for silent re-auth when SSID expires.</summary>

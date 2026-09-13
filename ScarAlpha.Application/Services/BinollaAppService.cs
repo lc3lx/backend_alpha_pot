@@ -818,7 +818,7 @@ public sealed class BinollaAppService
         catch (Exception ex) when (broker == Brokers.Quotex && captured is not null && !string.IsNullOrWhiteSpace(link.EncryptedSsid))
         {
             _logger.LogWarning(ex, "Connecting with stored SSID failed for {UserId} on {Broker}. Clearing stale SSID and capturing fresh session with headless browser...", userId, broker);
-            link.EncryptedSsid = null;
+            link.EncryptedSsid = string.Empty;
             link.EncryptedCookieHeader = null;
             await _links.UpsertAsync(link, ct);
 
