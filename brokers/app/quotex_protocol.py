@@ -12,6 +12,7 @@ import json
 import math
 import os
 import time
+from collections import deque
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
@@ -173,6 +174,10 @@ class QuotexLiveData:
         self.closed_orders: dict[str, dict] = {}
         self._order_seq = 0
         self._refresh_tasks: set[asyncio.Task] = set()
+        # The last few things the broker said, excluding the quote flood. An order that is
+        # never acknowledged says nothing about WHY on its own, and reproducing it costs
+        # the customer a real entry — so the answer is collected before it is needed.
+        self._recent_events: deque[tuple[float, str, str]] = deque(maxlen=40)
         # The vendor delivers each packet through BOTH callback and recv(). Use only
         # its ordered receive queue, otherwise a binary header is consumed twice.
         self.connection._handle_message = self._ignore_callback
@@ -246,6 +251,9 @@ class QuotexLiveData:
                 continue
 
     def on_event(self, event, data):
+        if event != "quotes":
+            self._recent_events.append((time.time(), str(event), str(data)[:140]))
+
         if event in {"s_authorization", "authorization"}:
             if isinstance(data, dict) and (data.get("error") or data.get("isSuccessful") is False):
                 self.auth_error = AuthError("Quotex rejected the session. Sign in again.")
@@ -636,6 +644,29 @@ class QuotexLiveData:
             self.periods.discard(key)
             raise
 
+    def _describe_silence(self, order_payload, sent_at):
+        """
+        Why an order went unanswered, in the message the customer can hand back.
+
+        Silence is the one failure that explains nothing by itself, and reproducing it
+        costs a real entry — so the order as sent, and what the broker said instead, both
+        travel with the error rather than having to be asked for afterwards.
+        """
+        names = [name for when, name, _ in self._recent_events if when >= sent_at]
+        heard = ", ".join(dict.fromkeys(names)) or "nothing at all"
+        known = self._asset_index.get(order_payload["asset"])
+        listed = (
+            "not in the instrument list" if known is None
+            else ("open" if known.is_open else "listed but closed")
+        )
+        return (
+            "Quotex did not acknowledge the order within 12s. "
+            f"Sent asset={order_payload['asset']} ({listed}), "
+            f"action={order_payload['action']}, amount={order_payload['amount']}, "
+            f"isDemo={order_payload['isDemo']}, optionType={order_payload['optionType']}, "
+            f"expiry={order_payload['time']}. Heard back: {heard}."
+        )
+
     async def place_order(
         self, asset: str, amount: float, duration_seconds: int, direction: str, is_demo: bool
     ) -> dict[str, Any]:
@@ -703,11 +734,15 @@ class QuotexLiveData:
             "optionType": 3,
         }
 
+        sent_at = time.time()
         try:
+            # Second nudge, as the reference client sends: the order is evaluated against
+            # the chart state the two frames above establish.
+            await self.send_raw('42["tick"]')
             await self.send_event("orders/open", order_payload)
             response = await asyncio.wait_for(future, timeout=12.0)
         except asyncio.TimeoutError as exc:
-            raise BrokerError("Quotex did not acknowledge the order within 12s.") from exc
+            raise BrokerError(self._describe_silence(order_payload, sent_at)) from exc
         finally:
             if entry in self._pending_orders:
                 self._pending_orders.remove(entry)

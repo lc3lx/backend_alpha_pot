@@ -206,3 +206,43 @@ def test_settled_deals_do_not_accumulate_without_limit(live):
             "id": f"deal-{index}", "profit": 1.0, "closeTimestamp": 1800000000 + index,
         })
     assert len(live.closed_orders) <= 500
+
+
+# ---- an order that goes unanswered ----------------------------------------
+
+
+async def test_silence_is_reported_with_what_was_sent_and_what_came_back(live, monkeypatch):
+    # Silence explains nothing by itself, and reproducing it costs a real entry. The
+    # order as sent, and whatever the broker said instead, belong in the error.
+    monkeypatch.setattr("app.quotex_protocol.asyncio.wait_for", _immediate_timeout)
+    live.on_event("instruments/list", [])
+
+    with pytest.raises(BrokerError) as caught:
+        await live.place_order("EURUSD_otc", 5.0, 60, "call", is_demo=True)
+
+    message = str(caught.value)
+    assert "asset=EURUSD_otc" in message
+    assert "not in the instrument list" in message
+    assert "action=call" in message
+    assert "isDemo=1" in message
+
+
+async def test_the_silence_report_names_the_frames_that_did_arrive(live, monkeypatch):
+    async def timeout_after_noise(awaitable, timeout=None):
+        live.on_event("s_balance/list", {"liveBalance": 10.0})
+        live.on_event("instruments/update", {"asset": "EURUSD_otc"})
+        awaitable.close() if hasattr(awaitable, "close") else None
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr("app.quotex_protocol.asyncio.wait_for", timeout_after_noise)
+
+    with pytest.raises(BrokerError) as caught:
+        await live.place_order("EURUSD_otc", 5.0, 60, "call", is_demo=True)
+
+    message = str(caught.value)
+    assert "s_balance/list" in message
+    assert "instruments/update" in message
+
+
+async def _immediate_timeout(awaitable, timeout=None):
+    raise asyncio.TimeoutError
