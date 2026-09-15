@@ -9,6 +9,7 @@ distinguish a working order from the several ways it silently was not one.
 """
 
 import asyncio
+import json
 import queue
 from types import SimpleNamespace
 
@@ -147,6 +148,36 @@ async def test_placing_an_order_needs_nothing_from_the_vendor_client(live):
     task = asyncio.create_task(live.place_order("EURUSD_otc", 5.0, 60, "call", is_demo=True))
     await asyncio.sleep(0.05)
     assert any("orders/open" in str(frame) for frame in live.connection._ws.sent)
+    task.cancel()
+
+
+async def test_the_order_frame_matches_the_shape_quotex_accepts(live):
+    # The broker drops a frame it does not recognise in silence. These three fields are
+    # exactly the ones that were wrong when every order went unanswered: the option type
+    # was 3 (not a real value), the time was an absolute timestamp (not a duration), and
+    # the amount was a float.
+    task = asyncio.create_task(live.place_order("EURUSD_otc", 25.0, 60, "call", is_demo=True))
+    await asyncio.sleep(0.05)
+
+    frame = next(f for f in live.connection._ws.sent if "orders/open" in str(f))
+    payload = json.loads(str(frame)[2:])[1]
+
+    assert payload["optionType"] == 100
+    assert payload["time"] == 60
+    assert payload["amount"] == 25 and isinstance(payload["amount"], int)
+    assert payload["action"] == "call"
+    assert payload["isDemo"] == 1
+    task.cancel()
+
+
+async def test_a_real_account_order_carries_isdemo_zero(live):
+    task = asyncio.create_task(live.place_order("EURUSD_otc", 10.0, 60, "put", is_demo=False))
+    await asyncio.sleep(0.05)
+
+    frame = next(f for f in live.connection._ws.sent if "orders/open" in str(f))
+    payload = json.loads(str(frame)[2:])[1]
+    assert payload["isDemo"] == 0
+    assert payload["action"] == "put"
     task.cancel()
 
 

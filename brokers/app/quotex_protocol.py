@@ -13,7 +13,6 @@ import math
 import os
 import time
 from collections import deque
-from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -675,43 +674,6 @@ class QuotexLiveData:
             raise self.auth_error
 
         clean_asset = self._tradable_symbol(asset)
-        now_ts = int(time.time())
-        now_dt = datetime.fromtimestamp(now_ts)
-        dur = max(duration_seconds, 60)
-        midnight = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-        seconds_since_midnight = int((now_dt - midnight).total_seconds())
-        remainder = seconds_since_midnight % dur
-        step = 2 if remainder > (dur / 2) else 1
-        next_valid = ((seconds_since_midnight // dur) + step) * dur
-        exp_time = int((midnight + timedelta(seconds=next_valid)).timestamp())
-
-        settings_payload = {
-            "chartId": "graph",
-            "settings": {
-                "chartId": "graph",
-                "chartType": 2,
-                "currentExpirationTime": exp_time,
-                "isFastOption": True,
-                "isFastAmountOption": False,
-                "isIndicatorsMinimized": False,
-                "isIndicatorsShowing": True,
-                "isShortBetElement": False,
-                "chartPeriod": 4,
-                "currentAsset": {"symbol": clean_asset},
-                "dealValue": float(amount),
-                "dealPercentValue": 1,
-                "isVisible": True,
-                "timePeriod": duration_seconds,
-                "gridOpacity": 8,
-                "isAutoScrolling": 1,
-                "isOneClickTrade": True,
-                "upColor": "#0FAF59",
-                "downColor": "#FF6251",
-            },
-            "endTime": exp_time,
-        }
-        await self.send_event("settings/apply", settings_payload)
-        await self.send_raw('42["tick"]')
 
         # Milliseconds plus a counter. The previous id was whole seconds, so two orders
         # placed in the same second shared one — and the first acknowledgement to arrive
@@ -723,22 +685,28 @@ class QuotexLiveData:
         entry = (req_id, clean_asset, future)
         self._pending_orders.append(entry)
 
+        # The exact shape Quotex's own web client sends for a fast option. Getting any of
+        # the three marked fields wrong makes the broker drop the frame in silence — no
+        # acknowledgement, no error — which is precisely the failure this replaces:
+        #   42["orders/open",{"asset":"CHFJPY_otc","amount":1,"time":60,"action":"call",
+        #                     "isDemo":1,"tournamentId":0,"requestId":...,"optionType":100}]
         order_payload = {
             "asset": clean_asset,
-            "amount": float(amount),
-            "time": exp_time,
+            # Integer, not float — the wire format is a whole-number stake.
+            "amount": int(amount),
+            # Duration in seconds (60), NOT an absolute expiry timestamp. This was sending
+            # a unix time where a duration belongs.
+            "time": int(duration_seconds),
             "action": direction.lower(),
             "isDemo": 1 if is_demo else 0,
             "tournamentId": 0,
             "requestId": req_id,
-            "optionType": 3,
+            # 100 = fast option. The previous 3 is not a value Quotex recognises.
+            "optionType": 100,
         }
 
         sent_at = time.time()
         try:
-            # Second nudge, as the reference client sends: the order is evaluated against
-            # the chart state the two frames above establish.
-            await self.send_raw('42["tick"]')
             await self.send_event("orders/open", order_payload)
             response = await asyncio.wait_for(future, timeout=12.0)
         except asyncio.TimeoutError as exc:
