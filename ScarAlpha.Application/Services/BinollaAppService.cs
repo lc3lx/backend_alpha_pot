@@ -29,6 +29,18 @@ public sealed class BinollaAppService
 
     private static readonly ConcurrentDictionary<Guid, BinollaBalanceDto> _lastKnownBalances = new();
 
+    /// <summary>When each cached balance was actually read from the broker.</summary>
+    private static readonly ConcurrentDictionary<Guid, DateTimeOffset> _lastKnownAt = new();
+
+    /// <summary>
+    /// How long a balance already read from the broker is served without asking again.
+    ///
+    /// Every open screen polls this endpoint on the app's heartbeat, and the shell blocks
+    /// on it while a page mounts. One broker round trip per poll per screen is most of why
+    /// moving between pages felt slow; a balance two seconds old is not wrong.
+    /// </summary>
+    private static readonly TimeSpan BalanceServeTtl = TimeSpan.FromSeconds(2);
+
     public static void RecordLastKnownBalance(Guid userId, string accountType, decimal? balance)
     {
         if (balance is null or <= 0m) return;
@@ -47,6 +59,7 @@ public sealed class BinollaAppService
                 RealBalance: isDemo ? existing.RealBalance : balance.Value,
                 CurrentBalance: balance.Value)
         );
+        _lastKnownAt[userId] = DateTimeOffset.UtcNow;
     }
 
     public static BinollaBalanceDto? TryGetLastKnownBalance(Guid userId)
@@ -615,6 +628,15 @@ public sealed class BinollaAppService
         var access = await _access.CheckAsync(_currentUser.UserId, ct);
         AccountAppService.EnsureConnectedForMarket(access);
 
+        // Served straight from the last reading while it is still current. Below this line
+        // the request can cost the caller seconds; above it, nothing at all.
+        if (_lastKnownBalances.TryGetValue(_currentUser.UserId, out var recent)
+            && _lastKnownAt.TryGetValue(_currentUser.UserId, out var readAt)
+            && DateTimeOffset.UtcNow - readAt < BalanceServeTtl)
+        {
+            return recent;
+        }
+
         // The user's own venue. Asking Binolla's manager unconditionally — as this did —
         // never found a Quotex session, so every balance poll spun the full wait below
         // and then reported a zero balance on a perfectly healthy account.
@@ -668,7 +690,11 @@ public sealed class BinollaAppService
 
         try
         {
-            using var balCts = new CancellationTokenSource(TimeSpan.FromSeconds(6));
+            // Three seconds, not six. This is a polled endpoint: a request that hangs for
+            // six seconds holds a thread while the page it belongs to sits blank, and the
+            // next poll is only moments behind it anyway.
+            using var balCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            balCts.CancelAfter(TimeSpan.FromSeconds(3));
             var balance = await client.GetBalanceAsync(balCts.Token);
             var accountType = balance.CurrentType == EngineAccount.Real ? "Real" : "Demo";
             var current =
@@ -683,6 +709,7 @@ public sealed class BinollaAppService
             if (current > 0 || balance.DemoBalance > 0 || balance.RealBalance > 0)
             {
                 _lastKnownBalances[_currentUser.UserId] = dto;
+                _lastKnownAt[_currentUser.UserId] = DateTimeOffset.UtcNow;
             }
 
             return dto;

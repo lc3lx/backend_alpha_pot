@@ -407,6 +407,23 @@ def _status(session: BrokerSession) -> SessionStatus:
     )
 
 
+@app.get("/diag/ssid", dependencies=[Guarded])
+async def diag_ssid(user_id: str, broker: str):
+    """
+    Whether a session token reached this process, and whether it is the expected one.
+
+    Deliberately not the token itself. It is a live trading credential: anyone holding it
+    can place orders on the account, and it would be echoed into terminal scrollback and
+    shell history by the first person who ran this. The length and last four characters
+    are enough to tell a missing session from a stale one, which is what this answers.
+    """
+    sess = _session(user_id, broker)
+    ssid = getattr(sess, "ssid", None)
+    if not ssid:
+        return {"present": False, "length": 0, "tail": None}
+    return {"present": True, "length": len(ssid), "tail": ssid[-4:]}
+
+
 @app.on_event("shutdown")
 async def _persist_on_shutdown() -> None:
     """

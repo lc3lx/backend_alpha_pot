@@ -28,6 +28,14 @@ public sealed class TradeAppService
     private readonly IReferralQualificationService _referralQualification;
     private readonly ILogger<TradeAppService> _logger;
 
+    /// <summary>
+    /// How long the pre-trade balance read may take before the trade proceeds without it.
+    ///
+    /// An entry is priced on a bar that is already closing. Spending longer than this on a
+    /// figure the broker will check again anyway costs the setup the trade was for.
+    /// </summary>
+    private static readonly TimeSpan BalanceCheckTimeout = TimeSpan.FromSeconds(3);
+
     public TradeAppService(
         ICurrentUser currentUser,
         ITradeRepository trades,
@@ -105,39 +113,75 @@ public sealed class TradeAppService
                 409);
         }
 
-        // Authoritative balance check from live broker session (not a local wallet).
-        BalanceInfo balance;
+        // Balance check from the live broker session (not a local wallet).
+        //
+        // Bounded, and no longer fatal. This exists to catch an account that cannot cover
+        // the stake; it is not a test of whether the session is usable. Refusing the trade
+        // whenever the figure was slow to arrive is what stopped both the bot and manual
+        // entries on a perfectly healthy account — and the broker rejects an underfunded
+        // order itself, so the check is a courtesy, not the last line of defence.
+        BalanceInfo? balance = null;
         try
         {
-            balance = await client.GetBalanceAsync(ct);
-            if (balance.CurrentBalance < request.Amount)
-                throw new ApiException(ApiErrorCodes.InsufficientBalance, "Insufficient balance.", 400);
+            using var balCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            balCts.CancelAfter(BalanceCheckTimeout);
+            balance = await client.GetBalanceAsync(balCts.Token);
         }
-        catch (ApiException) { throw; }
         catch (BinollaAuthenticationException)
         {
             throw new ApiException(ApiErrorCodes.BinollaSessionExpired, $"{broker} session expired.", 401);
         }
-        catch (Exception ex)
+        catch (Exception) when (ct.IsCancellationRequested)
         {
-            _logger.LogWarning(ex, "Balance check failed for user {UserId}", userId);
-            throw new ApiException(ApiErrorCodes.BinollaNotConnected, $"Unable to verify {broker} balance.", 409);
-        }
-
-        try
-        {
-            // Free ride on the balance we just fetched — the referral deposit signal is the
-            // real-account balance regardless of which book the user is currently trading.
-            await _referralQualification.ObserveRealBalanceAsync(userId, balance.RealBalance, ct);
+            throw;
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Referral balance observation failed for user {UserId}", userId);
+            _logger.LogWarning(
+                ex, "Balance check unavailable for user {UserId}; using last known figure", userId);
         }
 
-        var tradeAccountType = balance.CurrentType == EngineAccount.Real
-            ? BinollaAccountType.Real
-            : BinollaAccountType.Demo;
+        // Last figure this account actually reported. Older than live, but it is real, and
+        // it still catches the case the check is for.
+        var lastReported = balance is null ? BinollaAppService.TryGetLastKnownBalance(userId) : null;
+        if (lastReported is not null)
+        {
+            balance = new BalanceInfo
+            {
+                DemoBalance = lastReported.DemoBalance,
+                RealBalance = lastReported.RealBalance,
+                CurrentType = lastReported.AccountType.Equals("Real", StringComparison.OrdinalIgnoreCase)
+                    ? EngineAccount.Real
+                    : EngineAccount.Demo,
+                LastUpdated = DateTimeOffset.UtcNow,
+                Currency = "USD"
+            };
+        }
+
+        if (balance is not null && balance.CurrentBalance < request.Amount)
+            throw new ApiException(ApiErrorCodes.InsufficientBalance, "Insufficient balance.", 400);
+
+        if (balance is not null)
+        {
+            try
+            {
+                // Free ride on the balance we just fetched — the referral deposit signal is the
+                // real-account balance regardless of which book the user is currently trading.
+                await _referralQualification.ObserveRealBalanceAsync(userId, balance.RealBalance, ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Referral balance observation failed for user {UserId}", userId);
+            }
+        }
+
+        // With no figure at all, the link's own account type stands. Defaulting to Demo
+        // here would send a live user's trade to the practice book.
+        var tradeAccountType = balance is null
+            ? link.AccountType
+            : balance.CurrentType == EngineAccount.Real
+                ? BinollaAccountType.Real
+                : BinollaAccountType.Demo;
         // Keep the persisted link in sync with the live Binolla book.
         if (link.AccountType != tradeAccountType)
         {

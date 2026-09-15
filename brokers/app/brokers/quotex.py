@@ -396,8 +396,10 @@ class QuotexSession(BrokerSession):
             return False
 
     def _require(self) -> Any:
-        if self._client is None:
-            raise NotConnected("Quotex session is not connected.")
+        if self._client is None or not self.transport_connected:
+            raise NotConnected("Quotex session is not connected or session token expired.")
+        if self._live is not None and self._live.auth_error is not None:
+            raise self._live.auth_error
         return self._client
 
     @property
@@ -665,6 +667,29 @@ class QuotexSession(BrokerSession):
             else _enum_member(enums.TradeDirection, "PUT", "SELL", "DOWN")
         )
 
+        if self._live is not None:
+            is_demo = self.account_type is AccountType.DEMO
+            res = await self._live.place_order(
+                asset=asset,
+                amount=amount,
+                duration_seconds=duration_seconds,
+                direction="call" if side.name in ("CALL", "BUY", "UP") else "put",
+                is_demo=is_demo,
+            )
+            order_id = str(res.get("id") or res.get("order_id") or "")
+            open_price = float(res.get("openPrice") or res.get("open_price") or 0.0)
+            now_ts = time.time()
+            return OrderResponse(
+                order_id=order_id,
+                asset=asset,
+                direction=direction.strip().upper(),
+                amount=float(amount),
+                open_price=open_price,
+                placed_at=now_ts,
+                expiry_at=now_ts + duration_seconds,
+                account_type=self.account_type,
+            )
+
         try:
             trade = await _maybe_await(
                 client.buy(
@@ -697,6 +722,23 @@ class QuotexSession(BrokerSession):
 
     async def wait_outcome(self, order_id: str, timeout_seconds: float) -> Outcome:
         client = self._require()
+
+        # Orders are placed on the live socket, so the vendor client has no record of them
+        # and its lookup answered "Order not found" for every trade this app made. The
+        # settlement is read from the same stream the order was sent on.
+        if self._live is not None:
+            row = await self._live.wait_outcome(order_id, timeout_seconds)
+            if row is None:
+                # Undecided, not lost. Reporting a loss here would book a winning trade as
+                # a losing one; the caller re-checks an unknown outcome.
+                return Outcome(
+                    order_id=order_id,
+                    result=TradeResult.UNKNOWN,
+                    profit_loss=0.0,
+                    closed_at=time.time(),
+                )
+            return _outcome_from_deal(order_id, row)
+
         waiter = getattr(client, "wait_for_result", None)
         if waiter is None:
             raise NotConnected("This Quotex client cannot report trade outcomes.")
@@ -746,6 +788,42 @@ class QuotexSession(BrokerSession):
             close_price=_num(_attr(trade, "close_price")),
             closed_at=time.time(),
         )
+
+
+def _outcome_from_deal(order_id: str, row: dict) -> Outcome:
+    """Read a Quotex settlement frame into the outcome the app records."""
+    profit = row.get("profit")
+    if profit is None:
+        profit = row.get("profitAmount")
+    pnl = float(profit) if isinstance(profit, (int, float)) else 0.0
+
+    verdict = str(row.get("result") or row.get("status") or "").lower()
+    if "win" in verdict:
+        result = TradeResult.WIN
+    elif "loss" in verdict or "lose" in verdict or "loose" in verdict:
+        result = TradeResult.LOSS
+    elif verdict in {"equal", "draw", "tie", "refund"}:
+        result = TradeResult.TIE
+    elif pnl > 0:
+        result = TradeResult.WIN
+    elif pnl < 0:
+        result = TradeResult.LOSS
+    else:
+        # Quotex books a refunded trade as a zero move rather than naming it, and a real
+        # zero-profit settlement is the same thing to the ledger.
+        result = TradeResult.TIE if row.get("closePrice") is not None else TradeResult.UNKNOWN
+
+    close_price = row.get("closePrice")
+    if close_price is None:
+        close_price = row.get("close_price")
+
+    return Outcome(
+        order_id=order_id,
+        result=result,
+        profit_loss=pnl,
+        close_price=float(close_price) if isinstance(close_price, (int, float)) else None,
+        closed_at=time.time(),
+    )
 
 
 def _normalize_ssid(ssid: str | None) -> str | None:
