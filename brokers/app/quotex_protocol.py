@@ -368,14 +368,20 @@ class QuotexLiveData:
     # placed. Both halves are tracked here instead, off the same frame stream.
 
     #: Frames that may carry an acknowledgement of an order we just sent.
+    #
+    # Quotex replies to `orders/open` with `s_orders/open` — the `s_` prefix is the
+    # server's answer, and missing it is why a correctly-shaped order still timed out:
+    # the deal opened, the balance moved, and this waited twelve seconds for a name it
+    # was not listening for.
     _ACK_EVENTS = frozenset({
-        "orders/open", "orders/opened", "order/opened", "order/created", "_ack_response",
+        "s_orders/open", "orders/open", "orders/opened", "order/opened",
+        "order/created", "s_order/created", "_ack_response",
     })
 
     #: Frames that may carry a settlement.
     _CLOSE_EVENTS = frozenset({
-        "orders/closed", "order/closed", "deals/closed", "deal/closed",
-        "orders/complete", "position/closed",
+        "s_orders/closed", "orders/closed", "order/closed", "deals/closed", "deal/closed",
+        "s_deals/closed", "orders/complete", "position/closed",
     })
 
     def _absorb_order_events(self, event, data):

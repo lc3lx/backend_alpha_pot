@@ -65,6 +65,22 @@ def request_id_of(live_data):
 # ---- acknowledgement ------------------------------------------------------
 
 
+async def test_the_server_reply_prefixed_with_s_is_the_acknowledgement(live):
+    # Quotex answers `orders/open` with `s_orders/open`. The deal opened and the balance
+    # moved, but this name was not in the ack set, so a placed order still timed out.
+    task = asyncio.create_task(
+        live.place_order("USDCAD_otc", 25.0, 60, "call", is_demo=True)
+    )
+    await asyncio.sleep(0.05)
+    req = request_id_of(live)
+
+    live.on_event("s_orders/open", {
+        "id": "deal-s", "asset": "USDCAD_otc", "openPrice": 1.35, "requestId": req,
+    })
+    result = await asyncio.wait_for(task, 1)
+    assert result["id"] == "deal-s"
+
+
 async def test_an_order_is_acknowledged_by_its_own_reply(live):
     task = asyncio.create_task(
         live.place_order("EURUSD_otc", 5.0, 60, "call", is_demo=True)
