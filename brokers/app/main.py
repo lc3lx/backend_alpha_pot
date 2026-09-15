@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import traceback
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Header
@@ -137,7 +138,12 @@ def _fail(exc: Exception) -> HTTPException:
         return HTTPException(status_code=401, detail=f"BROKER_AUTH_FAILED: {exc}")
     if isinstance(exc, NotConnected):
         return HTTPException(status_code=409, detail=f"NOT_CONNECTED: {exc}")
-    return HTTPException(status_code=502, detail=f"BROKER_ERROR: {exc}")
+    # Unexpected: the reply body carries the reason, but the body is not logged, so a 502
+    # left no trace on the gateway and the cause had to be inferred from the caller. An
+    # order that fails is worth a line here, with the type in case the message is empty.
+    print(f"[ORDER/CALL FAILED] {type(exc).__name__}: {exc}", flush=True)
+    traceback.print_exc()
+    return HTTPException(status_code=502, detail=f"BROKER_ERROR: {type(exc).__name__}: {exc}")
 
 
 @app.get("/proxy/check", dependencies=[Guarded])
