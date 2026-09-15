@@ -721,11 +721,13 @@ class QuotexSession(BrokerSession):
         )
 
     async def wait_outcome(self, order_id: str, timeout_seconds: float) -> Outcome:
-        client = self._require()
-
         # Orders are placed on the live socket, so the vendor client has no record of them
         # and its lookup answered "Order not found" for every trade this app made. The
         # settlement is read from the same stream the order was sent on.
+        #
+        # Checked BEFORE the connection is required: a result already received is a fact
+        # about a finished trade, and refusing to report it because the socket dropped a
+        # moment ago would leave a settled trade showing as open.
         if self._live is not None:
             row = await self._live.wait_outcome(order_id, timeout_seconds)
             if row is None:
@@ -739,6 +741,7 @@ class QuotexSession(BrokerSession):
                 )
             return _outcome_from_deal(order_id, row)
 
+        client = self._require()
         waiter = getattr(client, "wait_for_result", None)
         if waiter is None:
             raise NotConnected("This Quotex client cannot report trade outcomes.")
