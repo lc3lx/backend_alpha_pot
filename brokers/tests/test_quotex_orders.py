@@ -296,7 +296,9 @@ async def test_silence_is_reported_with_what_was_sent_and_what_came_back(live, m
 
 async def test_the_silence_report_names_the_frames_that_did_arrive(live, monkeypatch):
     async def timeout_after_noise(awaitable, timeout=None):
-        live.on_event("s_balance/list", {"liveBalance": 10.0})
+        # Neutral market chatter only — a balance move or an s_orders frame would (rightly)
+        # be read as a deal opening, which is a different path than pure silence.
+        live.on_event("depth/change", [["EURUSD_otc", 12]])
         live.on_event("instruments/update", {"asset": "EURUSD_otc"})
         awaitable.close() if hasattr(awaitable, "close") else None
         raise asyncio.TimeoutError
@@ -307,9 +309,60 @@ async def test_the_silence_report_names_the_frames_that_did_arrive(live, monkeyp
         await live.place_order("EURUSD_otc", 5.0, 60, "call", is_demo=True)
 
     message = str(caught.value)
-    assert "s_balance/list" in message
+    assert "depth/change" in message
     assert "instruments/update" in message
 
 
 async def _immediate_timeout(awaitable, timeout=None):
     raise asyncio.TimeoutError
+
+
+async def test_a_silently_dropped_order_is_resent(live, monkeypatch):
+    # Quotex drops a valid frame in silence at random. The first send here produces no
+    # sign of a deal, so the order is sent again; the second is acknowledged.
+    real_wait_for = asyncio.wait_for
+    calls = {"n": 0}
+
+    async def flaky_wait_for(awaitable, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # First attempt: pure silence, nothing opened.
+            if hasattr(awaitable, "close"):
+                awaitable.close()
+            raise asyncio.TimeoutError
+        # Second attempt: the broker answers this one.
+        live.on_event("s_orders/open", {"id": "deal-retry", "asset": "USDCAD_otc"})
+        return await real_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr("app.quotex_protocol.asyncio.wait_for", flaky_wait_for)
+
+    result = await live.place_order("USDCAD_otc", 25.0, 60, "call", is_demo=True)
+    assert result["id"] == "deal-retry"
+    sends = [f for f in live.connection._ws.sent if "orders/open" in str(f)]
+    assert len(sends) == 2, "a silently dropped order should be sent again"
+
+
+async def test_a_balance_move_after_sending_prevents_a_duplicate(live, monkeypatch):
+    # If the balance moved after the send, a deal opened even though the ack was slow.
+    # The order must NOT be sent a second time.
+    real_wait_for = asyncio.wait_for
+    calls = {"n": 0}
+
+    async def wait_for_with_balance_move(awaitable, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # The deal opened — balance moves — but the ack has not arrived yet.
+            live.on_event("s_balance", {"liveBalance": 975.0, "demoBalance": 9000.0})
+            if hasattr(awaitable, "close"):
+                awaitable.close()
+            raise asyncio.TimeoutError
+        # The follow-up wait: the ack lands now.
+        live.on_event("s_orders/open", {"id": "deal-once", "asset": "USDCAD_otc"})
+        return await real_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr("app.quotex_protocol.asyncio.wait_for", wait_for_with_balance_move)
+
+    result = await live.place_order("USDCAD_otc", 25.0, 60, "call", is_demo=True)
+    assert result["id"] == "deal-once"
+    sends = [f for f in live.connection._ws.sent if "orders/open" in str(f)]
+    assert len(sends) == 1, "a deal that opened must not be sent a second time"

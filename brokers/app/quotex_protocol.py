@@ -761,12 +761,37 @@ class QuotexLiveData:
             "optionType": 100,
         }
 
+        # Quotex sometimes drops a perfectly valid order frame in silence — the live log
+        # showed the identical payload opening a deal on one attempt and being ignored on
+        # the next. So the send is retried, but only when it is SAFE to: if the balance
+        # moved or any order event was seen after a send, a deal likely opened and we wait
+        # for its acknowledgement rather than risk a duplicate. A resend happens only after
+        # a send that produced no sign of a deal at all.
         sent_at = time.time()
+        max_attempts = 3
+        per_attempt = 3.5
         try:
-            await self.send_event("orders/open", order_payload)
-            response = await asyncio.wait_for(future, timeout=12.0)
-        except asyncio.TimeoutError as exc:
-            raise BrokerError(self._describe_silence(order_payload, sent_at)) from exc
+            for attempt in range(1, max_attempts + 1):
+                balance_before = self.balance_at
+                await self.send_event("orders/open", order_payload)
+
+                try:
+                    # Shielded, so a timeout here leaves the order still pending: a late
+                    # acknowledgement on the next wait still resolves it.
+                    response = await asyncio.wait_for(asyncio.shield(future), per_attempt)
+                    break
+                except asyncio.TimeoutError:
+                    opened = self.balance_at != balance_before or any(
+                        name == "s_balance" or name.startswith("s_orders")
+                        for ts, name, _ in self._recent_events if ts >= sent_at
+                    )
+                    if opened:
+                        # Something opened. Never resend — wait out the ack instead.
+                        response = await asyncio.wait_for(future, 8.0)
+                        break
+                    if attempt >= max_attempts:
+                        raise BrokerError(self._describe_silence(order_payload, sent_at))
+                    # Genuinely silent: nothing opened, so it is safe to send again.
         finally:
             if entry in self._pending_orders:
                 self._pending_orders.remove(entry)
