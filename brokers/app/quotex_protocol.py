@@ -38,9 +38,9 @@ class SocketIOPackets:
             except Exception:
                 return None
 
-        if text.startswith("45") and "-" in text:
+        if (text.startswith("45") or text.startswith("51") or text.startswith("52")) and "-" in text[:6]:
             try:
-                count, body = text[2:].split("-", 1)
+                count, body = text.split("-", 1)
                 payload = json.loads(body)
                 if isinstance(payload, list) and payload and isinstance(payload[0], str):
                     data = payload[1] if len(payload) > 1 else None
@@ -63,7 +63,7 @@ class SocketIOPackets:
         indices = [text.find(c) for c in ("[", "{") if text.find(c) != -1]
         if indices:
             start_idx = min(indices)
-            if start_idx <= 4:
+            if start_idx <= 10:
                 try:
                     payload = json.loads(text[start_idx:])
                     if self.pending is not None:
@@ -226,6 +226,40 @@ class QuotexLiveData:
                 except (ValueError, TypeError):
                     continue
 
+        if event in {"history/load", "history/list/v2", "history/load/line"}:
+            payload_dict = data if isinstance(data, dict) else {}
+            asset_name = payload_dict.get("asset")
+            period = int(payload_dict.get("period") or 60)
+            raw_candles = (
+                payload_dict.get("data")
+                or payload_dict.get("candles")
+                or payload_dict.get("history")
+                or []
+            )
+            if not raw_candles and isinstance(data, list):
+                raw_candles = data
+            if asset_name and isinstance(raw_candles, list) and raw_candles:
+                normalized = []
+                for row in raw_candles:
+                    if isinstance(row, dict):
+                        normalized.append(row)
+                    elif isinstance(row, (list, tuple)) and len(row) >= 5:
+                        normalized.append({
+                            "time": row[0],
+                            "open": row[1],
+                            "close": row[2],
+                            "high": row[3],
+                            "low": row[4],
+                            "ticks": row[5] if len(row) > 5 else 0,
+                        })
+                if normalized:
+                    self.market.apply_candles(asset_name, period, normalized)
+                    if asset_name.endswith("_otc"):
+                        self.market.apply_candles(asset_name[:-4], period, normalized)
+                    else:
+                        self.market.apply_candles(f"{asset_name}_otc", period, normalized)
+
+
     async def authenticate(self, ssid, account_type):
         if not ssid:
             raise AuthError("Quotex requires a browser-captured session before connecting.")
@@ -330,6 +364,33 @@ class QuotexLiveData:
                 except Exception:
                     pass
             await self.send_event("instruments/update", {"asset": formatted, "period": period})
+
+            # Deep historical candles: bypasses the 199 candle live stream wait
+            now_sec = int(time.time())
+            browser_index = int(time.time() * 100)
+            offset = max(period * 250, 14400)
+            hist_payload = {
+                "asset": formatted,
+                "index": browser_index,
+                "time": now_sec,
+                "offset": offset,
+                "period": period,
+            }
+            try:
+                await self.send_event("history/load", hist_payload)
+            except Exception:
+                pass
+            if formatted != asset:
+                try:
+                    await self.send_event("history/load", {
+                        "asset": asset,
+                        "index": browser_index,
+                        "time": now_sec,
+                        "offset": offset,
+                        "period": period,
+                    })
+                except Exception:
+                    pass
         except BaseException:
             self.periods.discard(key)
             raise

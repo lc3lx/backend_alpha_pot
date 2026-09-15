@@ -548,6 +548,13 @@ class QuotexSession(BrokerSession):
         await self.subscribe(asset, period_seconds)
 
         bucket = self._market.bars(asset, period_seconds)
+        if len(bucket) < min(count, 100):
+            for _ in range(15):
+                await asyncio.sleep(0.1)
+                bucket = self._market.bars(asset, period_seconds)
+                if len(bucket) >= min(count, 100):
+                    break
+
         now = time.time()
         # A bar is closed once its whole period is behind us. The forming bar is what
         # makes an indicator disagree with the broker's own chart, and no downstream

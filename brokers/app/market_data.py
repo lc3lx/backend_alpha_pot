@@ -191,6 +191,41 @@ class MarketData:
         # Debounced inside the store — this fires per streamed tick.
         self._store.save(asset, period_seconds, bucket)
 
+    def apply_candles(self, asset: str, period_seconds: int, rows: list[dict[str, Any]]) -> int:
+        """Folds a batch of historical candles into the shared series."""
+        if not rows:
+            return 0
+        key = (asset, period_seconds)
+        bucket = self._bars.setdefault(key, {})
+        valid = 0
+        for row in rows:
+            ts = _num(row.get("time") or row.get("from") or row.get("timestamp"))
+            close = _num(row.get("close") or row.get("price") or row.get("value"))
+            if ts is None or close is None:
+                continue
+            start = int(ts) - (int(ts) % period_seconds)
+            open_p = _num(row.get("open")) or close
+            high = _num(row.get("high")) or close
+            low = _num(row.get("low")) or close
+            volume = _num(row.get("volume") or row.get("ticks")) or 0.0
+
+            existing = bucket.get(start)
+            if existing is None:
+                bucket[start] = [open_p, high, low, close, volume]
+                valid += 1
+            else:
+                existing[1] = max(existing[1], high)
+                existing[2] = min(existing[2], low)
+                existing[3] = close
+                existing[4] = max(existing[4], volume)
+                valid += 1
+
+        if valid > 0:
+            trim(bucket, period_seconds)
+            self._last_tick[key] = time.monotonic()
+            self._store.save(asset, period_seconds, bucket, force=True)
+        return valid
+
     def apply_quote(self, asset: str, row: dict[str, Any]) -> None:
         price = _num(row.get("price") or row.get("close") or row.get("value"))
         if price is None:

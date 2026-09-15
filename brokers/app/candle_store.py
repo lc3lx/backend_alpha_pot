@@ -42,8 +42,8 @@ def _env_int(name: str, default: int) -> int:
 RETENTION_HOURS = _env_int("QUOTEX_CANDLE_RETENTION_HOURS", 3)
 
 #: Never keep fewer bars than this, whatever the timeframe. The indicator warm-up floor
-#: upstream is 150; the margin above it covers the bars a fresh subscription misses.
-MIN_BARS = _env_int("QUOTEX_CANDLE_MIN_BARS", 200)
+#: upstream is 150; 250 bars ensures 200-bar indicators and deep history fit cleanly.
+MIN_BARS = _env_int("QUOTEX_CANDLE_MIN_BARS", 250)
 
 #: Seconds between flushes. Writing on every streamed tick would be hundreds of writes a
 #: minute per pair for data that only has to survive a restart.
@@ -58,9 +58,9 @@ def default_root() -> Path:
 
 
 def keep_count(period_seconds: int) -> int:
-    """How many bars the window holds for this timeframe (3 hours)."""
+    """How many bars the window holds for this timeframe (3 hours or at least MIN_BARS)."""
     by_time = (RETENTION_HOURS * 3600) // max(period_seconds, 1)
-    return max(int(by_time), 180)
+    return max(int(by_time), MIN_BARS)
 
 
 def trim(series: Series, period_seconds: int) -> Series:
@@ -77,14 +77,15 @@ def trim(series: Series, period_seconds: int) -> Series:
         for old in sorted(series)[: len(series) - limit]:
             series.pop(old, None)
 
-    if len(series) > 180:
+    if len(series) > MIN_BARS:
         for old in sorted(series):
-            if old < cutoff and len(series) > 180:
+            if old < cutoff and len(series) > MIN_BARS:
                 series.pop(old, None)
             elif old >= cutoff:
                 break
 
     return series
+
 
 
 class CandleStore:
