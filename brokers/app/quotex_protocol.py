@@ -128,6 +128,24 @@ def _order_rows(payload):
     return []
 
 
+def _find_order_id(row):
+    """The broker's id for a deal, wherever this particular frame put it."""
+    if not isinstance(row, dict):
+        return None
+    for key in ("id", "order_id", "orderId", "ticket", "dealId", "deal_id"):
+        value = row.get(key)
+        if value:
+            return str(value)
+    # Some frames wrap the deal one level down.
+    for key in ("deal", "order", "data"):
+        inner = row.get(key)
+        if isinstance(inner, dict):
+            found = _find_order_id(inner)
+            if found:
+                return found
+    return None
+
+
 def _is_settlement(row):
     """
     True when this row reports a finished trade rather than an accepted one.
@@ -384,6 +402,15 @@ class QuotexLiveData:
         "s_deals/closed", "orders/complete", "position/closed",
     })
 
+    #: Acks Quotex sends ONLY in answer to an order it accepted. Unlike the shared
+    #: `_ack_response` bucket, the arrival of one of these while an order is pending is
+    #: itself the confirmation — so it resolves the order even when the payload is thinner
+    #: than expected, rather than being held to the strict shape the noisy bucket needs.
+    _DEFINITIVE_ACKS = frozenset({
+        "s_orders/open", "orders/open", "orders/opened", "order/opened",
+        "order/created", "s_order/created",
+    })
+
     def _absorb_order_events(self, event, data):
         if event not in self._ACK_EVENTS and event not in self._CLOSE_EVENTS:
             return
@@ -391,7 +418,7 @@ class QuotexLiveData:
             if _is_settlement(row):
                 self._record_settlement(row)
             elif event in self._ACK_EVENTS:
-                self._resolve_pending_order(row)
+                self._resolve_pending_order(row, event)
 
     def _record_settlement(self, row):
         order_id = row.get("id") or row.get("order_id") or row.get("ticket")
@@ -404,33 +431,56 @@ class QuotexLiveData:
             for stale in list(self.closed_orders)[:200]:
                 self.closed_orders.pop(stale, None)
 
-    def _resolve_pending_order(self, row):
+    def _resolve_pending_order(self, row, event):
         if not self._pending_orders:
             return
-        order_id = row.get("id") or row.get("order_id") or row.get("ticket")
+
+        order_id = _find_order_id(row)
         rejected = bool(row.get("error")) or row.get("isSuccessful") is False
-        # `_ack_response` is a catch-all bucket — the acknowledgement of `settings/apply`
-        # arrives in it too, microseconds before the order's own. Resolving on that gave
-        # back a settings echo with no id, which the app then recorded as an order it
-        # could never find again.
-        names_an_order = bool(order_id) and any(
-            key in row for key in ("asset", "openPrice", "open_price", "amount", "command")
-        )
-        if not names_an_order and not rejected:
-            return
+        definitive = event in self._DEFINITIVE_ACKS
+
+        # The shared `_ack_response` bucket also carries the reply to `settings/apply`,
+        # sent microseconds before the order — a payload with no id that must not be taken
+        # for the order's own acknowledgement. A frame Quotex sends ONLY in answer to an
+        # order (s_orders/open and its kin) needs no such proof: its arrival while an
+        # order is pending IS the confirmation, whatever fields it happens to carry.
+        if not definitive and not rejected:
+            names_an_order = bool(order_id) and any(
+                key in row for key in ("asset", "openPrice", "open_price", "amount", "command")
+            )
+            if not names_an_order:
+                return
 
         request_id = row.get("requestId") or row.get("request_id")
         row_asset = str(row.get("asset") or "")
-        for entry in list(self._pending_orders):
-            req, asset, future = entry
-            if request_id is not None and str(request_id) != str(req):
-                continue
-            if request_id is None and row_asset and row_asset != asset:
-                continue
+
+        def hand_to(entry):
             self._pending_orders.remove(entry)
+            _, _, future = entry
             if not future.done():
+                # Guarantee the caller an id to track the trade by. Quotex's own deal id
+                # when it sent one; the request id as a last resort, so a confirmed order
+                # is never discarded merely because the ack was thin.
+                if not _find_order_id(row):
+                    row.setdefault("id", str(entry[0]))
                 future.set_result(row)
-            return
+
+        # Best: the broker echoed the request id we sent.
+        if request_id is not None:
+            for entry in list(self._pending_orders):
+                if str(request_id) == str(entry[0]):
+                    return hand_to(entry)
+
+        # Next: same instrument as a waiting order.
+        if row_asset:
+            for entry in list(self._pending_orders):
+                if row_asset == entry[1]:
+                    return hand_to(entry)
+
+        # A definitive ack with neither — orders go out one at a time, so the oldest
+        # waiter is the one this answers.
+        if definitive or rejected:
+            return hand_to(self._pending_orders[0])
 
     async def wait_outcome(self, order_id, timeout_seconds):
         """The settlement for an order placed here, or None if it did not arrive in time."""
@@ -726,9 +776,7 @@ class QuotexLiveData:
         if response.get("error") or response.get("isSuccessful") is False:
             msg = response.get("message") or response.get("error") or "Order rejected by Quotex"
             raise BrokerError(str(msg))
-        if not (response.get("id") or response.get("order_id") or response.get("ticket")):
-            # Without an id the trade cannot be followed to its result, and reporting it
-            # as placed would leave it open in the app forever.
-            raise BrokerError("Quotex accepted the order but returned no id to track it by.")
+        # The resolver guarantees an id — the broker's own when it sent one, the request id
+        # as a fallback — so a confirmed order is never rejected here for a thin ack.
         return response
 

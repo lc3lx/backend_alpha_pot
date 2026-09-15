@@ -142,18 +142,38 @@ async def test_a_refusal_is_raised_rather_than_returned_as_an_order(live):
         await asyncio.wait_for(task, 1)
 
 
-async def test_an_accepted_order_with_no_id_is_a_failure(live):
-    # It cannot be followed to a result, and reporting it as placed leaves the trade open
-    # in the app forever.
+async def test_a_definitive_ack_without_an_id_still_confirms_the_order(live):
+    # s_orders/open is sent only in answer to an order. When it carries no deal id, the
+    # order is still confirmed — the request id stands in — rather than being discarded
+    # and left to time out on a trade the broker actually opened.
     task = asyncio.create_task(live.place_order("EURUSD_otc", 5.0, 60, "call", is_demo=True))
     await asyncio.sleep(0.05)
     req = request_id_of(live)
 
-    live.on_event("orders/open", {"asset": "EURUSD_otc", "amount": 5.0, "requestId": req})
+    live.on_event("s_orders/open", {"asset": "EURUSD_otc", "requestId": req})
+    result = await asyncio.wait_for(task, 1)
+    assert result["id"] == str(req)
+
+
+async def test_a_definitive_ack_matches_the_waiter_by_asset_alone(live):
+    # No request id echoed and no id — but the instrument matches the pending order, and
+    # the event is one Quotex sends only for an order. That is enough to confirm it.
+    task = asyncio.create_task(live.place_order("GBPUSD_otc", 5.0, 60, "put", is_demo=True))
     await asyncio.sleep(0.05)
-    # Nothing named an order, so nothing resolved it.
-    assert not task.done()
-    task.cancel()
+
+    live.on_event("s_orders/open", {"asset": "GBPUSD_otc", "openPrice": 1.27})
+    result = await asyncio.wait_for(task, 1)
+    assert result["openPrice"] == 1.27
+
+
+async def test_the_deal_id_is_found_even_when_nested(live):
+    task = asyncio.create_task(live.place_order("EURUSD_otc", 5.0, 60, "call", is_demo=True))
+    await asyncio.sleep(0.05)
+    req = request_id_of(live)
+
+    live.on_event("s_orders/open", {"deal": {"id": "nested-deal"}, "requestId": req})
+    result = await asyncio.wait_for(task, 1)
+    assert result["deal"]["id"] == "nested-deal"
 
 
 async def test_placing_an_order_needs_nothing_from_the_vendor_client(live):
