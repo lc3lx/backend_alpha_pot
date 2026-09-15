@@ -599,7 +599,12 @@ public sealed class BrokerGatewayClient : IBrokerClient
         try
         {
             var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-            return body.Length > 200 ? body[..200] : body;
+            // Generous, not unbounded. This used to cut at 200 chars, which sliced the
+            // gateway's own {"detail":"..."} through the middle of the string — the JSON
+            // then failed to parse and the real reason was replaced by "gateway error
+            // (502)". The body is a small JSON object; a giant one is a runaway page we
+            // still do not want to hold, so cap it well above any real message.
+            return body.Length > 4000 ? body[..4000] : body;
         }
         catch
         {
