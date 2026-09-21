@@ -593,23 +593,8 @@ async function main() {
           await emailInput.waitFor({ state: 'attached', timeout: 5000 });
           await passInput.waitFor({ state: 'attached', timeout: 5000 });
 
-          await emailInput.fill(email).catch(() => {});
-          await passInput.fill(password).catch(() => {});
-          await emailInput.evaluate((node, v) => {
-            if (!(node instanceof HTMLInputElement)) return;
-            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-            if (setter) setter.call(node, v); else node.value = v;
-            node.dispatchEvent(new Event('input', { bubbles: true }));
-            node.dispatchEvent(new Event('change', { bubbles: true }));
-          }, email);
-          await passInput.evaluate((node, v) => {
-            if (!(node instanceof HTMLInputElement)) return;
-            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-            if (setter) setter.call(node, v); else node.value = v;
-            node.dispatchEvent(new Event('input', { bubbles: true }));
-            node.dispatchEvent(new Event('change', { bubbles: true }));
-          }, password);
-          await page.waitForTimeout(400);
+          await emailInput.fill(email);
+          await passInput.fill(password);
 
           if (!isSignup) {
             try {
@@ -750,7 +735,7 @@ async function main() {
       } else {
         // Quotex: wait up to 12s for navigation to /trade, while checking for errors or PIN prompt
         const navWaitStarted = Date.now();
-        const maxQxWait = Math.min(Math.max(waitBudgetMs, 18_000), 20_000);
+        const maxQxWait = Math.min(waitBudgetMs, 12000);
         while (!wsToken && Date.now() - navWaitStarted < maxQxWait) {
           if (page.url().includes('/trade')) break;
 
@@ -770,8 +755,7 @@ async function main() {
             const body = document.body?.innerText || '';
             if (/invalid email or password/i.test(body)) return 'Invalid email or password';
             if (/user not found/i.test(body)) return 'User not found';
-            if (/too many attempts|try again later|unusual activity|temporarily blocked/i.test(body))
-              return 'Too many attempts. Please wait a few minutes and try once.';
+            if (/too many attempts/i.test(body)) return 'Too many attempts. Please try again later.';
             return null;
           }).catch(() => null);
 
@@ -785,7 +769,7 @@ async function main() {
             const pinBox = document.querySelector('input[name="code"], input[placeholder*="code" i]');
             if (pinBox) return true;
             const body = document.body?.innerText || '';
-            return /enter the pin-code|pin-code|verification code|one-time|enter the code/i.test(body);
+            return /enter the pin-code|pin-code/i.test(body);
           }).catch(() => false);
 
           if (pinPromptDetected) {
@@ -933,9 +917,6 @@ async function main() {
       let error = isSignup
         ? `${preset.label} signup did not return a session token`
         : `${preset.label} login failed or the session token was not captured`;
-      const pageHint = diag
-        ? ` [${diag.url || ''} | ${(diag.textSnippet || '').slice(0, 180)}]`
-        : '';
 
       const lastBody = redactAuthBody(
         [...(apiResult.attempts || [])].reverse().find((a) => a.body)?.body || '',
@@ -974,12 +955,7 @@ async function main() {
         // operator nothing to act on.
         const snippet = lastBody ? ` Server said: ${lastBody.slice(0, 120)}` : '';
         error = `${error} [${apiHint}]${snippet}`;
-      } else if (/too many|try again later|unusual activity|temporarily blocked/i.test(diag?.textSnippet || '')) {
-        error = 'Too many attempts. Please wait a few minutes and try once.';
       }
-
-      if (pageHint && !error.includes(diag?.url || 'no-url'))
-        error = `${error}${pageHint}`;
 
       process.stdout.write(JSON.stringify({ ok: false, error }));
       process.exit(1);

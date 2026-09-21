@@ -353,8 +353,8 @@ public sealed class MarketAppService
         var broker = await _brokers.GetAsync(_currentUser.UserId, ct).ConfigureAwait(false);
         var client = _sessions.Get(_currentUser.UserId, broker);
         if (client is not null &&
-            client.Lifecycle is not SessionLifecycleState.AuthenticationFailed
-                and not SessionLifecycleState.SessionExpired)
+            client.IsTransportConnected &&
+            client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
         {
             return client;
         }

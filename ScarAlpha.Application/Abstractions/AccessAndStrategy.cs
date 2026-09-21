@@ -98,15 +98,6 @@ public interface IBinollaSessionRestorer
     /// per-account, so retrying on behalf of someone else only deepens it.
     /// </summary>
     void MarkCredentialLoginFailed(Guid userId, bool blockedByBroker);
-
-    /// <summary>
-    /// A headless capture is starting. Background restore must stand down so it does not
-    /// take the broker's one proxy IP while the person is signing in.
-    /// </summary>
-    void MarkCaptureStarted(Guid userId);
-
-    /// <summary>Capture finished (success or failure). Restore may resume.</summary>
-    void MarkCaptureEnded(Guid userId);
 }
 
 public enum StrategyCatalogStatus

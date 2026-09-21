@@ -77,7 +77,7 @@ public sealed class Phase5RsiTests
         var closes = OversoldWithRespectedBounce();
         var candles = CreateClosedCandles(closes);
 
-        // Punch a gap exceeding MaxFillGapSeconds (6 hours) before the last 10 bars: the contiguous tail is then too short to trust.
+        // Punch a gap exceeding MaxFillGapSeconds (2 hours) before the last 10 bars: the contiguous tail is then too short to trust.
         for (var i = 0; i < candles.Count - 10; i++)
         {
             candles[i] = candles[i] with { Timestamp = candles[i].Timestamp.AddHours(-10) };

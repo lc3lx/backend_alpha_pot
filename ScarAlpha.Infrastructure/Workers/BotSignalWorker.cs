@@ -333,23 +333,17 @@ public sealed class BotSignalWorker : IHostedService
                 client.Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected))
             {
                 restorer.EnsureBackgroundRestore(bot.UserId);
-                // Quotex reconnects from the stored SSID. Credential relogin launches a
-                // headless browser and was being fired every worker tick — that is what
-                // knocked live sockets down when the customer tab was closed.
-                if (broker == Brokers.Binolla)
+                try
                 {
-                    try
+                    using (AmbientUserContext.Use(bot.UserId))
                     {
-                        using (AmbientUserContext.Use(bot.UserId))
-                        {
-                            var binolla = scope.ServiceProvider.GetRequiredService<BinollaAppService>();
-                            await binolla.TryReloginFromStoredCredentialsAsync(ct).ConfigureAwait(false);
-                        }
+                        var binolla = scope.ServiceProvider.GetRequiredService<BinollaAppService>();
+                        await binolla.TryReloginFromStoredCredentialsAsync(ct).ConfigureAwait(false);
                     }
-                    catch
-                    {
-                        // soft — next tick retries
-                    }
+                }
+                catch
+                {
+                    // soft — next tick retries
                 }
 
                 client = sessions.Get(bot.UserId, broker);

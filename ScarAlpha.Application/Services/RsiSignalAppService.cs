@@ -142,7 +142,7 @@ public sealed class RsiSignalAppService
                 "rsi_soft_not_live",
                 new { symbol, wirePeriod });
             // #endregion
-            return SoftNone(symbol, wirePeriod) with { AutomationError = "NOT_CONNECTED" };
+            return SoftNone(symbol, wirePeriod);
         }
 
         if (PairPayoutGate.MinPayoutPercent > 0)
