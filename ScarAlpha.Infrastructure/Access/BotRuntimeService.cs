@@ -442,13 +442,14 @@ public sealed class BotRuntimeService : IBotRuntimeService
             NormalizeMarketType(marketTypeId));
     }
 
-    /// <summary>Unknown ids fall back to the always-available RSI strategy.</summary>
     internal static string NormalizeStrategy(string? strategyId)
     {
         var id = strategyId?.Trim();
         if (string.Equals(id, "ema", StringComparison.OrdinalIgnoreCase)) return "ema";
         if (string.Equals(id, "smart", StringComparison.OrdinalIgnoreCase)) return "smart";
         if (string.Equals(id, "alt5", StringComparison.OrdinalIgnoreCase)) return "alt5";
+        if (string.Equals(id, "time_analysis", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(id, "temporal", StringComparison.OrdinalIgnoreCase)) return "time_analysis";
         return "rsi";
     }
 

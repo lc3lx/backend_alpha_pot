@@ -100,7 +100,7 @@ class BrokerSession(abc.ABC):
     async def list_assets(self) -> list[TradingAsset]: ...
 
     @abc.abstractmethod
-    async def get_candles(self, asset: str, period_seconds: int, count: int = 200) -> list[Candle]:
+    async def get_candles(self, asset: str, period_seconds: int, count: int = 600) -> list[Candle]:
         """
         Closed bars, oldest first, for `asset`.
 

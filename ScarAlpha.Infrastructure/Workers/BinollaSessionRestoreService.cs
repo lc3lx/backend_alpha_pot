@@ -4,6 +4,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using ScarAlpha.Application.Abstractions;
+using ScarAlpha.Application.Common;
 using ScarAlpha.Application.Services;
 using ScarAlpha.Binolla.Abstractions;
 using ScarAlpha.Binolla.Models;
@@ -54,6 +55,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
     {
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _ = Task.Run(() => RunStartupRestoreAsync(_cts.Token));
+        _ = Task.Run(() => RunKeepAliveRestoreAsync(_cts.Token));
         return Task.CompletedTask;
     }
 
@@ -85,7 +87,43 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
         }
     }
 
-    public async Task RestoreApprovedSessionsAsync(CancellationToken ct = default)
+    /// <summary>
+    /// Keeps Quotex/Binolla sessions up after the browser is gone. Startup restore is a
+    /// one-shot; without this a dropped socket stays dead until the next API restart.
+    /// </summary>
+    private async Task RunKeepAliveRestoreAsync(CancellationToken ct)
+    {
+        try
+        {
+            await _initialDone.Task.WaitAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            return;
+        }
+
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+            await Task.Delay(TimeSpan.FromSeconds(30), ct).ConfigureAwait(false);
+                await RestoreApprovedSessionsAsync(ct, verbose: false).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Session keep-alive restore wave failed; next pass in 30s");
+            }
+        }
+    }
+
+    public Task RestoreApprovedSessionsAsync(CancellationToken ct = default) =>
+        RestoreApprovedSessionsAsync(ct, verbose: true);
+
+    private async Task RestoreApprovedSessionsAsync(CancellationToken ct, bool verbose)
     {
         if (!_options.Enabled)
         {
@@ -93,7 +131,25 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
             return;
         }
 
-        IReadOnlyList<(Guid UserId, Guid LinkId)> targets;
+        if (CaptureRunning)
+        {
+            if (verbose)
+            {
+                _logger.LogInformation("Session restore paused — a user is signing in");
+            }
+            return;
+        }
+
+        try
+        {
+            await _brokerSessions.RefreshGatewaySessionsAsync(ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Gateway session refresh before restore failed");
+        }
+
+        IReadOnlyList<(Guid UserId, Guid LinkId, string Broker)> targets;
         try
         {
             await using var scope = _scopeFactory.CreateAsyncScope();
@@ -108,7 +164,11 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                     (l.ApprovalStatus == AdminApprovalStatus.Approved ||
                      l.ApprovalStatus == AdminApprovalStatus.Pending) &&
                     l.ApprovalStatus != AdminApprovalStatus.Rejected)
-                .Select(l => (l.UserId, l.Id))
+                .Select(l => (l.UserId, l.Id, Brokers.Normalize(l.Broker)))
+                .Where(t => !IsLive(t.UserId)
+                            && !IsCoolingDown(t.UserId)
+                            && !IsCapturing(t.UserId)
+                            && !_authFailed.ContainsKey(t.UserId))
                 .ToList();
         }
         catch (Exception ex)
@@ -117,12 +177,29 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
             return;
         }
 
-        _logger.LogInformation(
-            "Binolla session restore starting for {Count} approved/pending linked user(s); parallelism={Parallelism}",
-            targets.Count, Math.Max(1, _options.MaxDegreeOfParallelism));
+        if (targets.Count == 0)
+        {
+            if (verbose)
+            {
+                _logger.LogInformation(
+                    "Session restore wave finished; nothing to reconnect; activeSessions={Binolla} gateway={Gateway}",
+                    _sessions.ActiveSessionCount, _brokerSessions.ActiveSessionCount);
+            }
+            return;
+        }
+
+        if (verbose)
+        {
+            _logger.LogInformation(
+                "Session restore starting for {Count} approved/pending linked user(s); parallelism={Parallelism}",
+                targets.Count, Math.Max(1, _options.MaxDegreeOfParallelism));
+        }
+
+        var binolla = targets.Where(t => t.Broker == Brokers.Binolla).ToList();
+        var gateway = targets.Where(t => t.Broker != Brokers.Binolla).ToList();
 
         using var gate = new SemaphoreSlim(Math.Max(1, _options.MaxDegreeOfParallelism));
-        var tasks = targets.Select(async item =>
+        var tasks = binolla.Select(async item =>
         {
             await gate.WaitAsync(ct).ConfigureAwait(false);
             try
@@ -137,9 +214,17 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
 
         await Task.WhenAll(tasks).ConfigureAwait(false);
 
+        // Quotex handshakes share process-level transport install. Three at once is what
+        // produced NOT_CONNECTED on the second and third users while the first stayed up.
+        foreach (var item in gateway)
+        {
+            if (ct.IsCancellationRequested) break;
+            await RestoreOneAsync(item.UserId, maxAttempts: _options.MaxAttempts, ct).ConfigureAwait(false);
+        }
+
         _logger.LogInformation(
-            "Binolla session restore wave finished; activeSessions={Active}",
-            _sessions.ActiveSessionCount);
+            "Session restore wave finished; activeSessions={Binolla} gateway={Gateway}",
+            _sessions.ActiveSessionCount, _brokerSessions.ActiveSessionCount);
     }
 
     public async Task<bool> TryRestoreUserAsync(Guid userId, CancellationToken ct = default)
@@ -368,10 +453,16 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
             }
         }
 
-        if (string.IsNullOrWhiteSpace(ssid) &&
-            (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(password)))
+        if (string.IsNullOrWhiteSpace(ssid))
         {
-            return false;
+            // Quotex will not authenticate from email/password on this socket. Trying it
+            // every keep-alive pass is what raced the customer's sign-in and made
+            // Playwright fail to capture a token.
+            if (broker == Brokers.Quotex)
+                return false;
+
+            if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(password))
+                return false;
         }
 
         try
@@ -411,7 +502,18 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                 }
             }
 
-            MarkGatewayRestoreFailed(userId);
+            if (broker == Brokers.Quotex)
+            {
+                // Connection refused / timeout is the gateway bouncing, not a dead SSID.
+                // Treating it as auth-failed is what froze restore after a deploy and
+                // left the chart empty until someone signed in again.
+                if (ex is ApiException api && api.StatusCode is 503 or 504)
+                    return false;
+
+                _authFailed[userId] = 1;
+            }
+
+            MarkGatewayRestoreFailed(userId, authFailed: true);
             return false;
         }
     }
@@ -432,11 +534,11 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
     /// entry point already checks — holds this user off without a second mechanism to
     /// keep in step.</para>
     /// </summary>
-    private void MarkGatewayRestoreFailed(Guid userId)
+    private void MarkGatewayRestoreFailed(Guid userId, bool authFailed = false)
     {
         var failures = _credentialFailures.AddOrUpdate(userId, 1, (_, n) => n + 1);
-        var baseSeconds = Math.Max(1, _options.FailureCooldownSeconds);
-        var factor = Math.Min(1 << Math.Min(failures - 1, 6), 32);
+        var baseSeconds = authFailed ? 300 : Math.Max(60, _options.FailureCooldownSeconds);
+        var factor = Math.Min(1 << Math.Min(failures - 1, 4), 8);
         var delay = Math.Min(baseSeconds * factor, 900);
         _retryAfterUtc[userId] = DateTimeOffset.UtcNow.AddSeconds(delay);
     }
@@ -753,12 +855,47 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
 
     private bool IsCoolingDown(Guid userId)
     {
+        if (_retryAfterUtc.TryGetValue(userId, out var until) && until > DateTimeOffset.UtcNow)
+            return true;
         return false;
     }
 
     private void SetFailureCooldown(Guid userId)
     {
-        _retryAfterUtc.TryRemove(userId, out _);
+        _retryAfterUtc[userId] = DateTimeOffset.UtcNow.AddSeconds(Math.Max(60, _options.FailureCooldownSeconds));
+    }
+
+    public void MarkCaptureStarted(Guid userId)
+    {
+        lock (_globalGate)
+        {
+            _captureHolders.Add(userId);
+        }
+    }
+
+    public void MarkCaptureEnded(Guid userId)
+    {
+        ReleaseGlobalSlot(userId);
+        _credentialInFlight.TryRemove(userId, out _);
+    }
+
+    private bool IsCapturing(Guid userId)
+    {
+        lock (_globalGate)
+        {
+            return _captureHolders.Contains(userId);
+        }
+    }
+
+    private bool CaptureRunning
+    {
+        get
+        {
+            lock (_globalGate)
+            {
+                return _captureHolders.Count > 0;
+            }
+        }
     }
 
     private async Task MarkLinkDisconnectedAsync(Guid userId, string reason, CancellationToken ct)

@@ -6,6 +6,11 @@ public static class BotAssetList
     /// <summary>Hard ceiling — enough for full Binolla FX lists.</summary>
     public const int MaxAssets = 2000;
 
+    public const string AllSymbol = "*";
+
+    public static bool IsAll(IReadOnlyList<string>? assets) =>
+        assets is not null && assets.Any(a => string.Equals(a.Trim(), AllSymbol, StringComparison.OrdinalIgnoreCase) || string.Equals(a.Trim(), "all", StringComparison.OrdinalIgnoreCase));
+
     public static IReadOnlyList<string> Normalize(string? asset, IEnumerable<string>? assets)
     {
         var set = new List<string>();
@@ -13,6 +18,11 @@ public static class BotAssetList
         {
             if (string.IsNullOrWhiteSpace(value)) return;
             var trimmed = value.Trim();
+            if (string.Equals(trimmed, AllSymbol, StringComparison.OrdinalIgnoreCase) || string.Equals(trimmed, "all", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!set.Contains(AllSymbol)) set.Insert(0, AllSymbol);
+                return;
+            }
             if (!FxCurrencyAssets.IsCurrencyPair(trimmed))
                 return;
             if (set.Any(x => string.Equals(x, trimmed, StringComparison.OrdinalIgnoreCase)))
@@ -28,6 +38,8 @@ public static class BotAssetList
         }
 
         Add(asset);
+        if (set.Contains(AllSymbol))
+            return new[] { AllSymbol };
         return set;
     }
 
@@ -38,5 +50,5 @@ public static class BotAssetList
     }
 
     public static bool Contains(IReadOnlyList<string> assets, string symbol) =>
-        assets.Any(a => string.Equals(a, symbol, StringComparison.OrdinalIgnoreCase));
+        IsAll(assets) || assets.Any(a => string.Equals(a, symbol, StringComparison.OrdinalIgnoreCase));
 }

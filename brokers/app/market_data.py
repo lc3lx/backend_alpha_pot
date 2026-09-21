@@ -58,6 +58,10 @@ class MarketData:
         self._feed: dict[tuple[str, int], tuple[str, Callable[[], bool]]] = {}
         #: asset -> (epoch seconds, price)
         self._quotes: dict[str, tuple[float, float]] = {}
+        #: (asset, timeframe) -> monotonic time of the last history/load we asked for.
+        #: Without a cooldown a gappy series would fire history/load on every chart poll.
+        self._history_reload_at: dict[tuple[str, int], float] = {}
+        self._history_reload_cooldown = 30.0
         self._lock = asyncio.Lock()
 
     # ---- reading ----------------------------------------------------------
@@ -72,6 +76,48 @@ class MarketData:
             return False
         # One bar of slack; past that the stream is not keeping the series current.
         return (time.monotonic() - seen) < (period_seconds + 15)
+
+    def _series(self, asset: str, period_seconds: int) -> Series:
+        bucket = self._bars.get((asset, period_seconds))
+        if bucket:
+            return bucket
+        alt = asset[:-4] if asset.endswith("_otc") else f"{asset}_otc"
+        return self._bars.get((alt, period_seconds), {})
+
+    def needs_history(self, asset: str, period_seconds: int, min_bars: int = 50) -> bool:
+        """
+        True when the stored series cannot support RSI: too few bars, last bar stale,
+        or a hole inside the recent window. Live ticks on top of a 4-hour gap look
+        "fresh" but leave the bot with two minutes of contiguous history.
+        """
+        bucket = self._series(asset, period_seconds)
+        if len(bucket) < min_bars:
+            return True
+        now = time.time()
+        last = max(bucket)
+        if now - last > period_seconds * 3:
+            return True
+        lookback = now - max(period_seconds * 200, 10800)
+        stamps = sorted(k for k in bucket if k >= lookback)
+        if len(stamps) < min_bars:
+            return True
+        gap_limit = max(period_seconds * 2, 120)
+        for i in range(1, len(stamps)):
+            if stamps[i] - stamps[i - 1] > gap_limit:
+                return True
+        return False
+
+    def should_reload_history(self, asset: str, period_seconds: int) -> bool:
+        if not self.needs_history(asset, period_seconds):
+            return False
+        last = self._history_reload_at.get((asset, period_seconds), 0.0)
+        return (time.monotonic() - last) >= self._history_reload_cooldown
+
+    def mark_history_reload(self, asset: str, period_seconds: int) -> None:
+        now = time.monotonic()
+        self._history_reload_at[(asset, period_seconds)] = now
+        alt = asset[:-4] if asset.endswith("_otc") else f"{asset}_otc"
+        self._history_reload_at[(alt, period_seconds)] = now
 
     def quote(self, asset: str) -> tuple[float, float] | None:
         hit = self._quotes.get(asset)
@@ -123,11 +169,10 @@ class MarketData:
                 except Exception:
                     alive = False  # an unanswerable session counts as gone
 
-                # Whoever holds it — including this same caller. `get_candles` subscribes
-                # on every read, so without this the pair was re-subscribed on every poll:
-                # production logs showed the same `depth/follow` fired once or twice a
-                # second per pair, for pairs that were already streaming.
-                if alive:
+                # Skip a live feed only when the stored series is also complete.
+                # Ticks arriving on top of a multi-hour hole look fresh and used to
+                # skip history/load, leaving RSI with 2–3 contiguous bars.
+                if alive and not self.should_reload_history(asset, period_seconds):
                     return
 
             # Load whatever previous runs left on disk before the first tick arrives, so
@@ -136,6 +181,8 @@ class MarketData:
                 self._bars[key] = self._store.load(asset, period_seconds)
 
             self._feed[key] = (user_id, is_alive)
+            if self.needs_history(asset, period_seconds):
+                self.mark_history_reload(asset, period_seconds)
 
         try:
             result = subscribe()
@@ -161,7 +208,7 @@ class MarketData:
 
     def apply_candle(self, asset: str, period_seconds: int, row: dict[str, Any]) -> None:
         """Folds one streamed update into the shared series."""
-        ts = _num(row.get("time") or row.get("from") or row.get("timestamp"))
+        ts = _epoch_seconds(_num(row.get("time") or row.get("from") or row.get("timestamp")))
         close = _num(row.get("close") or row.get("price") or row.get("value"))
         if ts is None or close is None:
             return
@@ -199,7 +246,7 @@ class MarketData:
         bucket = self._bars.setdefault(key, {})
         valid = 0
         for row in rows:
-            ts = _num(row.get("time") or row.get("from") or row.get("timestamp"))
+            ts = _epoch_seconds(_num(row.get("time") or row.get("from") or row.get("timestamp")))
             close = _num(row.get("close") or row.get("price") or row.get("value"))
             if ts is None or close is None:
                 continue
@@ -230,7 +277,7 @@ class MarketData:
         price = _num(row.get("price") or row.get("close") or row.get("value"))
         if price is None:
             return
-        ts = _num(row.get("time") or row.get("timestamp")) or time.time()
+        ts = _epoch_seconds(_num(row.get("time") or row.get("timestamp"))) or time.time()
         self._quotes[asset] = (float(ts), price)
 
     def flush(self) -> None:
@@ -251,6 +298,15 @@ def _num(value: Any) -> float | None:
         return float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _epoch_seconds(value: float | None) -> float | None:
+    if value is None:
+        return None
+    # Quotex history sometimes arrives in milliseconds.
+    if value >= 1_000_000_000_000:
+        return value / 1000.0
+    return value
 
 
 #: One store per broker, shared by every session on it.

@@ -190,14 +190,23 @@ public sealed class TradeAppService
             await _links.UpsertAsync(link, ct);
         }
 
-        if (PairPayoutGate.MinPayoutPercent > 0)
+        var assets = await client.GetTradingAssetsAsync(ct);
+        var match = assets.FirstOrDefault(a => string.Equals(a.Symbol, request.Asset.Trim(), StringComparison.OrdinalIgnoreCase));
+        if (match is not null)
         {
-            var payout = await PairPayoutGate.TryGetPayoutAsync(client, request.Asset.Trim(), ct);
-            if (payout is int known && !PairPayoutGate.IsTradable(known))
+            if (!match.IsOpen)
+            {
+                throw new ApiException(
+                    ApiErrorCodes.BinollaMarketUnavailable,
+                    $"Market for {request.Asset} is currently closed.",
+                    400);
+            }
+
+            if (PairPayoutGate.MinPayoutPercent > 0 && !PairPayoutGate.IsTradable(match.PayoutPercentage))
             {
                 throw new ApiException(
                     ApiErrorCodes.ValidationError,
-                    $"Pair payout ({known}%) is below the minimum {PairPayoutGate.MinPayoutPercent}%.",
+                    $"Pair payout ({match.PayoutPercentage}%) is below the minimum {PairPayoutGate.MinPayoutPercent}%.",
                     400);
             }
         }
@@ -288,22 +297,24 @@ public sealed class TradeAppService
         }
         catch (BinollaOrderException ex)
         {
-            await FailTradeAsync(trade, MapOrderError(ex.Message), ct);
-            throw new ApiException(trade.ErrorCode!, "Trade could not be opened.", 400);
+            await RemoveFailedPendingTradeAsync(trade, CancellationToken.None);
+            var mappedCode = MapOrderError(ex.Message);
+            throw new ApiException(mappedCode, "Trade could not be opened.", 400);
         }
         catch (BinollaAuthenticationException)
         {
-            await FailTradeAsync(trade, ApiErrorCodes.BinollaSessionExpired, ct);
-            throw new ApiException(ApiErrorCodes.BinollaSessionExpired, "Binolla session expired.", 401);
+            await RemoveFailedPendingTradeAsync(trade, CancellationToken.None);
+            throw new ApiException(ApiErrorCodes.BinollaSessionExpired, $"{broker} session expired.", 401);
         }
         catch (ApiException)
         {
+            await RemoveFailedPendingTradeAsync(trade, CancellationToken.None);
             throw;
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Trade placement failed for user {UserId} tradeId={TradeId}", userId, trade.Id);
-            await FailTradeAsync(trade, ApiErrorCodes.BinollaConnectionFailed, ct);
+            await RemoveFailedPendingTradeAsync(trade, CancellationToken.None);
             throw new ApiException(ApiErrorCodes.BinollaConnectionFailed, "Unable to place trade.", 502);
         }
     }
@@ -376,6 +387,21 @@ public sealed class TradeAppService
         return Map(trade);
     }
 
+    private async Task RemoveFailedPendingTradeAsync(Trade trade, CancellationToken ct)
+    {
+        try
+        {
+            await _trades.DeleteAsync(trade.Id, ct);
+            _logger.LogInformation(
+                "Unplaced pending trade removed user={UserId} tradeId={TradeId} asset={Asset}",
+                trade.UserId, trade.Id, trade.Asset);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to remove unplaced pending trade {TradeId}", trade.Id);
+        }
+    }
+
     private async Task FailTradeAsync(Trade trade, string errorCode, CancellationToken ct)
     {
         var status = trade.Status;
@@ -384,7 +410,7 @@ public sealed class TradeAppService
             trade.Status = status;
             trade.ErrorCode = errorCode;
             trade.UpdatedAt = DateTimeOffset.UtcNow;
-            await _trades.UpdateAsync(trade, ct);
+            await _trades.UpdateAsync(trade, CancellationToken.None);
             _logger.LogInformation(
                 "Trade failed user={UserId} tradeId={TradeId} code={Code}",
                 trade.UserId, trade.Id, errorCode);

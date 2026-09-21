@@ -157,3 +157,47 @@ async def test_a_dead_own_feed_is_reopened(market):
     )
 
     assert calls == ["a1", "a2"]
+
+
+def _recent_bars(market, n: int, gap_before_last: int = 0) -> None:
+    now = int(time.time()) - (int(time.time()) % 60)
+    live = 3 if gap_before_last else n
+    older = n - live if gap_before_last else 0
+    if older:
+        old_end = now - gap_before_last - 60
+        for i in range(older):
+            market.apply_candle("EURUSD_otc", 60, candle(old_end - (older - 1 - i) * 60, 1.10))
+    for i in range(live):
+        market.apply_candle("EURUSD_otc", 60, candle(now - (live - 1 - i) * 60, 1.20))
+
+
+async def test_a_gappy_series_reloads_history_even_when_ticks_are_fresh(market):
+    calls: list[str] = []
+    _recent_bars(market, n=83, gap_before_last=16800)
+
+    await market.ensure_feed(
+        "EURUSD_otc", 60, "user-a", lambda: calls.append("a"), lambda: True
+    )
+    market._history_reload_at.clear()  # noqa: SLF001
+    await market.ensure_feed(
+        "EURUSD_otc", 60, "user-b", lambda: calls.append("b"), lambda: True
+    )
+
+    assert market.needs_history("EURUSD_otc", 60) is True
+    assert calls == ["a", "b"]
+
+
+async def test_contiguous_recent_series_does_not_reload(market):
+    calls: list[str] = []
+    _recent_bars(market, n=80)
+
+    await market.ensure_feed(
+        "EURUSD_otc", 60, "user-a", lambda: calls.append("a"), lambda: True
+    )
+    market._history_reload_at.clear()  # noqa: SLF001
+    await market.ensure_feed(
+        "EURUSD_otc", 60, "user-b", lambda: calls.append("b"), lambda: True
+    )
+
+    assert market.needs_history("EURUSD_otc", 60) is False
+    assert calls == ["a"]

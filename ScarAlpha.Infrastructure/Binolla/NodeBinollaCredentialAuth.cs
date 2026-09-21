@@ -144,9 +144,10 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         string? pinCode,
         CancellationToken cancellationToken)
     {
+        var useXvfb = !OperatingSystem.IsWindows() && File.Exists("/usr/bin/xvfb-run");
         var psi = new ProcessStartInfo
         {
-            FileName = _nodeExecutable,
+            FileName = useXvfb ? "/usr/bin/xvfb-run" : _nodeExecutable,
             WorkingDirectory = _toolDirectory,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -162,13 +163,20 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         if (!string.IsNullOrWhiteSpace(_proxyServer))
             psi.Environment["BINOLLA_AUTH_PROXY"] = _proxyServer;
 
+        if (useXvfb)
+        {
+            psi.ArgumentList.Add("-a");
+            psi.ArgumentList.Add("--server-args=-screen 0 1366x768x24");
+            psi.ArgumentList.Add(_nodeExecutable);
+        }
+
         psi.ArgumentList.Add("capture.mjs");
         psi.ArgumentList.Add("--broker");
         psi.ArgumentList.Add(broker);
         psi.ArgumentList.Add("--mode");
         psi.ArgumentList.Add(mode);
         psi.ArgumentList.Add("--headless");
-        psi.ArgumentList.Add(_headless ? "true" : "false");
+        psi.ArgumentList.Add(useXvfb ? "false" : (_headless ? "true" : "false"));
         // Only override the script's own URLs when this deployment has been told to. The
         // defaults live in one table beside the login logic, so a new venue does not need
         // a matching set of appsettings keys before it can be used at all.
@@ -250,6 +258,11 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
 
         if (!result.Ok || string.IsNullOrWhiteSpace(result.Token) || result.Token.Length < 16)
         {
+            _logger.LogWarning(
+                "{Broker} capture failed: {Error}",
+                broker,
+                string.IsNullOrWhiteSpace(result.Error) ? "(no error)" : result.Error);
+
             if (result.PinRequired == true || (result.Error?.Contains("PIN", StringComparison.OrdinalIgnoreCase) == true))
             {
                 throw new ApiException(ApiErrorCodes.QuotexPinRequired, result.Error ?? "Quotex PIN code required.", 400);

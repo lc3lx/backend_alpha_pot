@@ -29,6 +29,7 @@ public sealed class RsiSignalAppService
     private readonly IBotRuntimeService _botRuntime;
     private readonly ITradeRepository _tradeRepository;
     private readonly IBinollaLinkRepository _links;
+    private readonly CohortSignalCache _decisions;
     private readonly ILogger<RsiSignalAppService> _logger;
 
     public RsiSignalAppService(
@@ -48,6 +49,7 @@ public sealed class RsiSignalAppService
         IBotRuntimeService botRuntime,
         ITradeRepository tradeRepository,
         IBinollaLinkRepository links,
+        CohortSignalCache decisions,
         ILogger<RsiSignalAppService> logger)
     {
         _currentUser = currentUser;
@@ -66,6 +68,7 @@ public sealed class RsiSignalAppService
         _botRuntime = botRuntime;
         _tradeRepository = tradeRepository;
         _links = links;
+        _decisions = decisions;
         _logger = logger;
     }
 
@@ -104,8 +107,8 @@ public sealed class RsiSignalAppService
             AccountAppService.EnsureConnectedForMarket(access);
         }
 
-        // While a live trade is open for this user: do not analyze / place.
-        if (!skipMarketAccess && await IsAnalysisPausedAsync(ct))
+        // While a live trade is open for this user: do not auto-execute.
+        if (autoExecute && !skipMarketAccess && await IsAnalysisPausedAsync(ct))
         {
             return SoftNone(asset.Trim(), periodSeconds) with
             {
@@ -114,6 +117,20 @@ public sealed class RsiSignalAppService
         }
 
         var symbol = asset.Trim();
+        var isAllAssets = symbol == "*" || string.Equals(symbol, "all", StringComparison.OrdinalIgnoreCase);
+        if (isAllAssets)
+        {
+            var broker = await CurrentBrokerAsync(ct).ConfigureAwait(false);
+            var cohort = SignalCohort.For(broker, strategyId, periodSeconds * options.ExpiryCandles);
+            var decision = _decisions.TryGet(cohort, periodSeconds, DateTimeOffset.UtcNow);
+            if (decision is { Candidates.Count: > 0 })
+            {
+                return decision.Candidates[0].Signal;
+            }
+
+            symbol = "EURUSD_otc";
+        }
+
         var wirePeriod = BinollaMarketPeriods.NormalizeHistoryPeriod(periodSeconds);
         var client = await EnsureLiveClientAsync(ct);
         if (client is null)
@@ -125,7 +142,7 @@ public sealed class RsiSignalAppService
                 "rsi_soft_not_live",
                 new { symbol, wirePeriod });
             // #endregion
-            return SoftNone(symbol, wirePeriod);
+            return SoftNone(symbol, wirePeriod) with { AutomationError = "NOT_CONNECTED" };
         }
 
         if (PairPayoutGate.MinPayoutPercent > 0)
@@ -137,7 +154,7 @@ public sealed class RsiSignalAppService
             }
         }
 
-        if (!skipMarketAccess && await IsAnalysisPausedAsync(ct))
+        if (autoExecute && !skipMarketAccess && await IsAnalysisPausedAsync(ct))
         {
             return SoftNone(symbol, wirePeriod) with { AutomationError = "OPEN_TRADE_EXISTS" };
         }
@@ -152,12 +169,12 @@ public sealed class RsiSignalAppService
             client.EnsureMarketDataWarm(symbol, wirePeriod);
         try
         {
-            if (!skipMarketAccess && await IsAnalysisPausedAsync(ct))
+            if (autoExecute && !skipMarketAccess && await IsAnalysisPausedAsync(ct))
             {
                 return SoftNone(symbol, wirePeriod) with { AutomationError = "OPEN_TRADE_EXISTS" };
             }
 
-            if (!quoteFresh)
+            if (!quoteFresh && !skipMarketAccess)
                 quoteFresh = await WaitForFreshQuoteAsync(client, symbol, maxQuoteAgeSeconds, ct);
 
             var now = DateTimeOffset.UtcNow;
@@ -181,16 +198,16 @@ public sealed class RsiSignalAppService
             // Pine's checkpoint + win/loss counters, advanced on the closed series.
             _emaTracker.Resolve(_currentUser.UserId, symbol, analysis.ClosedCandles, wirePeriod);
 
-            if (!skipMarketAccess && await IsAnalysisPausedAsync(ct))
+            if (autoExecute && !skipMarketAccess && await IsAnalysisPausedAsync(ct))
             {
-                return SoftNone(symbol, wirePeriod) with { AutomationError = "OPEN_TRADE_EXISTS" };
+                return SoftNone(symbol, wirePeriod, analysis.Rsi) with { AutomationError = "OPEN_TRADE_EXISTS" };
             }
 
             _ = ApplyLiveQuoteToCandles(client, symbol, candles, wirePeriod, now);
 
             var lastClosed = candles.LastOrDefault(c => c.Timestamp + period <= now);
             if (lastClosed is { } closedBar &&
-                (now - (closedBar.Timestamp + period)).TotalSeconds > wirePeriod)
+                (now - (closedBar.Timestamp + period)).TotalSeconds > wirePeriod * 3)
             {
                 // #region agent log
                 ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
@@ -206,7 +223,10 @@ public sealed class RsiSignalAppService
                     },
                     runId: "live-rsi");
                 // #endregion
-                return SoftNone(symbol, wirePeriod);
+                var staleRsi = analysis.Rsi > 0m ? analysis.Rsi : (analysis.Closes.Count >= options.Period + 1
+                    ? Math.Round(Indicators.Rsi(analysis.Closes, options.Period)!.Value, 2, MidpointRounding.AwayFromZero)
+                    : 0m);
+                return SoftNone(symbol, wirePeriod, staleRsi);
             }
 
             // EMA runs purely on its own settings — no coupling to the regime switch.
@@ -241,7 +261,7 @@ public sealed class RsiSignalAppService
                 : strategyId;
             if (engineId is null)
             {
-                return SoftNone(symbol, wirePeriod) with
+                return SoftNone(symbol, wirePeriod, analysis.Rsi) with
                 {
                     AutomationError = RegimeRouting.RejectUnclear,
                     Regime = analysis.Regime?.Regime ?? MarketRegime.Unclear,
@@ -480,6 +500,21 @@ public sealed class RsiSignalAppService
                     },
                     runId: "rsi-parity");
                 // #endregion
+                if (prepared.Count >= options.Period + 1)
+                {
+                    var partialCloses = prepared.Closes;
+                    var partialRsi = Math.Round(Indicators.Rsi(partialCloses, options.Period)!.Value, 2, MidpointRounding.AwayFromZero);
+                    return new MarketAnalysis(
+                        Asset: symbol,
+                        TimeframeSeconds: wirePeriod,
+                        ClosedBarTime: prepared.Last.Timestamp + period,
+                        ClosedCandles: prepared.Closed,
+                        Closes: partialCloses,
+                        Rsi: partialRsi,
+                        CallBacktest: null,
+                        PutBacktest: null,
+                        Regime: null);
+                }
                 return null;
             }
 
@@ -511,12 +546,12 @@ public sealed class RsiSignalAppService
                 Regime: regime);
         }, ct);
 
-    private static StrategySignal SoftNone(string symbol, int periodSeconds) =>
+    private static StrategySignal SoftNone(string symbol, int periodSeconds, decimal rsi = 0m) =>
         new(
             StrategyId: "rsi",
             Asset: symbol,
             Signal: "None",
-            Rsi: 0m,
+            Rsi: rsi,
             CandleTime: DateTimeOffset.UtcNow,
             Timeframe: periodSeconds.ToString());
 
@@ -796,7 +831,7 @@ public sealed class RsiSignalAppService
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, SemaphoreSlim> _autoTradeGates = new();
 
-    private async Task<string?> GetReachedDailyLimitAsync(BotRuntimeConfig bot, CancellationToken ct)
+    public async Task<string?> GetReachedDailyLimitAsync(BotRuntimeConfig bot, CancellationToken ct)
     {
         if ((!bot.AutoStopAtProfit || bot.DailyProfitTarget <= 0m) &&
             (!bot.AutoStopAtLoss || bot.DailyLossLimit <= 0m))
@@ -836,10 +871,27 @@ public sealed class RsiSignalAppService
         if (AsLiveClient(_brokers.Get(userId, broker)) is { } live)
             return live;
 
-        // Signal polling is latency-sensitive; reconnect without blocking this request.
-        _restorer.EnsureBackgroundRestore(userId);
+        if (AsLiveClient(_brokers.Get(userId, broker)) is { } restored)
+            return restored;
 
-        return AsLiveClient(_brokers.Get(userId, broker));
+        if (!string.Equals(broker, Brokers.Binolla, StringComparison.OrdinalIgnoreCase))
+        {
+            var userClient = _brokers.Get(userId, broker);
+            if (userClient is not null && userClient.IsTransportConnected)
+                return userClient;
+
+            var anyClient = _brokers.GetAny(broker);
+            if (anyClient is not null && anyClient.IsTransportConnected)
+                return anyClient;
+
+            if (userClient is not null)
+                return userClient;
+
+            if (anyClient is not null)
+                return anyClient;
+        }
+
+        return null;
     }
 
     private static IBrokerClient? AsLiveClient(IBrokerClient? client) =>

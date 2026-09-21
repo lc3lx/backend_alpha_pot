@@ -50,6 +50,17 @@ public static class PairPayoutGate
         return map.TryGetValue(asset.Trim(), out var payout) ? payout : null;
     }
 
+    public static async Task<bool> IsAssetOpenAsync(
+        IBrokerClient client,
+        string asset,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(asset)) return false;
+        var assets = await client.GetTradingAssetsAsync(ct).ConfigureAwait(false);
+        var match = assets.FirstOrDefault(a => string.Equals(a.Symbol, asset.Trim(), StringComparison.OrdinalIgnoreCase));
+        return match is not null && match.IsOpen;
+    }
+
     public static async Task<IReadOnlyDictionary<string, int>> BuildPayoutMapAsync(
         IBrokerClient client,
         CancellationToken ct = default)
@@ -58,7 +69,7 @@ public static class PairPayoutGate
         var map = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         foreach (var asset in assets)
         {
-            if (asset.PayoutPercentage <= 0 || string.IsNullOrWhiteSpace(asset.Symbol)) continue;
+            if (!asset.IsOpen || asset.PayoutPercentage <= 0 || string.IsNullOrWhiteSpace(asset.Symbol)) continue;
             map[asset.Symbol.Trim()] = asset.PayoutPercentage;
         }
 

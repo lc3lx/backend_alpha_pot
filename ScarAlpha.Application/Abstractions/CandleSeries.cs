@@ -38,10 +38,17 @@ public static class CandleSeries
         var barLength = TimeSpan.FromSeconds(periodSeconds);
 
         // One bar per bucket, ascending. Later entries win (they are the fresher tick).
+        // Each bucket's timestamp is normalized to exact bucket start to prevent fractional second drift.
         var ordered = candles
             .OrderBy(c => c.Timestamp)
             .GroupBy(c => c.Timestamp.ToUnixTimeSeconds() / periodSeconds)
-            .Select(g => g.Last())
+            .Select(g =>
+            {
+                var last = g.Last();
+                var bucketStartUnix = (last.Timestamp.ToUnixTimeSeconds() / periodSeconds) * periodSeconds;
+                var bucketStart = DateTimeOffset.FromUnixTimeSeconds(bucketStartUnix);
+                return last with { Timestamp = bucketStart, EndTimestamp = bucketStart + barLength };
+            })
             .OrderBy(c => c.Timestamp)
             .ToList();
 
@@ -50,12 +57,63 @@ public static class CandleSeries
         var closed = ordered.Where(c => c.Timestamp + barLength <= now).ToList();
         var forming = ordered.LastOrDefault(c => c.Timestamp + barLength > now);
 
-        var contiguous = ContiguousTail(closed, periodSeconds);
+        var filled = FillSmallGaps(closed, periodSeconds);
+        var contiguous = ContiguousTail(filled, periodSeconds);
         return new Prepared(
             Closed: contiguous,
             Forming: forming,
             RawCount: closed.Count,
-            GapsDropped: closed.Count - contiguous.Count);
+            GapsDropped: filled.Count - contiguous.Count);
+    }
+
+    /// <summary>
+    /// Maximum gap size (in seconds) to forward-fill. A dropped Quotex session can
+    /// leave a multi-hour hole with live ticks on top; filling up to 6 hours keeps
+    /// RSI computable until history/load backfills real bars. Larger gaps (weekend
+    /// on non-OTC) stay untouched so ContiguousTail stops at them.
+    /// </summary>
+    public const int MaxFillGapSeconds = 21600;
+
+    /// <summary>
+    /// Forward-fills small gaps between closed bars with the previous close.
+    /// Larger gaps (e.g. market closure) are left untouched so ContiguousTail
+    /// can stop at them cleanly.
+    /// </summary>
+    public static List<RsiCandle> FillSmallGaps(IReadOnlyList<RsiCandle> closed, int periodSeconds)
+    {
+        if (closed.Count <= 1) return closed.ToList();
+
+        var barLength = TimeSpan.FromSeconds(periodSeconds);
+        var result = new List<RsiCandle>(closed.Count + 16);
+        result.Add(closed[0]);
+
+        for (var i = 1; i < closed.Count; i++)
+        {
+            var prev = result[^1];
+            var curr = closed[i];
+            var gapSeconds = (curr.Timestamp - prev.Timestamp).TotalSeconds;
+
+            if (gapSeconds > periodSeconds + 0.5d && gapSeconds <= MaxFillGapSeconds)
+            {
+                var nextTime = prev.Timestamp + barLength;
+                while (nextTime + TimeSpan.FromSeconds(0.5d) < curr.Timestamp)
+                {
+                    result.Add(new RsiCandle(
+                        Timestamp: nextTime,
+                        Close: prev.Close,
+                        EndTimestamp: nextTime + barLength,
+                        High: prev.Close,
+                        Low: prev.Close,
+                        Open: prev.Close,
+                        Volume: 0m));
+                    nextTime += barLength;
+                }
+            }
+
+            result.Add(curr);
+        }
+
+        return result;
     }
 
     /// <summary>

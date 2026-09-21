@@ -88,12 +88,26 @@ async def test_real_account_authorizes_before_any_balance_request(live):
     assert ws.sent == []
 
 
-async def test_rejected_session_cannot_become_connected(live):
-    async def send(*args):
-        live.on_event("authorization/reject", {})
+async def test_instruments_list_after_auth_counts_as_connected(live):
+    async def send(event, data=None):
+        assert event == "authorization"
+        live.on_event("instruments/list", [[368, "EURUSD_otc", "EUR/USD OTC", "currency", 1, 90]])
+
+    live.send_event = send
+    await live.authenticate("fresh-token", AccountType.DEMO)
+    assert live.auth_error is None
+    assert live.auth_ready.is_set()
+
+
+async def test_reject_after_instruments_list_still_fails(live):
+    async def send(event, data=None):
+        live.on_event("instruments/list", [[368, "EURUSD_otc", "EUR/USD OTC"]])
+        await asyncio.sleep(0.05)
+        live.on_event("authorization/reject", None)
+
     live.send_event = send
     with pytest.raises(AuthError):
-        await live.authenticate("expired", AccountType.DEMO)
+        await live.authenticate("dead-token", AccountType.DEMO)
 
 
 async def test_live_balances_are_shared_by_concurrent_polls_and_include_zero(live):
@@ -157,9 +171,23 @@ async def test_ticks_feed_each_subscribed_period(live):
     live.market.apply_candle = lambda *a: candles.append(a)
     await live.subscribe("EURUSD", 60)
     live.on_event("quotes", [["EURUSD", 1800000000, 1.2, 1]])
-    assert len(quotes) == len(candles) == 1
-    assert candles[0][:2] == ("EURUSD", 60)
-    assert json.loads(live.connection._ws.sent[0][2:])[0] == "instruments/update"
+    assert len(quotes) == 1
+    assert len(candles) >= 1
+    sent = [json.loads(frame[2:])[0] for frame in live.connection._ws.sent]
+    assert sent[0] == "history/load"
+    assert sent.index("history/load") < sent.index("instruments/update")
+
+
+async def test_history_list_without_asset_uses_pending_request(live):
+    applied = []
+    live.market.apply_candles = lambda *a: applied.append(a) or len(a[2])
+    live._last_history_request = ("EURGBP_otc", 60)
+    rows = [[1_800_000_000 + i * 60, 1.1, 1.2, 1.3, 1.0] for i in range(5)]
+    live.on_event("history/list/v2", rows)
+    assert applied
+    assert applied[0][0] == "EURGBP_otc"
+    assert applied[0][1] == 60
+    assert len(applied[0][2]) == 5
 
 
 @pytest.mark.parametrize("reject", [False, True])

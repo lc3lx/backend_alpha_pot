@@ -4,6 +4,8 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using ScarAlpha.Application.Abstractions;
 using ScarAlpha.Application.Common;
+using ScarAlpha.Application.Contracts;
+using ScarAlpha.Application.Services;
 using ScarAlpha.Binolla.Abstractions;
 using ScarAlpha.Binolla.Models;
 using ScarAlpha.Domain.Enums;
@@ -94,13 +96,23 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
                             + OutcomeWaitGraceSeconds + SweepMarginSeconds);
                         if (now >= noIdDeadline && !TradeStateMachine.IsHardTerminal(trade.Status))
                         {
-                            await ApplyStatusAsync(
-                                trades,
-                                trade,
-                                trade.Status == TradeStatus.Pending ? TradeStatus.Failed : TradeStatus.Unknown,
-                                null,
-                                "SWEEP_MISSING_ORDER_ID",
-                                ct);
+                            if (trade.Status == TradeStatus.Pending)
+                            {
+                                await trades.DeleteAsync(trade.Id, ct);
+                                _logger.LogInformation(
+                                    "Sweep: Orphaned pending trade {TradeId} user={UserId} purged (no broker order id)",
+                                    trade.Id, trade.UserId);
+                            }
+                            else
+                            {
+                                await ApplyStatusAsync(
+                                    trades,
+                                    trade,
+                                    TradeStatus.Unknown,
+                                    null,
+                                    "SWEEP_MISSING_ORDER_ID",
+                                    ct);
+                            }
                         }
 
                         continue;
@@ -224,9 +236,9 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
 
                 if (trade.Status == TradeStatus.Pending && string.IsNullOrWhiteSpace(trade.BinollaOrderId))
                 {
-                    await ApplyStatusAsync(trades, trade, TradeStatus.Failed, null, "RECOVERY_PENDING_NO_ORDER", ct);
-                    _logger.LogWarning(
-                        "Recovery: Pending trade {TradeId} user={UserId} marked Failed (no Binolla order id)",
+                    await trades.DeleteAsync(trade.Id, ct);
+                    _logger.LogInformation(
+                        "Recovery: Pending trade {TradeId} user={UserId} purged (no broker order id)",
                         trade.Id, trade.UserId);
                     continue;
                 }
@@ -532,6 +544,48 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
                 _logger.LogInformation(
                     "Pair benched after loss userId={UserId} strategy={Strategy} asset={Asset} forSeconds={Seconds}",
                     trade.UserId, strategyId, trade.Asset, PairCooldownRegistry.CooldownSeconds);
+            }
+        }
+
+        // Time Analysis: 1-step recovery trade (Martingale) immediately in the same direction if loss
+        if (trade.IdempotencyKey.StartsWith("time-signal:", StringComparison.OrdinalIgnoreCase)
+            && !trade.IdempotencyKey.StartsWith("time-signal-recovery:", StringComparison.OrdinalIgnoreCase)
+            && next == TradeStatus.Loss)
+        {
+            try
+            {
+                var botRuntime = scope.ServiceProvider.GetRequiredService<IBotRuntimeService>();
+                var bot = botRuntime.Get(trade.UserId);
+                if (bot.State is BotRunState.Running)
+                {
+                    var recoveryAmount = StakeProgression.CalculateNextAfterLoss(bot.StakeMode, bot.EffectiveBaseAmount, trade.Amount);
+                    var tradeAppService = scope.ServiceProvider.GetRequiredService<TradeAppService>();
+                    var recoveryKey = $"time-signal-recovery:{trade.Id}:{trade.UserId}";
+                    var dirStr = trade.Direction.ToString().ToUpperInvariant();
+                    var duration = trade.DurationSeconds > 0 ? trade.DurationSeconds : 60;
+
+                    var recoveryReq = new PlaceTradeRequest(
+                        Asset: trade.Asset,
+                        Direction: dirStr,
+                        Amount: recoveryAmount,
+                        DurationSeconds: duration,
+                        StrategyId: "time_analysis"
+                    );
+
+                    using (AmbientUserContext.Use(trade.UserId))
+                    {
+                        var placed = await tradeAppService.PlaceTradeAsync(recoveryReq, recoveryKey, ct).ConfigureAwait(false);
+                        _logger.LogInformation(
+                            "Time signal 1-step recovery trade placed userId={UserId} asset={Asset} dir={Dir} amount={Amount} tradeId={TradeId}",
+                            trade.UserId, trade.Asset, dirStr, recoveryAmount, placed.Id);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Failed to place time signal recovery trade for userId={UserId} asset={Asset}",
+                    trade.UserId, trade.Asset);
             }
         }
 

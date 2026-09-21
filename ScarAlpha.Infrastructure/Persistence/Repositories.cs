@@ -281,6 +281,16 @@ public sealed class TradeRepository : ITradeRepository
         await _db.SaveChangesAsync(ct);
     }
 
+    public async Task DeleteAsync(Guid id, CancellationToken ct = default)
+    {
+        var trade = await _db.Trades.FindAsync(new object[] { id }, ct);
+        if (trade is not null)
+        {
+            _db.Trades.Remove(trade);
+            await _db.SaveChangesAsync(ct);
+        }
+    }
+
     private static IQueryable<Trade> Filter(
         IQueryable<Trade> q,
         Guid userId,
@@ -291,6 +301,8 @@ public sealed class TradeRepository : ITradeRepository
         q = q.Where(x => x.UserId == userId);
         if (status.HasValue)
             q = q.Where(x => x.Status == status.Value);
+        else
+            q = q.Where(x => x.Status != TradeStatus.Failed && x.Status != TradeStatus.Pending && x.Status != TradeStatus.Cancelled);
         if (!string.IsNullOrWhiteSpace(asset))
             q = q.Where(x => x.Asset == asset);
         if (accountType.HasValue)
@@ -687,5 +699,73 @@ public sealed class ScopedAppSettingRepository : IAppSettingRepository
         await using var scope = _scopeFactory.CreateAsyncScope();
         var inner = scope.ServiceProvider.GetRequiredService<IAppSettingRepository>();
         await inner.SetAsync(key, value, ct);
+    }
+}
+
+public sealed class TimeSignalRepository : ITimeSignalRepository
+{
+    private readonly AppDbContext _db;
+    public TimeSignalRepository(AppDbContext db) => _db = db;
+
+    public async Task AddAsync(TimeSignal signal, CancellationToken ct = default)
+    {
+        _db.TimeSignals.Add(signal);
+        await _db.SaveChangesAsync(ct);
+    }
+
+    public async Task AddRangeAsync(IEnumerable<TimeSignal> signals, CancellationToken ct = default)
+    {
+        _db.TimeSignals.AddRange(signals);
+        await _db.SaveChangesAsync(ct);
+    }
+
+    public Task<TimeSignal?> GetByIdAsync(Guid id, CancellationToken ct = default) =>
+        _db.TimeSignals.FirstOrDefaultAsync(s => s.Id == id, ct);
+
+    public async Task<(IReadOnlyList<TimeSignal> Items, int Total)> ListAsync(
+        TimeSignalStatus? status,
+        int page,
+        int pageSize,
+        CancellationToken ct = default)
+    {
+        page = Math.Max(1, page);
+        pageSize = Math.Clamp(pageSize, 1, 100);
+        var query = _db.TimeSignals.AsNoTracking();
+
+        if (status is not null)
+            query = query.Where(s => s.Status == status);
+
+        var total = await query.CountAsync(ct);
+        var items = await query
+            .OrderByDescending(s => s.ScheduledTime)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync(ct);
+
+        return (items, total);
+    }
+
+    public async Task<IReadOnlyList<TimeSignal>> GetPendingDueAsync(DateTimeOffset now, int take = 10, CancellationToken ct = default)
+    {
+        return await _db.TimeSignals
+            .Where(s => s.Status == TimeSignalStatus.Pending && s.ScheduledTime <= now)
+            .OrderBy(s => s.ScheduledTime)
+            .Take(take)
+            .ToListAsync(ct);
+    }
+
+    public async Task UpdateAsync(TimeSignal signal, CancellationToken ct = default)
+    {
+        _db.TimeSignals.Update(signal);
+        await _db.SaveChangesAsync(ct);
+    }
+
+    public async Task<bool> DeleteAsync(Guid id, CancellationToken ct = default)
+    {
+        var s = await _db.TimeSignals.FirstOrDefaultAsync(x => x.Id == id, ct);
+        if (s is null) return false;
+        _db.TimeSignals.Remove(s);
+        await _db.SaveChangesAsync(ct);
+        return true;
     }
 }

@@ -3,8 +3,12 @@ using Microsoft.Extensions.Logging;
 using ScarAlpha.Application.Abstractions;
 using ScarAlpha.Application.Common;
 using ScarAlpha.Application.Contracts;
+using ScarAlpha.Binolla.Abstractions;
+using ScarAlpha.Binolla.Models;
 using ScarAlpha.Domain.Entities;
 using ScarAlpha.Domain.Enums;
+using DomainAccount = ScarAlpha.Domain.Enums.BinollaAccountType;
+using EngineAccount = ScarAlpha.Binolla.Models.AccountType;
 
 namespace ScarAlpha.Application.Services;
 
@@ -20,6 +24,10 @@ public sealed class BinollaAuthAppService
     private readonly BinollaAppService _binolla;
     private readonly IConfiguration _configuration;
     private readonly ReferralAppService _referrals;
+    private readonly IBrokerSessionManager _brokers;
+    private readonly IBotAccessService _access;
+    private readonly IBinollaSessionRestorer _restorer;
+    private readonly IUserPasswordHasher _passwords;
     private readonly ILogger<BinollaAuthAppService> _logger;
 
     public BinollaAuthAppService(
@@ -30,6 +38,10 @@ public sealed class BinollaAuthAppService
         BinollaAppService binolla,
         IConfiguration configuration,
         ReferralAppService referrals,
+        IBrokerSessionManager brokers,
+        IBotAccessService access,
+        IBinollaSessionRestorer restorer,
+        IUserPasswordHasher passwords,
         ILogger<BinollaAuthAppService> logger)
     {
         _users = users;
@@ -39,6 +51,10 @@ public sealed class BinollaAuthAppService
         _binolla = binolla;
         _configuration = configuration;
         _referrals = referrals;
+        _brokers = brokers;
+        _access = access;
+        _restorer = restorer;
+        _passwords = passwords;
         _logger = logger;
     }
 
@@ -64,6 +80,113 @@ public sealed class BinollaAuthAppService
         }
 
         await EnsureUserEmailAsync(user, email, ct);
+
+        // FAST-PATH: If user is already registered and the provided password matches our record,
+        // sign them in instantly (< 100ms) without forcing a 60-second headless browser launch.
+        if (!provisioned)
+        {
+            var passwordVerified = false;
+            if (!string.IsNullOrWhiteSpace(user.PasswordHash))
+            {
+                passwordVerified = _passwords.Verify(user.PasswordHash, request.Password);
+            }
+            else if (!string.IsNullOrWhiteSpace(user.EncryptedLoginPassword))
+            {
+                try
+                {
+                    var decrypted = _protector.Decrypt(user.EncryptedLoginPassword);
+                    if (string.Equals(decrypted, request.Password, StringComparison.Ordinal))
+                    {
+                        passwordVerified = true;
+                        // Backfill PasswordHash for future argon/bcrypt verification
+                        user.PasswordHash = _passwords.Hash(request.Password);
+                        user.UpdatedAt = DateTimeOffset.UtcNow;
+                        await _users.UpdateAsync(user, ct);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed decrypting stored login password for user {UserId}", user.Id);
+                }
+            }
+
+            if (passwordVerified)
+            {
+                var link = await _links.GetByUserIdAsync(user.Id, ct);
+                var broker = Brokers.Normalize(request.Broker ?? link?.Broker);
+                var liveClient = _brokers.Get(user.Id, broker);
+                var isLive = liveClient is not null &&
+                             liveClient.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected;
+
+                decimal? balance = null;
+                if (isLive)
+                {
+                    try
+                    {
+                        using var balCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                        balance = (await liveClient!.GetBalanceAsync(balCts.Token)).CurrentBalance;
+                    }
+                    catch { /* non-fatal */ }
+                }
+                else if (link is not null && !string.IsNullOrWhiteSpace(link.EncryptedSsid) && link.Status == BinollaLinkStatus.Connected)
+                {
+                    try
+                    {
+                        using var quickCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+                        var storedSsid = _protector.Decrypt(link.EncryptedSsid);
+                        var storedCookie = !string.IsNullOrWhiteSpace(link.EncryptedCookieHeader)
+                            ? _protector.Decrypt(link.EncryptedCookieHeader)
+                            : null;
+                        var client = await _brokers.GetOrCreateAsync(
+                            user.Id,
+                            broker,
+                            new BrokerCredentials(
+                                Ssid: storedSsid,
+                                CookieHeader: storedCookie,
+                                Email: request.Email.Trim(),
+                                Password: request.Password,
+                                AccountType: link.AccountType == DomainAccount.Demo ? EngineAccount.Demo : EngineAccount.Real),
+                            quickCts.Token);
+
+                        if (client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
+                        {
+                            isLive = true;
+                            try
+                            {
+                                using var balCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                                balance = (await client.GetBalanceAsync(balCts.Token)).CurrentBalance;
+                            }
+                            catch { /* non-fatal */ }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogInformation(ex, "Quick SSID restore during login did not succeed for user {UserId}; background restore will handle it.", user.Id);
+                        _restorer.EnsureBackgroundRestore(user.Id);
+                    }
+                }
+                else
+                {
+                    _restorer.EnsureBackgroundRestore(user.Id);
+                }
+
+                var access = await _access.CheckAsync(user.Id, ct);
+                _logger.LogInformation(
+                    "Fast-path web login user={UserId} email={Email} isLive={IsLive} access={Access}",
+                    user.Id, email, isLive, access.Access);
+
+                return new BinollaAuthResponse(
+                    AccessToken: _jwt.CreateToken(user),
+                    UserId: user.Id.ToString(),
+                    Connected: isLive,
+                    AccountType: (link?.AccountType ?? DomainAccount.Real).ToString(),
+                    Access: AccountAppService.MapAccess(access.Access),
+                    AdminApproved: access.AdminApproved,
+                    ApprovalStatus: access.ApprovalStatus,
+                    LastConnectedAt: link?.LastConnectedAt,
+                    Balance: balance);
+            }
+        }
 
         BinollaConnectResponse connect;
         try

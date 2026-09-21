@@ -44,8 +44,8 @@ public sealed class MarketWarmupWorker : IHostedService
     /// </summary>
     private static readonly TimeSpan SubscribeSpacing = TimeSpan.FromMilliseconds(250);
 
-    /// <summary>Cold pairs warmed per sweep, so one bad pass cannot stall the loop.</summary>
-    private const int MaxWarmPerSweep = 12;
+    /// <summary>Cold pairs warmed per sweep, sized to cover all tradable pairs in one sweep.</summary>
+    private const int MaxWarmPerSweep = 64;
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IBotRuntimeService _botRuntime;
@@ -110,7 +110,7 @@ public sealed class MarketWarmupWorker : IHostedService
     private async Task SweepAsync(CancellationToken ct)
     {
         var running = _botRuntime.ListKnown()
-            .Where(b => b.State == BotRunState.Running && b.ResolvedAssets.Count > 0)
+            .Where(b => b.State == BotRunState.Running && (b.IsAllAssets || b.ResolvedAssets.Count > 0))
             .ToList();
         if (running.Count == 0) return;
 
@@ -124,20 +124,53 @@ public sealed class MarketWarmupWorker : IHostedService
             brokerByUser[userId] = await brokers.GetAsync(userId, ct).ConfigureAwait(false);
 
         // (pair, timeframe) the bots will actually ask for at the next bar close, kept
-        // PER VENUE: a symbol is only meaningful on the broker whose bot asked for it, and
-        // warming a Binolla-only pair on a Quotex socket just burns subscribe slots the
-        // pairs that pair's own users need.
-        var wantedByBroker = running
-            .GroupBy(b => brokerByUser[b.UserId])
-            .ToDictionary(
-                g => g.Key,
-                g => g
-                    .SelectMany(b => FxCurrencyAssets
-                        .FilterSymbols(b.ResolvedAssets)
-                        .Select(a => (Asset: a, Timeframe: StrategyTimeframes.For(b.StrategyId))))
-                    .Distinct()
-                    .OrderBy(x => x.Asset, StringComparer.OrdinalIgnoreCase)
-                    .ToList());
+        // PER VENUE: a symbol is only meaningful on the broker whose bot asked for it.
+        var wantedByBroker = new Dictionary<string, List<(string Asset, int Timeframe)>>();
+        foreach (var group in running.GroupBy(b => brokerByUser[b.UserId]))
+        {
+            var broker = group.Key;
+            var list = new List<(string Asset, int Timeframe)>();
+
+            if (group.Any(b => b.IsAllAssets))
+            {
+                var connectedClient = group
+                    .Select(b => sessions.Get(b.UserId, broker))
+                    .FirstOrDefault(c => c is { IsTransportConnected: true });
+
+                if (connectedClient != null)
+                {
+                    try
+                    {
+                        var assets = await connectedClient.GetTradingAssetsAsync(ct).ConfigureAwait(false);
+                        var openPairs = assets
+                            .Where(a => a.IsOpen && FxCurrencyAssets.IsCurrencyPair(a.Symbol))
+                            .Select(a => (Asset: a.Symbol, Timeframe: 60));
+                        list.AddRange(openPairs);
+                    }
+                    catch
+                    {
+                        // soft fallback below
+                    }
+                }
+
+                if (list.Count == 0)
+                {
+                    list.AddRange(CommonWarmupPairs.Select(p => (Asset: p, Timeframe: 60)));
+                }
+            }
+
+            var specific = group
+                .SelectMany(b => FxCurrencyAssets
+                    .FilterSymbols(b.ResolvedAssets)
+                    .Where(a => a != "*" && !string.Equals(a, "all", StringComparison.OrdinalIgnoreCase))
+                    .Select(a => (Asset: a, Timeframe: StrategyTimeframes.For(b.StrategyId))));
+            list.AddRange(specific);
+
+            wantedByBroker[broker] = list
+                .Distinct()
+                .OrderBy(x => x.Asset, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
 
         if (wantedByBroker.Values.All(v => v.Count == 0)) return;
 
@@ -185,7 +218,10 @@ public sealed class MarketWarmupWorker : IHostedService
                     // soft — next sweep retries
                 }
 
-                await Task.Delay(SubscribeSpacing, ct).ConfigureAwait(false);
+                var spacing = string.Equals(brokerByUser[userId], Brokers.Binolla, StringComparison.OrdinalIgnoreCase)
+                    ? SubscribeSpacing
+                    : TimeSpan.FromMilliseconds(30);
+                await Task.Delay(spacing, ct).ConfigureAwait(false);
             }
         }
 
@@ -207,4 +243,12 @@ public sealed class MarketWarmupWorker : IHostedService
             // #endregion
         }
     }
+
+    private static readonly string[] CommonWarmupPairs =
+    {
+        "EURUSD_otc", "GBPUSD_otc", "USDJPY_otc", "AUDUSD_otc", "USDCAD_otc",
+        "USDCHF_otc", "NZDUSD_otc", "EURGBP_otc", "EURJPY_otc", "GBPJPY_otc",
+        "USDBDT_otc", "USDPKR_otc", "USDEGP_otc", "USDINR_otc", "USDTRY_otc",
+        "USDBRL_otc", "USDMXN_otc", "USDARS_otc", "USDIDR_otc", "USDDZD_otc"
+    };
 }

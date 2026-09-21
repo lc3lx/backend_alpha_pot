@@ -32,10 +32,11 @@ namespace ScarAlpha.Infrastructure.Workers;
 public sealed class BotSignalWorker : IHostedService
 {
     /// <summary>
-    /// Must stay 1: Binolla accepts ONE asset/change at a time. Parallel history fetches
-    /// thrash the socket so only the last pair gets candles — looks like "bot only analyzes one pair".
+    /// For Quotex/Gateway brokers, scanning happens concurrently in parallel (64).
+    /// Binolla accepts ONE asset/change at a time so it stays 1 to avoid thrashing the socket.
     /// </summary>
-    private const int ScanParallelism = 1;
+    private static int GetScanParallelism(string broker) =>
+        string.Equals(broker, Brokers.Binolla, StringComparison.OrdinalIgnoreCase) ? 1 : 64;
 
     /// <summary>
     /// Cohorts are independent decisions, so they scan concurrently. Kept small because
@@ -161,7 +162,7 @@ public sealed class BotSignalWorker : IHostedService
         if (_maintenance.Current.Active) return;
 
         var running = _botRuntime.ListKnown()
-            .Where(b => b.State == BotRunState.Running && b.ResolvedAssets.Count > 0)
+            .Where(b => b.State == BotRunState.Running && (b.IsAllAssets || b.ResolvedAssets.Count > 0) && !IsTimeAnalysis(b.StrategyId))
             .ToList();
         if (running.Count == 0) return;
 
@@ -225,12 +226,14 @@ public sealed class BotSignalWorker : IHostedService
         // from any one bot's raw duration — every member resolves to exactly these options.
         var options = RsiStrategyOptions.Default60Seconds with { ExpiryCandles = cohort.ExpiryCandles };
 
-        // This loop ticks every second, but the decision only changes once per bar. When
-        // this bar has already been decided with nothing to trade there is nothing left
-        // for any user to do, so bail out before touching the database — otherwise 100
-        // bots cost 200 trade queries a second for the ~59 seconds the answer cannot change.
+        var secIntoMin = SecondsIntoMinute();
+        var allowRescan = secIntoMin < 20;
+
+        // When this bar has already been decided with nothing to trade, only bail out if we are
+        // past the initial candle close arrival window (20s). In the first 20 seconds, candles
+        // can land asynchronously from Quotex WebSocket.
         var settled = _decisions.TryGet(cohort, timeframe, DateTimeOffset.UtcNow);
-        if (settled is { Candidates.Count: 0 }) return;
+        if (settled is { Candidates.Count: 0 } && !allowRescan) return;
 
         // Establishing readiness first serves two purposes: it heals dropped Binolla
         // sessions, and it tells us which user may act as the scan's data source. Running
@@ -250,7 +253,6 @@ public sealed class BotSignalWorker : IHostedService
         if (eligible.Count == 0) return;
 
         var scanStarted = DateTimeOffset.UtcNow;
-        var secIntoMin = SecondsIntoMinute();
 
         // THE central step: one decision per cohort per bar, however many users are in it.
         var decision = await _decisions.GetOrAddAsync(
@@ -258,7 +260,8 @@ public sealed class BotSignalWorker : IHostedService
             timeframe,
             DateTimeOffset.UtcNow,
             (barTime, token) => ScanCohortAsync(cohort, eligible, options, barTime, token),
-            ct).ConfigureAwait(false);
+            ct,
+            allowRescanIfEmpty: allowRescan).ConfigureAwait(false);
 
         if (decision is null || decision.Candidates.Count == 0) return;
 
@@ -322,49 +325,67 @@ public sealed class BotSignalWorker : IHostedService
             var sessions = scope.ServiceProvider.GetRequiredService<IBrokerSessionManager>();
             var restorer = scope.ServiceProvider.GetRequiredService<IBinollaSessionRestorer>();
 
-            // Auto-heal Binolla session so Running bots keep trading without manual Start.
-            var client = sessions.Get(bot.UserId, await _brokerResolver.GetAsync(bot.UserId, ct).ConfigureAwait(false));
+            // Auto-heal broker session so Running bots keep trading without manual Start.
+            var broker = await _brokerResolver.GetAsync(bot.UserId, ct).ConfigureAwait(false);
+            var client = sessions.Get(bot.UserId, broker);
             if (client is null ||
                 !client.IsTransportConnected ||
                 client.Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected))
             {
                 restorer.EnsureBackgroundRestore(bot.UserId);
-                try
+                // Quotex reconnects from the stored SSID. Credential relogin launches a
+                // headless browser and was being fired every worker tick — that is what
+                // knocked live sockets down when the customer tab was closed.
+                if (broker == Brokers.Binolla)
                 {
-                    using (AmbientUserContext.Use(bot.UserId))
+                    try
                     {
-                        var binolla = scope.ServiceProvider.GetRequiredService<BinollaAppService>();
-                        await binolla.TryReloginFromStoredCredentialsAsync(ct).ConfigureAwait(false);
+                        using (AmbientUserContext.Use(bot.UserId))
+                        {
+                            var binolla = scope.ServiceProvider.GetRequiredService<BinollaAppService>();
+                            await binolla.TryReloginFromStoredCredentialsAsync(ct).ConfigureAwait(false);
+                        }
+                    }
+                    catch
+                    {
+                        // soft — next tick retries
                     }
                 }
-                catch
-                {
-                    // soft — next tick retries
-                }
-            }
 
-            // Only block on truly live open trades — expired/stuck ones must not freeze the bot.
-            var links = scope.ServiceProvider.GetRequiredService<IBinollaLinkRepository>();
-            var link = await links.GetByUserIdAsync(bot.UserId, ct).ConfigureAwait(false);
-            var accountType = link?.AccountType ?? BinollaAccountType.Demo;
-            if (OpenTradeGate.IsUserHeld(bot.UserId) ||
-                await HasBlockingOpenTradeAsync(trades, bot.UserId, accountType, ct).ConfigureAwait(false))
-            {
-                // #region agent log
-                ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-                    "H-STUCK1",
-                    "BotSignalWorker.PrepareBotAsync",
-                    "worker_skip_blocking_open",
-                    new { userId = bot.UserId.ToString("N")[..8] },
-                    runId: "stuck-running");
-                // #endregion
-                return new BotReadiness(Eligible: false, SkipMarketAccess: true);
+                client = sessions.Get(bot.UserId, broker);
             }
 
             using (AmbientUserContext.Use(bot.UserId))
             {
                 var demo = scope.ServiceProvider.GetRequiredService<IMarketingDemoService>();
                 var isDemo = await demo.IsMarketingDemoAsync(bot.UserId, ct).ConfigureAwait(false);
+
+                // Non-demo users MUST have a live, connected broker session to be eligible.
+                if (!isDemo && (client is null ||
+                    !client.IsTransportConnected ||
+                    client.Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)))
+                {
+                    return new BotReadiness(Eligible: false, SkipMarketAccess: true);
+                }
+
+                // Only block on truly live open trades — expired/stuck ones must not freeze the bot.
+                var links = scope.ServiceProvider.GetRequiredService<IBinollaLinkRepository>();
+                var link = await links.GetByUserIdAsync(bot.UserId, ct).ConfigureAwait(false);
+                var accountType = link?.AccountType ?? BinollaAccountType.Demo;
+                if (OpenTradeGate.IsUserHeld(bot.UserId) ||
+                    await HasBlockingOpenTradeAsync(trades, bot.UserId, accountType, ct).ConfigureAwait(false))
+                {
+                    // #region agent log
+                    ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                        "H-STUCK1",
+                        "BotSignalWorker.PrepareBotAsync",
+                        "worker_skip_blocking_open",
+                        new { userId = bot.UserId.ToString("N")[..8] },
+                        runId: "stuck-running");
+                    // #endregion
+                    return new BotReadiness(Eligible: false, SkipMarketAccess: true);
+                }
+
                 return new BotReadiness(Eligible: true, SkipMarketAccess: !isDemo);
             }
         }
@@ -401,22 +422,16 @@ public sealed class BotSignalWorker : IHostedService
     {
         // Union, not intersection: a pair any member follows is worth analysing, and each
         // user filters the ranked list down to their own selection during fan-out.
-        var assets = FxCurrencyAssets.FilterSymbols(
-            eligible.SelectMany(b => b.ResolvedAssets)
-                .Select(a => a.Trim())
-                .Where(a => a.Length > 0)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToList());
-        if (assets.Count == 0) return null;
-
-        // Scan all assets followed by cohort members. Per-user pair cooldowns are evaluated
-        // individually when picking the trade in ExecuteForBotAsync.
-        var ordered = assets
-            .OrderBy(a => a, StringComparer.OrdinalIgnoreCase)
+        var includeAllOpen = eligible.Any(b => b.IsAllAssets);
+        var rawAssets = eligible.SelectMany(b => b.ResolvedAssets)
+            .Select(a => a.Trim())
+            .Where(a => a.Length > 0 && a != "*" && !string.Equals(a, "all", StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
-        if (ordered.Count == 0) return null;
 
-        ordered = (await FilterTradableByPayoutAsync(cohort.Broker, eligible, ordered, ct).ConfigureAwait(false)).ToList();
+        if (rawAssets.Count == 0 && !includeAllOpen) return null;
+
+        var ordered = (await FilterTradableByPayoutAsync(cohort.Broker, eligible, rawAssets, ct).ConfigureAwait(false)).ToList();
         if (ordered.Count == 0) return null;
         var timeframe = StrategyTimeframes.For(cohort.StrategyId);
 
@@ -468,10 +483,11 @@ public sealed class BotSignalWorker : IHostedService
         var bag = new ConcurrentBag<CohortCandidate>();
         var scanned = 0;
 
-        // Serial by necessity — Binolla accepts one asset/change at a time.
+        // Parallel scan for fast brokers (Quotex), serial for Binolla socket constraints.
+        var parallelism = GetScanParallelism(cohort.Broker);
         await Parallel.ForEachAsync(
             ordered,
-            new ParallelOptions { MaxDegreeOfParallelism = ScanParallelism, CancellationToken = ct },
+            new ParallelOptions { MaxDegreeOfParallelism = parallelism, CancellationToken = ct },
             async (asset, token) =>
             {
                 try
@@ -527,7 +543,8 @@ public sealed class BotSignalWorker : IHostedService
         IReadOnlyList<string> assets,
         CancellationToken ct)
     {
-        if (PairPayoutGate.MinPayoutPercent <= 0 || assets.Count == 0) return assets;
+        var includeAllOpen = eligible.Any(b => b.IsAllAssets);
+        if (PairPayoutGate.MinPayoutPercent <= 0 && !includeAllOpen && assets.Count == 0) return assets;
 
         foreach (var scanUser in eligible.Take(MaxScanCandidates))
         {
@@ -546,12 +563,26 @@ public sealed class BotSignalWorker : IHostedService
                 var payoutMap = await PairPayoutGate.BuildPayoutMapAsync(client, ct).ConfigureAwait(false);
                 if (payoutMap.Count == 0) continue;
 
+                if (includeAllOpen)
+                {
+                    var allOpen = payoutMap.Keys
+                        .Where(k => FxCurrencyAssets.IsCurrencyPair(k) && PairPayoutGate.IsTradable(payoutMap, k));
+                    var merged = assets.Where(a => a != "*").Concat(allOpen).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                    var filtered = PairPayoutGate.FilterTradableSymbols(merged, payoutMap);
+                    if (filtered.Count > 0) return filtered;
+                }
+
                 return PairPayoutGate.FilterTradableSymbols(assets, payoutMap);
             }
             catch
             {
                 // soft — try the next scan candidate
             }
+        }
+
+        if (includeAllOpen && assets.Count == 0)
+        {
+            return FallbackTradableFxPairs;
         }
 
         return assets;
@@ -570,53 +601,71 @@ public sealed class BotSignalWorker : IHostedService
         if (OpenTradeGate.IsUserHeld(userId) || ct.IsCancellationRequested)
             return false;
 
-        var pick = SelectForBot(bot.ResolvedAssets, decision, userId, bot.StrategyId);
-        if (pick is null) return false;
+        var allowedAssets = bot.IsAllAssets
+            ? decision.Candidates.Select(c => c.Asset).ToList()
+            : bot.ResolvedAssets;
 
-        // Re-checked here rather than at scan time: the decision is shared, but its TTL
-        // is wall-clock, and a user reached late must not place a stale entry.
-        if (!IsLiveSetup(pick.Signal, bot.StrategyId)) return false;
+        var selected = allowedAssets.Count > 0
+            ? new HashSet<string>(allowedAssets, StringComparer.OrdinalIgnoreCase)
+            : null;
 
-        try
+        var now = DateTimeOffset.UtcNow;
+        var candidates = decision.Candidates
+            .Where(c => (selected == null || selected.Contains(c.Asset))
+                     && !PairCooldownRegistry.IsBenched(userId, bot.StrategyId, c.Asset, now))
+            .ToList();
+
+        if (candidates.Count == 0) return false;
+
+        foreach (var pick in candidates)
         {
-            await using var execScope = _scopeFactory.CreateAsyncScope();
-            var rsi = execScope.ServiceProvider.GetRequiredService<RsiSignalAppService>();
-            using (AmbientUserContext.Use(userId))
+            if (ct.IsCancellationRequested) break;
+
+            // Re-checked here rather than at scan time: the decision is shared, but its TTL
+            // is wall-clock, and a user reached late must not place a stale entry.
+            if (!IsLiveSetup(pick.Signal, bot.StrategyId)) continue;
+
+            try
             {
-                OpenTradeGate.MarkUserHeld(userId, bot.DurationSeconds);
-                // #region agent log
-                ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
-                    "H-LIVE",
-                    "BotSignalWorker.ExecuteForBotAsync",
-                    "best_execute",
-                    new
-                    {
-                        userId = userId.ToString("N")[..8],
-                        cohort = decision.Cohort.ToString(),
-                        asset = pick.Asset,
-                        signal = pick.Signal.Signal,
-                        liveRsi = pick.Signal.LiveRsi,
-                        closedRsi = pick.Signal.Rsi,
-                        successRate = pick.Signal.Backtest?.SuccessRate,
-                        candidates = decision.Candidates.Count,
-                        secIntoMin = SecondsIntoMinute()
-                    },
-                    runId: "missed-entry");
-                // #endregion
+                await using var execScope = _scopeFactory.CreateAsyncScope();
+                var rsi = execScope.ServiceProvider.GetRequiredService<RsiSignalAppService>();
+                using (AmbientUserContext.Use(userId))
+                {
+                    OpenTradeGate.MarkUserHeld(userId, bot.DurationSeconds);
+                    // #region agent log
+                    ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
+                        "H-LIVE",
+                        "BotSignalWorker.ExecuteForBotAsync",
+                        "best_execute",
+                        new
+                        {
+                            userId = userId.ToString("N")[..8],
+                            cohort = decision.Cohort.ToString(),
+                            asset = pick.Asset,
+                            signal = pick.Signal.Signal,
+                            liveRsi = pick.Signal.LiveRsi,
+                            closedRsi = pick.Signal.Rsi,
+                            successRate = pick.Signal.Backtest?.SuccessRate,
+                            candidates = decision.Candidates.Count,
+                            secIntoMin = SecondsIntoMinute()
+                        },
+                        runId: "missed-entry");
+                    // #endregion
 
-                var executed = await rsi.TryAutoExecuteAsync(pick.Signal, options, ct).ConfigureAwait(false);
-                if (!string.IsNullOrEmpty(executed.AutomatedTradeId))
-                    return true;
+                    var executed = await rsi.TryAutoExecuteAsync(pick.Signal, options, ct).ConfigureAwait(false);
+                    if (!string.IsNullOrEmpty(executed.AutomatedTradeId))
+                        return true;
 
+                    OpenTradeGate.ReleaseUser(userId);
+                }
+            }
+            catch
+            {
                 OpenTradeGate.ReleaseUser(userId);
-                return false;
             }
         }
-        catch
-        {
-            OpenTradeGate.ReleaseUser(userId);
-            return false;
-        }
+
+        return false;
     }
 
     private static async Task<bool> HasBlockingOpenTradeAsync(
@@ -725,4 +774,16 @@ public sealed class BotSignalWorker : IHostedService
             .ThenBy(s => s.Asset, StringComparer.OrdinalIgnoreCase)
             .ToList();
     }
+
+    private static bool IsTimeAnalysis(string? strategyId) =>
+        string.Equals(strategyId?.Trim(), "time_analysis", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(strategyId?.Trim(), "temporal", StringComparison.OrdinalIgnoreCase);
+
+    private static readonly string[] FallbackTradableFxPairs =
+    {
+        "EURUSD_otc", "GBPUSD_otc", "USDJPY_otc", "AUDUSD_otc", "USDCAD_otc",
+        "USDCHF_otc", "NZDUSD_otc", "EURGBP_otc", "EURJPY_otc", "GBPJPY_otc",
+        "USDBDT_otc", "USDPKR_otc", "USDEGP_otc", "USDINR_otc", "USDTRY_otc",
+        "USDBRL_otc", "USDMXN_otc", "USDARS_otc", "USDIDR_otc", "USDDZD_otc"
+    };
 }

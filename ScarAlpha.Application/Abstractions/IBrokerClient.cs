@@ -117,6 +117,9 @@ public interface IBrokerSessionManager
     /// <summary>The user's live client, or null when there is no session.</summary>
     IBrokerClient? Get(Guid userId, string broker);
 
+    /// <summary>Any active client on the named broker, useful for shared read-only market data.</summary>
+    IBrokerClient? GetAny(string broker);
+
     /// <summary>Opens or reuses a session on the named broker.</summary>
     Task<IBrokerClient> GetOrCreateAsync(
         Guid userId,
@@ -125,6 +128,13 @@ public interface IBrokerSessionManager
         CancellationToken ct = default);
 
     Task RemoveAsync(Guid userId, string broker, CancellationToken ct = default);
+
+    /// <summary>
+    /// Asks the gateway which sessions are still actually up, and drops the ones that are
+    /// not. Local flags stay "Connected" after the socket dies until a call fails — this
+    /// is what makes a closed browser look like a live bot.
+    /// </summary>
+    Task RefreshGatewaySessionsAsync(CancellationToken ct = default);
 
     int ActiveSessionCount { get; }
 }

@@ -32,7 +32,6 @@ from typing import Any
 
 from app.market_data import market_data
 from app.proxy import configure_process_proxy, proxy_url
-from app.quotex_ws import install as install_websocket_transport
 from app.quotex_protocol import QuotexLiveData
 from app.brokers.base import (
     AuthError,
@@ -166,14 +165,18 @@ async def _auto_extract_ssid(email: str, password: str) -> str | None:
     if auth_proxy:
         env["BINOLLA_AUTH_PROXY"] = auth_proxy
 
-    cmd = [
+    use_xvfb = os.path.exists("/usr/bin/xvfb-run")
+    cmd = []
+    if use_xvfb:
+        cmd.extend(["/usr/bin/xvfb-run", "-a", "--server-args=-screen 0 1366x768x24"])
+    cmd.extend([
         "node",
         str(script_path),
         "--broker", "quotex",
         "--mode", "login",
-        "--headless", "true",
+        "--headless", "false" if use_xvfb else "true",
         "--timeoutMs", "60000",
-    ]
+    ])
 
     def _run() -> str | None:
         try:
@@ -225,6 +228,8 @@ class QuotexSession(BrokerSession):
         self._password: str | None = None
         self._last_balance: Balance | None = None
         self._connect_lock = asyncio.Lock()
+        self._last_reconnect_attempt: float = 0.0
+        self._reconnect_cooldown: float = 5.0
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -251,6 +256,17 @@ class QuotexSession(BrokerSession):
             if not ssid and (email and password):
                 ssid = await _auto_extract_ssid(email, password)
 
+            # Drop a dead leftover client before opening a new socket. Do not call the
+            # full disconnect() path here — that also releases shared market feeds.
+            if self._client is not None:
+                stale, self._client = self._client, None
+                self._live = None
+                self._data = None
+                try:
+                    await _maybe_await(stale.disconnect())
+                except Exception:
+                    pass
+
             cls = _load_client_cls()
             self.lifecycle = LifecycleState.CONNECTING
 
@@ -258,7 +274,8 @@ class QuotexSession(BrokerSession):
             # the environment when it builds its session, and there is no object to set it on
             # afterwards.
             configure_process_proxy()
-            install_websocket_transport()
+            # Transport is installed once at process start. Re-installing on every
+            # connect raced parallel sessions onto one socket.
 
             # The balance is chosen in the constructor, before the socket exists. Switching
             # after the handshake races the broker's own setup and can leave the session on
@@ -379,6 +396,16 @@ class QuotexSession(BrokerSession):
     def transport_connected(self) -> bool:
         if self._client is None or self.lifecycle != LifecycleState.CONNECTED:
             return False
+        if self._live is not None:
+            if self._live.auth_error is not None:
+                self.lifecycle = LifecycleState.AUTH_FAILED
+                return False
+            # Our live socket is the source of truth. The vendor client's
+            # is_connected() stays false after instruments/list auth, which
+            # used to reconnect every few seconds and kill candles/assets.
+            if self._live.is_alive():
+                return True
+            return False
         try:
             connected = getattr(self._client, "is_connected", None)
             if connected is not None:
@@ -395,8 +422,45 @@ class QuotexSession(BrokerSession):
         except Exception:
             return False
 
+    async def _ensure_connected(self) -> None:
+        if self.transport_connected:
+            return
+        if not (self.ssid or (self._email and self._password)):
+            return
+        # A handshake is already running. Waiting on the lock used to serialize
+        # keep-alive behind a 15s auth, then start another connect the moment
+        # it finished — disconnect/reconnect forever.
+        if self._connect_lock.locked() or self.lifecycle == LifecycleState.CONNECTING:
+            return
+
+        now = time.monotonic()
+        if now - self._last_reconnect_attempt < self._reconnect_cooldown:
+            return
+
+        self._last_reconnect_attempt = now
+        _log(f"Auto-reconnecting session for user {self.user_id}...")
+        try:
+            await self.connect(
+                ssid=self.ssid,
+                email=self._email,
+                password=self._password,
+                account_type=self.account_type,
+            )
+            self._reconnect_cooldown = 5.0
+            if self._subscribed:
+                for asset, period in list(self._subscribed):
+                    try:
+                        await self.subscribe(asset, period)
+                    except Exception:
+                        pass
+        except Exception as e:
+            self._reconnect_cooldown = min(30.0, max(5.0, self._reconnect_cooldown * 1.5))
+            _log(f"Auto-reconnect attempt failed: {e}")
+
     def _require(self) -> Any:
         if self._client is None or not self.transport_connected:
+            if self._live is not None and self._live.auth_error is not None:
+                raise self._live.auth_error
             raise NotConnected("Quotex session is not connected or session token expired.")
         if self._live is not None and self._live.auth_error is not None:
             raise self._live.auth_error
@@ -411,8 +475,11 @@ class QuotexSession(BrokerSession):
         return "polling"
 
     async def get_balance(self) -> Balance:
+        await self._ensure_connected()
         client = self._client
-        if client is None:
+        if client is None or not self.transport_connected:
+            if self._live is not None and self._live.auth_error is not None:
+                raise self._live.auth_error
             if self._last_balance is not None:
                 return self._last_balance
             raise NotConnected("Quotex session is not connected.")
@@ -424,6 +491,9 @@ class QuotexSession(BrokerSession):
                     self._last_balance = bal
                     return bal
             except Exception as ex:
+                if self._live.auth_error is not None:
+                    self.lifecycle = LifecycleState.AUTH_FAILED
+                    raise self._live.auth_error
                 _log(f"live get_balance fallback: {ex}")
 
         enums = _enums()
@@ -470,30 +540,36 @@ class QuotexSession(BrokerSession):
         return Balance(demo=demo, real=real, current_type=self.account_type)
 
     async def change_account(self, account_type: AccountType) -> None:
-        client = self._require()
-        if account_type is self.account_type:
+        if account_type is self.account_type and self.transport_connected:
             return
         self.account_type = account_type
-        if hasattr(client, "config"):
-            try:
-                client.config.is_demo = (account_type is AccountType.DEMO)
-            except Exception:
-                pass
         if self._live is not None:
+            if hasattr(self._client, "config"):
+                try:
+                    self._client.config.is_demo = (account_type is AccountType.DEMO)
+                except Exception:
+                    pass
             if self.ssid:
                 try:
                     await self._live.authenticate(self.ssid, account_type)
                 except Exception as ex:
                     _log(f"live change_account authenticate: {ex}")
+                    raise
+            self._live.assets_at = 0.0
             try:
-                await self._live.send_event("switch_account", {"account_type": "demo" if account_type is AccountType.DEMO else "real"})
+                await self._live.send_event(
+                    "switch_account",
+                    {"account_type": "demo" if account_type is AccountType.DEMO else "real"},
+                )
             except Exception:
                 pass
             try:
+                self._last_balance = None
                 await self._live.get_balance(account_type)
             except Exception:
                 pass
             return
+        client = self._require()
         switch = getattr(client, "switch_account", None) or getattr(
             client, "change_account", None
         )
@@ -509,6 +585,9 @@ class QuotexSession(BrokerSession):
     # ---- market data -------------------------------------------------------
 
     async def list_assets(self) -> list[TradingAsset]:
+        if self._live is not None and self._live.assets:
+            return await self._live.list_assets()
+        await self._ensure_connected()
         client = self._require()
         if self._live is not None:
             return await self._live.list_assets()
@@ -541,28 +620,43 @@ class QuotexSession(BrokerSession):
         return assets
 
     async def get_candles(
-        self, asset: str, period_seconds: int, count: int = 200
+        self, asset: str, period_seconds: int, count: int = 600
     ) -> list[Candle]:
-        # Streamed, not fetched: this library exposes no history call, so the series is
-        # whatever has arrived since the pair was subscribed. Subscribing here (rather
-        # than only in `subscribe`) means a first request starts the feed instead of
-        # failing outright — it will simply return few or no bars until it fills.
-        await self.subscribe(asset, period_seconds)
+        def _bucket() -> dict:
+            found = self._market.bars(asset, period_seconds)
+            if found:
+                return found
+            alt = asset[:-4] if asset.endswith("_otc") else f"{asset}_otc"
+            return self._market.bars(alt, period_seconds)
 
-        bucket = self._market.bars(asset, period_seconds)
-        if len(bucket) < min(count, 100):
-            for _ in range(15):
-                await asyncio.sleep(0.1)
-                bucket = self._market.bars(asset, period_seconds)
-                if len(bucket) >= min(count, 100):
-                    break
+        bucket = _bucket()
+        # Shared history is enough to draw the chart even while this socket
+        # reconnects. Reload when the series is missing, stale, OR has a hole
+        # that would leave RSI with only the last few live minutes.
+        now = time.time()
+        last_ts = max(bucket.keys()) if bucket else 0
+        need_history = self._market.should_reload_history(asset, period_seconds) or (
+            len(bucket) < min(count, 100) or (now - last_ts) > (period_seconds * 3)
+        )
+        if need_history:
+            try:
+                await self._ensure_connected()
+                if self.transport_connected:
+                    await self.subscribe(asset, period_seconds)
+                    for _ in range(50):
+                        await asyncio.sleep(0.1)
+                        bucket = _bucket()
+                        last_ts = max(bucket.keys()) if bucket else 0
+                        if not self._market.needs_history(asset, period_seconds) and (
+                            len(bucket) >= min(count, 50)
+                            and (now - last_ts) <= (period_seconds * 3)
+                        ):
+                            break
+            except Exception:
+                bucket = _bucket()
 
         now = time.time()
-        # A bar is closed once its whole period is behind us. The forming bar is what
-        # makes an indicator disagree with the broker's own chart, and no downstream
-        # calibration can undo it.
         cutoff = int(now) - (int(now) % period_seconds)
-
         candles = [
             Candle(
                 timestamp=start,
@@ -573,7 +667,9 @@ class QuotexSession(BrokerSession):
                 volume=values[4] if values[4] else None,
             )
             for start, values in sorted(bucket.items())
-            if start + period_seconds <= cutoff
+            # Include the forming bar so the chart has a live candle, not only
+            # closed history. RSI still splits forming off downstream.
+            if start <= cutoff
         ]
         return candles[-count:]
 
@@ -585,6 +681,7 @@ class QuotexSession(BrokerSession):
         return Quote(asset=asset, timestamp=ts, price=price)
 
     async def subscribe(self, asset: str, period_seconds: int = 60) -> None:
+        await self._ensure_connected()
         client = self._require()
         key = (asset, period_seconds)
 
@@ -659,6 +756,7 @@ class QuotexSession(BrokerSession):
     async def place_order(
         self, asset: str, amount: float, duration_seconds: int, direction: str
     ) -> OrderResponse:
+        await self._ensure_connected()
         client = self._require()
         enums = _enums()
         side = (
@@ -676,7 +774,7 @@ class QuotexSession(BrokerSession):
                 direction="call" if side.name in ("CALL", "BUY", "UP") else "put",
                 is_demo=is_demo,
             )
-            order_id = str(res.get("id") or res.get("order_id") or "")
+            order_id = str(res.get("id") or res.get("order_id") or res.get("uuid") or res.get("ticket") or "")
             open_price = float(res.get("openPrice") or res.get("open_price") or 0.0)
             now_ts = time.time()
             return OrderResponse(

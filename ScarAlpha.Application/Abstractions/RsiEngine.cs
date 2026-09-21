@@ -14,7 +14,7 @@ public sealed record RsiStrategyOptions(
     decimal Oversold,
     decimal Overbought,
     int TimeframeSeconds,
-    int BacktestCandleCount = 200,
+    int BacktestCandleCount = 400,
     int ExpiryCandles = 5,
     decimal MinimumSuccessRate = 75m,
     /// <summary>
@@ -58,7 +58,7 @@ public static class RsiEntryLevels
 {
     private static decimal _callMax = 25m;
     private static decimal _putMin = 75m;
-    private static int _minZoneVisits = 2;
+    private static int _minZoneVisits = 1;
 
     /// <summary>
     /// Call entry ceiling — RSI must close at or below this. Configurable

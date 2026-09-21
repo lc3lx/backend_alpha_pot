@@ -303,7 +303,7 @@ public static class StrategyEndpoints
             [FromQuery] int rsiLength = 14,
             [FromQuery] decimal oversold = 25m,
             [FromQuery] decimal overbought = 75m,
-            [FromQuery] int backtestCandles = 200,
+            [FromQuery] int backtestCandles = 400,
             [FromQuery] int expiryCandles = 5,
             [FromQuery] decimal minimumSuccessRate = 75m) =>
         {
@@ -561,6 +561,41 @@ public static class AdminEndpoints
             AdminReferralAppService svc,
             CancellationToken ct) =>
             Results.Ok(await svc.MarkRewardPaidAsync(rewardId, request, ct)));
+
+        var timeSignals = app.MapGroup("/api/admin/time-signals")
+            .WithTags("Admin")
+            .RequireAuthorization("AdminOnly");
+
+        timeSignals.MapPost("/preview", (
+            [FromBody] TimeSignalPreviewRequest request,
+            TimeSignalAppService svc) =>
+            Results.Ok(svc.Preview(request)));
+
+        timeSignals.MapPost("/bulk", async (
+            [FromBody] TimeSignalBulkCreateRequest request,
+            TimeSignalAppService svc,
+            CancellationToken ct) =>
+            Results.Ok(await svc.CreateBulkAsync(request, ct)));
+
+        timeSignals.MapGet("/", async (
+            TimeSignalAppService svc,
+            CancellationToken ct,
+            [FromQuery] string? status = null,
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 50) =>
+            Results.Ok(await svc.ListSignalsAsync(status, page, pageSize, ct)));
+
+        timeSignals.MapPost("/{id:guid}/cancel", async (
+            Guid id,
+            TimeSignalAppService svc,
+            CancellationToken ct) =>
+            Results.Ok(await svc.CancelSignalAsync(id, ct)));
+
+        timeSignals.MapDelete("/{id:guid}", async (
+            Guid id,
+            TimeSignalAppService svc,
+            CancellationToken ct) =>
+            Results.Ok(new { deleted = await svc.DeleteSignalAsync(id, ct) }));
 
         return group;
     }

@@ -117,6 +117,7 @@ class WebSocketTransport:
         self._stopped = threading.Event()
         self._send_lock = threading.Lock()
         self._ping_interval = 25.0
+        self._last_recv_time = time.monotonic()
 
         self._on_message: Callable[[str], None] | None = None
         self._on_error: Callable[[Exception], None] | None = None
@@ -379,6 +380,7 @@ class WebSocketTransport:
                 break
 
             text = frame.decode() if isinstance(frame, (bytes, bytearray)) else str(frame)
+            self._last_recv_time = time.monotonic()
 
             # Engine.IO housekeeping never reaches the protocol layer above.
             if text == _PONG:
@@ -409,6 +411,18 @@ class WebSocketTransport:
                 break
             if not self._running.is_set() or not self.is_connected():
                 break
+
+            # Silence watchdog: If we haven't received ANY frame from Quotex in >90 seconds,
+            # the TCP stream is dead/stalled (Cloudflare silent drop or network blip).
+            time_since_recv = time.monotonic() - self._last_recv_time
+            if time_since_recv > max(90.0, self._ping_interval * 3.0):
+                _log(
+                    f"silence timeout: no frame received for {time_since_recv:.1f}s; "
+                    "tearing down dead socket"
+                )
+                self._fail(TimeoutError("Quotex WebSocket silence timeout"))
+                break
+
             try:
                 if not self.send(_PING):
                     break

@@ -30,6 +30,7 @@ public sealed class AppDbContext : DbContext
     public DbSet<ReferralCommission> ReferralCommissions => Set<ReferralCommission>();
     public DbSet<ReferralReward> ReferralRewards => Set<ReferralReward>();
     public DbSet<ReferralPayout> ReferralPayouts => Set<ReferralPayout>();
+    public DbSet<TimeSignal> TimeSignals => Set<TimeSignal>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -190,6 +191,20 @@ public sealed class AppDbContext : DbContext
             e.Property(x => x.Destination).HasMaxLength(256);
             e.Property(x => x.DecidedBy).HasMaxLength(256);
             e.Property(x => x.AdminNote).HasMaxLength(512);
+        });
+
+        modelBuilder.Entity<TimeSignal>(e =>
+        {
+            e.ToTable("time_signals");
+            e.HasKey(x => x.Id);
+            e.HasIndex(x => new { x.Status, x.ScheduledTime });
+            e.HasIndex(x => x.ScheduledTime);
+            e.Property(x => x.Asset).HasMaxLength(64).IsRequired();
+            e.Property(x => x.RawAsset).HasMaxLength(64).IsRequired();
+            e.Property(x => x.Direction).HasMaxLength(16).IsRequired();
+            e.Property(x => x.Status).HasConversion<int>();
+            e.Property(x => x.ExecutionLog).HasColumnType("text");
+            e.Property(x => x.ErrorMessage).HasMaxLength(512);
         });
     }
 }

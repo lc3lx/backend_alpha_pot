@@ -49,7 +49,7 @@ public sealed class BrokerSessionManager : IBrokerSessionManager
 
         if (_gatewaySessions.TryGetValue(Key(userId, broker), out var client))
         {
-            if (client.Lifecycle is SessionLifecycleState.Disconnected or SessionLifecycleState.AuthenticationFailed)
+            if (client.Lifecycle is SessionLifecycleState.AuthenticationFailed)
             {
                 _gatewaySessions.TryRemove(Key(userId, broker), out _);
                 return null;
@@ -58,6 +58,17 @@ public sealed class BrokerSessionManager : IBrokerSessionManager
         }
 
         return null;
+    }
+
+    public IBrokerClient? GetAny(string broker)
+    {
+        broker = Brokers.Normalize(broker);
+        if (broker == Brokers.Binolla)
+            return null;
+
+        return _gatewaySessions.Values.FirstOrDefault(s =>
+            string.Equals(s.Broker, broker, StringComparison.OrdinalIgnoreCase) &&
+            s.Lifecycle is not (SessionLifecycleState.Disconnected or SessionLifecycleState.AuthenticationFailed));
     }
 
     public async Task<IBrokerClient> GetOrCreateAsync(
@@ -84,12 +95,23 @@ public sealed class BrokerSessionManager : IBrokerSessionManager
         }
 
         var key = Key(userId, broker);
-        // Replace rather than reuse: a reconnect must re-run the handshake, which is where
-        // the account type is applied.
-        if (_gatewaySessions.TryRemove(key, out var previous))
+        if (_gatewaySessions.TryGetValue(key, out var existing))
         {
-            try { await previous.DisconnectAsync(ct).ConfigureAwait(false); }
-            catch { /* the entry is gone either way */ }
+            if (existing.IsTransportConnected &&
+                existing.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
+            {
+                return existing;
+            }
+
+            try
+            {
+                await existing.ConnectAsync(credentials, ct).ConfigureAwait(false);
+                return existing;
+            }
+            catch
+            {
+                _gatewaySessions.TryRemove(key, out _);
+            }
         }
 
         var http = _httpFactory.CreateClient(BrokerGatewayDefaults.HttpClientName);
@@ -114,6 +136,28 @@ public sealed class BrokerSessionManager : IBrokerSessionManager
         {
             try { await client.DisconnectAsync(ct).ConfigureAwait(false); }
             catch { /* best effort */ }
+        }
+    }
+
+    public async Task RefreshGatewaySessionsAsync(CancellationToken ct = default)
+    {
+        foreach (var (key, client) in _gatewaySessions.ToArray())
+        {
+            try
+            {
+                await client.RefreshTransportAsync(ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                // RefreshTransportAsync already marks the client dead.
+            }
+
+            if (!client.IsTransportConnected &&
+                client.Lifecycle is SessionLifecycleState.AuthenticationFailed
+                    or SessionLifecycleState.SessionExpired)
+            {
+                _gatewaySessions.TryRemove(key, out _);
+            }
         }
     }
 

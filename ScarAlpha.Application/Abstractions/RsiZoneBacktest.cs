@@ -13,67 +13,48 @@ namespace ScarAlpha.Application.Abstractions;
 /// </summary>
 public static class RsiZoneBacktest
 {
-    public const int LookbackCandles = 200;
+    public const int LookbackCandles = 400;
 
     public static (RsiBacktestStats Call, RsiBacktestStats Put) Evaluate(
         IReadOnlyList<decimal> closedCloses,
         RsiStrategyOptions options)
     {
         var lookback = LookbackCandles;
-        var oversold = RsiEntryLevels.CallMax;
-        var overbought = RsiEntryLevels.PutMin;
+        var oversold = options.Oversold > 0 ? options.Oversold : RsiEntryLevels.CallMax;
+        var overbought = options.Overbought > 0 ? options.Overbought : RsiEntryLevels.PutMin;
+        var expiry = options.ExpiryCandles is >= 3 and <= 5 ? options.ExpiryCandles : 5;
+
         var currentIndex = closedCloses.Count - 1;
         var firstIndex = Math.Max(options.Period, currentIndex - lookback);
-        var lastIndex = currentIndex - 1;
+        var lastIndex = currentIndex - expiry; // No lookahead: only evaluate trades that have reached expiry
         var rsiSeries = BuildRsiSeries(closedCloses, options);
 
         var callTotal = 0;
         var callWins = 0;
         var putTotal = 0;
         var putWins = 0;
-        var inCallZone = false;
-        var inPutZone = false;
-        var callTouchIndex = -1;
-        var putTouchIndex = -1;
 
-        for (var i = firstIndex; i <= lastIndex; i++)
+        if (lastIndex >= firstIndex)
         {
-            var historicalRsi = rsiSeries[i];
+            for (var i = firstIndex; i <= lastIndex; i++)
+            {
+                var historicalRsi = rsiSeries[i];
 
-            if (historicalRsi <= oversold)
-            {
-                if (!inCallZone)
+                if (historicalRsi <= oversold)
                 {
-                    inCallZone = true;
-                    callTouchIndex = i;
+                    callTotal++;
+                    // CALL Win: price after expiry is higher than signal candle close
+                    if (closedCloses[i + expiry] > closedCloses[i])
+                        callWins++;
                 }
-            }
-            else if (inCallZone)
-            {
-                callTotal++;
-                // Left 25: respected if price bounced up from the touch.
-                if (closedCloses[i] > closedCloses[callTouchIndex])
-                    callWins++;
-                inCallZone = false;
-                callTouchIndex = -1;
-            }
 
-            if (historicalRsi >= overbought)
-            {
-                if (!inPutZone)
+                if (historicalRsi >= overbought)
                 {
-                    inPutZone = true;
-                    putTouchIndex = i;
+                    putTotal++;
+                    // PUT Win: price after expiry is lower than signal candle close
+                    if (closedCloses[i + expiry] < closedCloses[i])
+                        putWins++;
                 }
-            }
-            else if (inPutZone)
-            {
-                putTotal++;
-                // Left 75: respected if price dropped from the touch.
-                if (closedCloses[i] < closedCloses[putTouchIndex])
-                    putWins++;
-                inPutZone = false;
-                putTouchIndex = -1;
             }
         }
 
@@ -100,7 +81,7 @@ public static class RsiZoneBacktest
             FailedSignals: failed,
             SuccessRate: successRate,
             LookbackCandles: lookback,
-            ExpiryCandles: options.ExpiryCandles,
+            ExpiryCandles: options.ExpiryCandles is >= 3 and <= 5 ? options.ExpiryCandles : 5,
             MinimumSuccessRate: minimum,
             Passed: total > 0 && successRate >= minimum);
     }

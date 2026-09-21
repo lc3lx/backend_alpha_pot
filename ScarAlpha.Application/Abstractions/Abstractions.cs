@@ -65,6 +65,7 @@ public interface ITradeRepository
         CancellationToken ct = default);
     Task AddAsync(Trade trade, CancellationToken ct = default);
     Task UpdateAsync(Trade trade, CancellationToken ct = default);
+    Task DeleteAsync(Guid id, CancellationToken ct = default);
 }
 
 public interface ITelegramAuthService

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import traceback
 from typing import Annotated
 
@@ -51,6 +52,14 @@ ADAPTERS: dict[str, type[BrokerSession]] = {
 
 app = FastAPI(title="Scar Alpha Broker Gateway", version="0.1.0")
 registry = SessionRegistry()
+
+#: One handshake at a time per venue. Parallel Quotex connects rewrite the same
+#: process-level transport and leave every session after the first on NOT_CONNECTED.
+_handshake_locks: dict[str, asyncio.Lock] = {}
+
+
+def _handshake_lock(broker: str) -> asyncio.Lock:
+    return _handshake_locks.setdefault(broker, asyncio.Lock())
 
 #: Set once, at import, before any broker client exists — a client that builds its HTTP
 #: session before this runs would go out on the server's own IP and be refused.
@@ -248,45 +257,64 @@ async def connect(
         if not (body.ssid and body.ssid != getattr(existing, "ssid", None)):
             return _status(existing)
 
-    # A connect for this same account is already under way — from another device, or
-    # from a background restore. WAIT for it rather than refusing: one account has one
-    # session, and whoever asked second wants exactly the session the first will produce.
-    # Refusing here is what told a user signing in on their laptop that a sign-in was
-    # "already running", while their phone was quietly completing the very same one.
+    # Wait OUTSIDE the handshake lock. Waiting inside it deadlocks the connect that
+    # already holds the lock and is the session we would be joining.
     if throttle.is_connecting(body.user_id):
         joined = await _await_session(body.user_id, broker, body.account_type)
         if joined is not None:
             return _status(joined)
 
-    # Ask before trying. A broker that is refusing logins keeps refusing, and the caller
-    # retries on its own schedule — without this the gateway relays the storm.
-    if not throttle.can_attempt(body.user_id):
-        # Say which of the several reasons applies; "wait a moment" told a user nothing
-        # about whether the problem was theirs, the broker's, or just timing.
-        raise HTTPException(status_code=429, detail=throttle.describe(body.user_id))
+    async with _handshake_lock(broker):
+        existing = registry.get(body.user_id, broker)
+        if existing is not None and existing.transport_connected:
+            if not (body.ssid and body.ssid != getattr(existing, "ssid", None)):
+                return _status(existing)
 
-    if not (body.ssid or (body.email and body.password)):
-        raise HTTPException(
-            status_code=409,
-            detail=f"{broker.capitalize()} session is not connected and no credentials were provided to reconnect.",
-        )
+        # Dead-but-known session: reconnect in place. Removing it first is what killed
+        # live trading when the browser closed — background restore tore the socket down
+        # and the replacement handshake then failed.
+        if existing is not None:
+            try:
+                await existing.connect(
+                    ssid=body.ssid or getattr(existing, "ssid", None),
+                    email=body.email or getattr(existing, "_email", None),
+                    password=body.password or getattr(existing, "_password", None),
+                    account_type=body.account_type,
+                )
+                if existing.transport_connected:
+                    return _status(existing)
+            except Exception as reconnect_err:
+                print(f"in-place reconnect failed {body.user_id}: {reconnect_err}", flush=True)
 
-    await registry.remove(body.user_id, broker)
-    session = cls(body.user_id)
-    try:
-        await session.connect(
-            ssid=body.ssid,
-            email=body.email,
-            password=body.password,
-            account_type=body.account_type,
-        )
-    except Exception as exc:
-        throttle.mark_failed(body.user_id, blocked_by_broker=isinstance(exc, BlockedError))
-        raise _fail(exc)
+        # Ask before trying. A broker that is refusing logins keeps refusing, and the caller
+        # retries on its own schedule — without this the gateway relays the storm.
+        if not throttle.can_attempt(body.user_id):
+            # Say which of the several reasons applies; "wait a moment" told a user nothing
+            # about whether the problem was theirs, the broker's, or just timing.
+            raise HTTPException(status_code=429, detail=throttle.describe(body.user_id))
 
-    throttle.mark_succeeded(body.user_id)
-    await registry.put(session)
-    return _status(session)
+        if not (body.ssid or (body.email and body.password)):
+            raise HTTPException(
+                status_code=409,
+                detail=f"{broker.capitalize()} session is not connected and no credentials were provided to reconnect.",
+            )
+
+        await registry.remove(body.user_id, broker)
+        session = cls(body.user_id)
+        try:
+            await session.connect(
+                ssid=body.ssid,
+                email=body.email,
+                password=body.password,
+                account_type=body.account_type,
+            )
+        except Exception as exc:
+            throttle.mark_failed(body.user_id, blocked_by_broker=isinstance(exc, BlockedError))
+            raise _fail(exc)
+
+        throttle.mark_succeeded(body.user_id)
+        await registry.put(session)
+        return _status(session)
 
 
 @app.post("/sessions/disconnect", dependencies=[Guarded])
@@ -310,7 +338,7 @@ async def assets(user_id: str, broker: str) -> list[TradingAsset]:
 
 @app.get("/market/candles", response_model=list[Candle], dependencies=[Guarded])
 async def candles(
-    user_id: str, broker: str, asset: str, period_seconds: int = 60, count: int = 200
+    user_id: str, broker: str, asset: str, period_seconds: int = 60, count: int = 600
 ) -> list[Candle]:
     try:
         return await _market_session(user_id, broker).get_candles(asset, period_seconds, count)
@@ -428,6 +456,68 @@ async def diag_ssid(user_id: str, broker: str):
     if not ssid:
         return {"present": False, "length": 0, "tail": None}
     return {"present": True, "length": len(ssid), "tail": ssid[-4:]}
+
+
+@app.get("/diag/session_market", dependencies=[Guarded])
+async def diag_session_market(user_id: str, broker: str):
+    sess = _session(user_id, broker)
+    live = getattr(sess, "_live", None)
+    now_mono = time.monotonic()
+    now_ts = time.time()
+    store = all_stores().get(broker.strip().lower())
+    bars_summary = {}
+    if store:
+        for k, b in store._bars.items():
+            last_ts = max(b.keys()) if b else None
+            last_tick = store._last_tick.get(k)
+            bars_summary[f"{k[0]}@{k[1]}"] = {
+                "count": len(b),
+                "last_ts": last_ts,
+                "age_sec": round(now_ts - last_ts, 1) if last_ts else None,
+                "tick_age_sec": round(now_mono - last_tick, 1) if last_tick else None,
+                "feeder": store.feeder(k[0], k[1]),
+                "is_fresh": store.is_fresh(k[0], k[1]),
+            }
+    live_diag = {}
+    if live:
+        live_diag = {
+            "periods": [list(p) for p in live.periods],
+            "recent_events": list(live._recent_events),
+            "assets_count": len(live._asset_index) if live._asset_index else 0,
+            "ws_connected": bool(live.connection._ws and live.connection._ws.is_connected()) if getattr(live, "connection", None) else False,
+        }
+    return {
+        "user_id": user_id,
+        "broker": broker,
+        "transport_connected": getattr(sess, "transport_connected", False),
+        "live": live_diag,
+        "bars": bars_summary,
+    }
+
+
+async def _keep_sessions_alive() -> None:
+    """
+    Reconnect dropped Quotex sockets without the customer browser.
+
+    Analysis and orders live in this process. If a transport dies and nobody is
+    sitting on the website, the bot must still bring the session back and keep
+    scanning every pair.
+    """
+    while True:
+        await asyncio.sleep(8)
+        for session in list(registry.all_sessions()):
+            ensure = getattr(session, "_ensure_connected", None)
+            if ensure is None:
+                continue
+            try:
+                await ensure()
+            except Exception as exc:
+                print(f"keep-alive {session.user_id}: {exc}", flush=True)
+
+
+@app.on_event("startup")
+async def _start_keep_alive() -> None:
+    asyncio.create_task(_keep_sessions_alive())
 
 
 @app.on_event("shutdown")

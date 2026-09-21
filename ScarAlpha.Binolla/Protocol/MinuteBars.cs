@@ -10,7 +10,7 @@ namespace ScarAlpha.Binolla.Protocol;
 public static class MinuteBars
 {
     public const int DefaultPeriodSeconds = 60;
-    public const int MaxStoredCandles = 300;
+    public const int MaxStoredCandles = 800;
 
     public static int EffectivePeriod(int period) =>
         period <= 0 ? DefaultPeriodSeconds : period;

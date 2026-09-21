@@ -62,6 +62,7 @@ public static class DependencyInjection
         services.AddScoped<INotificationRepository, NotificationRepository>();
         services.AddScoped<IAppSettingRepository, AppSettingRepository>();
         services.AddScoped<INotificationWriter, NotificationWriter>();
+        services.AddScoped<ITimeSignalRepository, TimeSignalRepository>();
         services.AddScoped<IReferralRepository, ReferralRepository>();
         services.AddScoped<IReferralQualificationService, ReferralQualificationService>();
         services.AddScoped<IReferralRewardService, ReferralRewardService>();
@@ -94,6 +95,7 @@ public static class DependencyInjection
         services.AddScoped<BotControlAppService>();
         services.AddScoped<ReferralAppService>();
         services.AddScoped<AdminReferralAppService>();
+        services.AddScoped<TimeSignalAppService>();
 
         services.AddSingleton<IBinollaCredentialAuth, NodeBinollaCredentialAuth>();
 
@@ -256,6 +258,9 @@ public static class DependencyInjection
         services.AddHostedService<TradeReconciliationWorker>();
         // Backstop for the referral deposit signal — see ReferralBalanceWatcher.
         services.AddHostedService<ReferralBalanceWatcher>();
+        // Executes scheduled time-analysis signals across all subscribed users
+        services.AddSingleton<TimeSignalWorker>();
+        services.AddHostedService(sp => sp.GetRequiredService<TimeSignalWorker>());
 
         services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             .AddJwtBearer();

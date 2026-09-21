@@ -13,15 +13,15 @@ import math
 import os
 import time
 from collections import deque
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
 from app.brokers.base import AuthError, BrokerError, NotConnected
 from app.models import AccountType, Balance, TradingAsset
 
-#: Frame-level tracing. Printing every non-quote frame costs real time once PM2 is
-#: capturing stdout, and it ran on every session — keep it available, keep it off.
-TRACE_FRAMES = os.getenv("BROKER_QUOTEX_TRACE", "").strip().lower() in {"1", "true", "yes"}
+#: Frame-level tracing.
+TRACE_FRAMES = True
 
 #: How long a delivered instrument list is reused before another is requested. The list
 #: is also pushed unprompted, so this is an upper bound on staleness, not a poll rate.
@@ -59,17 +59,17 @@ class SocketIOPackets:
                 payload = json.loads(body)
                 if isinstance(payload, list) and payload and isinstance(payload[0], str):
                     data = payload[1] if len(payload) > 1 else None
-                    if isinstance(data, dict) and data.get("_placeholder") is True:
+                    if data is None or (isinstance(data, dict) and data.get("_placeholder") is True):
                         self.pending = payload[0]
                         return None
                     return payload[0], data
                 if isinstance(payload, list) and len(payload) == 1 and isinstance(payload[0], dict):
                     item = payload[0]
-                    if "liveBalance" in item or "demoBalance" in item or "realBalance" in item:
+                    if any(k in item for k in ("liveBalance", "demoBalance", "realBalance", "balance")):
                         return "balance", item
                     return "_ack_response", item
                 if isinstance(payload, dict):
-                    if "liveBalance" in payload or "demoBalance" in payload:
+                    if any(k in payload for k in ("liveBalance", "demoBalance", "realBalance", "balance")):
                         return "balance", payload
                     return "_ack_response", payload
             except Exception:
@@ -102,12 +102,12 @@ class SocketIOPackets:
                         event, self.pending = self.pending, None
                         return event, payload
                     if isinstance(payload, dict):
-                        if "liveBalance" in payload or "demoBalance" in payload:
+                        if any(k in payload for k in ("liveBalance", "demoBalance", "realBalance", "balance")):
                             return "balance", payload
-                        if "id" in payload or "deals" in payload or "openPrice" in payload:
+                        if any(k in payload for k in ("id", "deal", "deals", "openPrice", "uuid", "ticket", "order_id", "status")):
                             return "_ack_response", payload
                     if isinstance(payload, list):
-                        if payload and isinstance(payload[0], dict) and ("id" in payload[0] or "openPrice" in payload[0]):
+                        if payload and isinstance(payload[0], dict) and any(k in payload[0] for k in ("id", "deal", "deals", "openPrice", "uuid", "ticket", "order_id")):
                             return "_ack_response", payload[0]
                         return "quotes", payload
                 except Exception:
@@ -118,21 +118,86 @@ class SocketIOPackets:
 def _order_rows(payload):
     """Every order-shaped dict in a frame, whatever container the broker wrapped it in."""
     if isinstance(payload, dict):
+        if "deal" in payload and isinstance(payload["deal"], dict):
+            r = dict(payload)
+            deal_data = r.pop("deal")
+            r.update(deal_data)
+            return [r]
         for key in ("deals", "orders", "positions"):
             inner = payload.get(key)
             if isinstance(inner, list):
-                return [row for row in inner if isinstance(row, dict)]
+                meta = {k: v for k, v in payload.items() if k not in ("deals", "orders", "positions")}
+                rows = []
+                for row in inner:
+                    if isinstance(row, dict):
+                        r = dict(meta)
+                        r.update(row)
+                        rows.append(r)
+                return rows
         return [payload]
     if isinstance(payload, list):
         return [row for row in payload if isinstance(row, dict)]
     return []
 
 
+def _normalize_history_rows(raw_candles: list) -> list[dict]:
+    """Turn broker history (dicts, OHLC arrays, or [time, price] ticks) into candle rows."""
+    normalized = []
+    for row in raw_candles:
+        if isinstance(row, dict):
+            normalized.append(row)
+            continue
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
+            continue
+        ts = row[0]
+        if len(row) >= 5:
+            normalized.append({
+                "time": ts,
+                "open": row[1],
+                "close": row[2],
+                "high": row[3],
+                "low": row[4],
+                "ticks": row[5] if len(row) > 5 else 0,
+            })
+        else:
+            price = row[1]
+            normalized.append({
+                "time": ts,
+                "open": price,
+                "close": price,
+                "high": price,
+                "low": price,
+            })
+    return normalized
+
+
+def get_expiration_time_quotex(timestamp: int, duration: int) -> int:
+    """
+    Calculates the exact candle close expiration timestamp for Quotex orders.
+    Enforces Quotex's >=30s remaining rule and timeframe boundaries.
+    """
+    now = datetime.fromtimestamp(timestamp)
+    if duration < 60:
+        shift = 1 if now.second >= 30 else 0
+        exp_time = now.replace(second=0, microsecond=0) + timedelta(minutes=shift + 1)
+        return int(exp_time.timestamp())
+
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    seconds_since_midnight = int((now - midnight).total_seconds())
+
+    remainder = seconds_since_midnight % duration
+    step = 2 if remainder > (duration / 2) else 1
+    next_valid = ((seconds_since_midnight // duration) + step) * duration
+
+    expiration_time = midnight + timedelta(seconds=next_valid)
+    return int(expiration_time.timestamp())
+
+
 def _find_order_id(row):
     """The broker's id for a deal, wherever this particular frame put it."""
     if not isinstance(row, dict):
         return None
-    for key in ("id", "order_id", "orderId", "ticket", "dealId", "deal_id"):
+    for key in ("id", "order_id", "orderId", "ticket", "dealId", "deal_id", "uuid", "orderUuid", "deal_uuid"):
         value = row.get(key)
         if value:
             return str(value)
@@ -146,7 +211,7 @@ def _find_order_id(row):
     return None
 
 
-def _is_settlement(row):
+def _is_settlement(row, event=None):
     """
     True when this row reports a finished trade rather than an accepted one.
 
@@ -154,12 +219,21 @@ def _is_settlement(row):
     so the close time is what separates them — reading a settlement as an acknowledgement
     would report the previous trade's fill as this one's.
     """
+    if not isinstance(row, dict):
+        return False
     if not (row.get("id") or row.get("order_id") or row.get("ticket")):
         return False
-    if row.get("closeTimestamp") or row.get("close_timestamp") or row.get("closeTime"):
+    if event and event in QuotexLiveData._CLOSE_EVENTS:
         return True
-    has_close_price = row.get("closePrice") is not None or row.get("close_price") is not None
-    return has_close_price and ("profit" in row or "profitAmount" in row)
+    if str(row.get("status", "")).lower() == "closed" or row.get("game_state") == 1:
+        return True
+    close_price = row.get("closePrice") or row.get("close_price")
+    try:
+        if close_price is not None and float(close_price) > 0 and ("profit" in row or "profitAmount" in row or "win" in row):
+            return True
+    except (ValueError, TypeError):
+        pass
+    return False
 
 
 class QuotexLiveData:
@@ -176,6 +250,16 @@ class QuotexLiveData:
         self.balance_ready = asyncio.Event()
         self.auth_ready = asyncio.Event()
         self.auth_error = None
+        # Waiters for history/load so the chart can draw closed bars before live ticks.
+        self._history_waiters: dict[tuple[str, int], asyncio.Event] = {}
+        # Last history/load we sent, used when the broker replies with a bare candle
+        # list and no asset name.
+        self._last_history_request: tuple[str, int] | None = None
+        # Set when instruments/list arrives while authenticate() is waiting. Fresh
+        # captures often never get s_authorization on this transport; they get the
+        # instrument dump instead, and treating that as a timeout is what made login
+        # fail after a successful browser capture.
+        self._instruments_during_auth = False
         self.asset_lock = asyncio.Lock()
         self.balance_lock = asyncio.Lock()
         self.periods = set()
@@ -195,12 +279,22 @@ class QuotexLiveData:
         # never acknowledged says nothing about WHY on its own, and reproducing it costs
         # the customer a real entry — so the answer is collected before it is needed.
         self._recent_events: deque[tuple[float, str, str]] = deque(maxlen=40)
+        self.last_recv_time = time.monotonic()
+        self._is_running = True
         # The vendor delivers each packet through BOTH callback and recv(). Use only
         # its ordered receive queue, otherwise a binary header is consumed twice.
         self.connection._handle_message = self._ignore_callback
         self.connection._receive_messages = self.receive
         self.connection.send_raw = self.send_raw
         self.connection.send_request = self.send_request
+
+    def is_alive(self) -> bool:
+        ws = getattr(self.connection, "_ws", None)
+        if ws is None or not ws.is_connected():
+            return False
+        if not getattr(self, "_is_running", False):
+            return False
+        return True
 
     async def _ignore_callback(self, message):
         pass
@@ -209,6 +303,8 @@ class QuotexLiveData:
         ws = self.connection._ws
         if ws is None or not ws.is_connected():
             raise NotConnected("Quotex transport disconnected.")
+        if TRACE_FRAMES:
+            print(f"[LIVE SEND] {str(message)[:250]}", flush=True)
         if inspect.iscoroutinefunction(ws.send):
             sent = await ws.send(message)
         else:
@@ -236,36 +332,41 @@ class QuotexLiveData:
 
     async def receive(self):
         ws = self.connection._ws
-        while ws is not None and ws.is_connected():
-            message = await asyncio.to_thread(ws.recv, 0.5)
-            if not message:
-                continue
-            if message == "2":
-                await self.send_raw("3")
-                continue
-            if TRACE_FRAMES and not (
-                isinstance(message, str)
-                and (message.startswith('42["quotes') or message.startswith("b4"))
-            ):
-                text = message if isinstance(message, str) else repr(message)
-                print(f"[LIVE RECV] {text[:200]}", flush=True)
-            try:
-                if isinstance(message, str) and message.startswith("{"):
-                    value = json.loads(message)
-                    if value.get("request_id"):
-                        await self.connection._route_message(value)
-                        continue
-                parsed = self.packets.parse(message)
-                if parsed is None:
+        self._is_running = True
+        try:
+            while ws is not None and ws.is_connected():
+                message = await asyncio.to_thread(ws.recv, 0.5)
+                if not message:
                     continue
-                event, data = parsed
-                if TRACE_FRAMES and event != "quotes":
-                    print(f"[LIVE PARSED] event={event} data={str(data)[:200]}", flush=True)
-                self.on_event(event, data)
-                await self.connection._route_socketio_event(event, data)
-            except (ValueError, TypeError, KeyError, IndexError):
-                # Malformed input must not stop subsequent valid market updates.
-                continue
+                self.last_recv_time = time.monotonic()
+                if message == "2":
+                    await self.send_raw("3")
+                    continue
+                if TRACE_FRAMES and not (
+                    isinstance(message, str)
+                    and (message.startswith('42["quotes') or message.startswith("b4"))
+                ):
+                    text = message if isinstance(message, str) else repr(message)
+                    print(f"[LIVE RECV] {text[:200]}", flush=True)
+                try:
+                    if isinstance(message, str) and message.startswith("{"):
+                        value = json.loads(message)
+                        if value.get("request_id"):
+                            await self.connection._route_message(value)
+                            continue
+                    parsed = self.packets.parse(message)
+                    if parsed is None:
+                        continue
+                    event, data = parsed
+                    if TRACE_FRAMES and event != "quotes":
+                        print(f"[LIVE PARSED] event={event} data={str(data)[:200]}", flush=True)
+                    self.on_event(event, data)
+                    await self.connection._route_socketio_event(event, data)
+                except (ValueError, TypeError, KeyError, IndexError):
+                    # Malformed input must not stop subsequent valid market updates.
+                    continue
+        finally:
+            self._is_running = False
 
     def on_event(self, event, data):
         if event != "quotes":
@@ -286,17 +387,53 @@ class QuotexLiveData:
         if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict):
             data = data[0]
         if isinstance(data, dict):
+            cur_real, cur_demo = self.balances if self.balances is not None else (0.0, 10000.0)
+            has_update = False
+
+            # Format 1: Quotex dynamic balance push from trades/orders
+            # e.g. event="s_balance", data={'uid': ..., 'isDemo': 1/0, 'balance': 2699.52}
+            if "balance" in data and ("isDemo" in data or "is_demo" in data):
+                try:
+                    b_val = float(data["balance"])
+                    raw_demo = data.get("isDemo") if "isDemo" in data else data.get("is_demo")
+                    is_demo = raw_demo in (1, True, "1")
+                    if math.isfinite(b_val):
+                        if is_demo:
+                            cur_demo = b_val
+                        else:
+                            cur_real = b_val
+                        has_update = True
+                except (ValueError, TypeError):
+                    pass
+
+            # Format 2: Quotex batch balance: {'liveBalance': ..., 'demoBalance': ...}
             live = data.get("liveBalance") if data.get("liveBalance") is not None else data.get("realBalance")
             demo = data.get("demoBalance")
-            if live is not None or demo is not None:
-                real = float(live if live is not None else 0.0)
-                demo_val = float(demo if demo is not None else 10000.0)
-                if math.isfinite(real) and math.isfinite(demo_val):
-                    self.balances = (real, demo_val)
-                    self.balance_at = time.monotonic()
-                    self.balance_ready.set()
+            if live is not None:
+                try:
+                    live_val = float(live)
+                    if math.isfinite(live_val):
+                        cur_real = live_val
+                        has_update = True
+                except (ValueError, TypeError):
+                    pass
+            if demo is not None:
+                try:
+                    demo_val = float(demo)
+                    if math.isfinite(demo_val):
+                        cur_demo = demo_val
+                        has_update = True
+                except (ValueError, TypeError):
+                    pass
+
+            if has_update and math.isfinite(cur_real) and math.isfinite(cur_demo):
+                self.balances = (cur_real, cur_demo)
+                self.balance_at = time.monotonic()
+                self.balance_ready.set()
 
         if event == "instruments/list":
+            if not self.auth_ready.is_set():
+                self._instruments_during_auth = True
             rows = data.get("list") if isinstance(data, dict) else data
             if not isinstance(rows, list):
                 return
@@ -331,24 +468,32 @@ class QuotexLiveData:
                         continue
                     tick = {"time": ts, "price": price}
                     self.market.apply_quote(symbol, tick)
-                    if symbol.endswith("_otc"):
-                        self.market.apply_quote(symbol[:-4], tick)
-                    else:
-                        self.market.apply_quote(f"{symbol}_otc", tick)
-                    for asset, period in self.periods:
+                    for asset, period in list(self.periods):
                         if (
                             asset == symbol
                             or (symbol.endswith("_otc") and asset == symbol[:-4])
                             or (not symbol.endswith("_otc") and f"{symbol}_otc" == asset)
                         ):
                             self.market.apply_candle(asset, period, tick)
+                            counterpart = symbol[:-4] if symbol.endswith("_otc") else f"{symbol}_otc"
+                            self.market.apply_candle(counterpart, period, tick)
                 except (ValueError, TypeError):
                     continue
 
-        if event in {"history/load", "history/list/v2", "history/load/line"}:
+        if event in {
+            "history/load",
+            "history/list/v2",
+            "history/load/line",
+            "s_history/load",
+            "history/list",
+            "candles/history",
+        }:
             payload_dict = data if isinstance(data, dict) else {}
-            asset_name = payload_dict.get("asset")
-            period = int(payload_dict.get("period") or 60)
+            asset_name = payload_dict.get("asset") or payload_dict.get("symbol")
+            try:
+                period = int(payload_dict.get("period") or 0)
+            except (TypeError, ValueError):
+                period = 0
             raw_candles = (
                 payload_dict.get("data")
                 or payload_dict.get("candles")
@@ -357,26 +502,41 @@ class QuotexLiveData:
             )
             if not raw_candles and isinstance(data, list):
                 raw_candles = data
+            pending = self._last_history_request
+            if pending:
+                if not asset_name:
+                    asset_name = pending[0]
+                if not period:
+                    period = pending[1]
+            if not period:
+                period = 60
             if asset_name and isinstance(raw_candles, list) and raw_candles:
-                normalized = []
-                for row in raw_candles:
-                    if isinstance(row, dict):
-                        normalized.append(row)
-                    elif isinstance(row, (list, tuple)) and len(row) >= 5:
-                        normalized.append({
-                            "time": row[0],
-                            "open": row[1],
-                            "close": row[2],
-                            "high": row[3],
-                            "low": row[4],
-                            "ticks": row[5] if len(row) > 5 else 0,
-                        })
+                normalized = _normalize_history_rows(raw_candles)
                 if normalized:
-                    self.market.apply_candles(asset_name, period, normalized)
+                    result = self.market.apply_candles(asset_name, period, normalized)
+                    try:
+                        applied = int(result or 0)
+                    except (TypeError, ValueError):
+                        applied = len(normalized)
                     if asset_name.endswith("_otc"):
                         self.market.apply_candles(asset_name[:-4], period, normalized)
                     else:
                         self.market.apply_candles(f"{asset_name}_otc", period, normalized)
+                    print(
+                        f"[quotex] history event={event} asset={asset_name} "
+                        f"period={period} rows={len(normalized)} applied={applied}",
+                        flush=True,
+                    )
+                    self._signal_history(asset_name, period)
+            elif TRACE_FRAMES:
+                kind = type(data).__name__
+                keys = list(payload_dict)[:8] if payload_dict else []
+                print(
+                    f"[quotex] history ignored event={event} asset={asset_name} "
+                    f"period={period} kind={kind} keys={keys} rows="
+                    f"{len(raw_candles) if isinstance(raw_candles, list) else 0}",
+                    flush=True,
+                )
 
 
     # ---- order acknowledgement and settlement ------------------------------
@@ -398,8 +558,9 @@ class QuotexLiveData:
 
     #: Frames that may carry a settlement.
     _CLOSE_EVENTS = frozenset({
-        "s_orders/closed", "orders/closed", "order/closed", "deals/closed", "deal/closed",
-        "s_deals/closed", "orders/complete", "position/closed",
+        "s_orders/close", "s_orders/closed", "orders/closed", "order/closed", "orders/close",
+        "deals/closed", "deal/closed", "s_deals/closed", "orders/complete", "position/closed",
+        "orders/closed/list", "deals", "s_deals",
     })
 
     #: Acks Quotex sends ONLY in answer to an order it accepted. Unlike the shared
@@ -415,16 +576,18 @@ class QuotexLiveData:
         if event not in self._ACK_EVENTS and event not in self._CLOSE_EVENTS:
             return
         for row in _order_rows(data):
-            if _is_settlement(row):
-                self._record_settlement(row)
-            elif event in self._ACK_EVENTS:
+            if event in self._ACK_EVENTS:
                 self._resolve_pending_order(row, event)
+            elif event in self._CLOSE_EVENTS or _is_settlement(row, event):
+                self._record_settlement(row)
 
     def _record_settlement(self, row):
         order_id = row.get("id") or row.get("order_id") or row.get("ticket")
         if not order_id:
             return
         self.closed_orders[str(order_id)] = row
+        # Trigger an immediate balance refresh on settlement so the UI reflects winnings/losses without delay
+        self._refresh_in_background(self._request_balance())
         # A session runs for days. Keep the window that outcomes are actually read from
         # and drop the rest, rather than holding every deal until the process restarts.
         if len(self.closed_orders) > 500:
@@ -444,15 +607,16 @@ class QuotexLiveData:
         # for the order's own acknowledgement. A frame Quotex sends ONLY in answer to an
         # order (s_orders/open and its kin) needs no such proof: its arrival while an
         # order is pending IS the confirmation, whatever fields it happens to carry.
+        deal_dict = row.get("deal") if isinstance(row.get("deal"), dict) else row
         if not definitive and not rejected:
             names_an_order = bool(order_id) and any(
-                key in row for key in ("asset", "openPrice", "open_price", "amount", "command")
+                key in row or key in deal_dict for key in ("asset", "openPrice", "open_price", "amount", "command", "uuid")
             )
             if not names_an_order:
                 return
 
-        request_id = row.get("requestId") or row.get("request_id")
-        row_asset = str(row.get("asset") or "")
+        request_id = row.get("requestId") or row.get("request_id") or deal_dict.get("requestId") or deal_dict.get("request_id")
+        row_asset = str(row.get("asset") or deal_dict.get("asset") or "")
 
         def hand_to(entry):
             self._pending_orders.remove(entry)
@@ -461,9 +625,13 @@ class QuotexLiveData:
                 # Guarantee the caller an id to track the trade by. Quotex's own deal id
                 # when it sent one; the request id as a last resort, so a confirmed order
                 # is never discarded merely because the ack was thin.
-                if not _find_order_id(row):
-                    row.setdefault("id", str(entry[0]))
-                future.set_result(row)
+                res_dict = dict(row)
+                found_id = _find_order_id(res_dict)
+                if found_id:
+                    res_dict.setdefault("id", found_id)
+                else:
+                    res_dict.setdefault("id", str(entry[0]))
+                future.set_result(res_dict)
 
         # Best: the broker echoed the request id we sent.
         if request_id is not None:
@@ -518,36 +686,35 @@ class QuotexLiveData:
             raise AuthError("Quotex requires a browser-captured session before connecting.")
         self.auth_ready.clear()
         self.auth_error = None
+        self._instruments_during_auth = False
         await self.send_event("authorization", {"session": ssid,
             "isDemo": int(account_type is AccountType.DEMO), "tournamentId": 0})
         try:
-            await asyncio.wait_for(self.auth_ready.wait(), 15)
+            await asyncio.wait_for(self.auth_ready.wait(), 3)
         except asyncio.TimeoutError as exc:
-            raise AuthError("Quotex authorization timed out. Sign in again.") from exc
+            if self.auth_error:
+                raise self.auth_error
+            # A fresh token answers with instruments/list, then (if it is dead) with
+            # authorization/reject a moment later. Waiting the full 15s and disconnecting
+            # is what turned a captured session into HTTP 409.
+            if self._instruments_during_auth:
+                await asyncio.sleep(1.2)
+                if self.auth_error:
+                    raise self.auth_error
+                self.auth_ready.set()
+            else:
+                try:
+                    await asyncio.wait_for(self.auth_ready.wait(), 12)
+                except asyncio.TimeoutError:
+                    if self._instruments_during_auth and self.auth_error is None:
+                        self.auth_ready.set()
+                    else:
+                        raise AuthError("Quotex authorization timed out. Sign in again.") from exc
         if self.auth_error:
             raise self.auth_error
 
     async def get_balance(self, account_type):
-        ws = getattr(self.connection, "_ws", None)
-        is_conn = ws is not None and getattr(ws, "is_connected", lambda: False)()
-        if not is_conn:
-            if self.balances is not None:
-                real, demo = self.balances
-                return Balance(real=real, demo=demo, current_type=account_type)
-            if hasattr(self.client, "account"):
-                acc_balances = getattr(self.client.account, "_balances", None)
-                if acc_balances:
-                    real = 0.0
-                    demo_val = 10000.0
-                    for b in acc_balances:
-                        act = str(getattr(b, "account_type", "")).upper()
-                        amt = float(getattr(b, "amount", 0.0) or 0.0)
-                        if "REAL" in act:
-                            real = amt
-                        elif "DEMO" in act:
-                            demo_val = amt
-                    return Balance(real=real, demo=demo_val, current_type=account_type)
-            raise NotConnected("Quotex transport disconnected.")
+        self.require_connected()
 
         # The broker pushes a balance frame on every change, so a stored value is current
         # unless the stream went quiet. Serving it without a round trip is the difference
@@ -568,23 +735,8 @@ class QuotexLiveData:
                     await asyncio.wait_for(self.balance_ready.wait(), 2.5)
                 except (asyncio.TimeoutError, Exception):
                     pass
-            if (self.balances is None or self.balances == (0.0, 10000.0)) and hasattr(self.client, "account"):
-                acc_balances = getattr(self.client.account, "_balances", None)
-                if acc_balances:
-                    real = 0.0
-                    demo_val = 10000.0
-                    for b in acc_balances:
-                        act = str(getattr(b, "account_type", "")).upper()
-                        amt = float(getattr(b, "amount", 0.0) or 0.0)
-                        if "REAL" in act:
-                            real = amt
-                        elif "DEMO" in act:
-                            demo_val = amt
-                    self.balances = (real, demo_val)
-                    self.balance_at = time.monotonic()
             if self.balances is None:
-                self.balances = (0.0, 10000.0)
-                self.balance_at = time.monotonic()
+                raise NotConnected("Quotex did not deliver live balance.")
             real, demo = self.balances
             return Balance(real=real, demo=demo, current_type=account_type)
 
@@ -609,6 +761,8 @@ class QuotexLiveData:
             raise NotConnected("Quotex did not provide live instruments.")
 
     def require_connected(self):
+        if self.auth_error is not None:
+            raise self.auth_error
         ws = self.connection._ws
         if ws is None or not ws.is_connected():
             raise NotConnected("Quotex transport disconnected.")
@@ -653,26 +807,35 @@ class QuotexLiveData:
         except (asyncio.TimeoutError, Exception):
             pass
 
+    def _signal_history(self, asset: str, period: int) -> None:
+        keys = {(asset, period)}
+        if asset.endswith("_otc"):
+            keys.add((asset[:-4], period))
+        else:
+            keys.add((f"{asset}_otc", period))
+        for key in keys:
+            ev = self._history_waiters.get(key)
+            if ev is not None and not ev.is_set():
+                ev.set()
+
     async def subscribe(self, asset, period):
         key = (asset, period)
         self.periods.add(key)
+        formatted = asset if asset.endswith("_otc") else f"{asset}_otc"
+        self.periods.add((formatted, period))
+        if asset.endswith("_otc"):
+            self.periods.add((asset[:-4], period))
         try:
             ws = getattr(self.connection, "_ws", None)
             if ws is None or not getattr(ws, "is_connected", lambda: False)():
                 return
-            formatted = asset if asset.endswith("_otc") else f"{asset}_otc"
-            await self.send_event("depth/follow", formatted)
-            if formatted != asset:
-                try:
-                    await self.send_event("depth/follow", asset)
-                except Exception:
-                    pass
-            await self.send_event("instruments/update", {"asset": formatted, "period": period})
 
-            # Deep historical candles: bypasses the 199 candle live stream wait
+            # Historical candles FIRST, then the live stream. Sending live quotes
+            # before history/load left the chart empty until ticks dribbled in.
             now_sec = int(time.time())
             browser_index = int(time.time() * 100)
-            offset = max(period * 250, 14400)
+            # 12 hours of 1m bars covers a multi-hour reconnect hole plus RSI warmup.
+            offset = max(period * 720, 14400)
             hist_payload = {
                 "asset": formatted,
                 "index": browser_index,
@@ -680,19 +843,34 @@ class QuotexLiveData:
                 "offset": offset,
                 "period": period,
             }
+            waiter = asyncio.Event()
+            self._history_waiters[(formatted, period)] = waiter
+            self._last_history_request = (formatted, period)
             try:
                 await self.send_event("history/load", hist_payload)
-            except Exception:
-                pass
+                if formatted != asset:
+                    try:
+                        await self.send_event("history/load", {
+                            "asset": asset,
+                            "index": browser_index,
+                            "time": now_sec,
+                            "offset": offset,
+                            "period": period,
+                        })
+                    except Exception:
+                        pass
+                try:
+                    await asyncio.wait_for(waiter.wait(), 5.0)
+                except asyncio.TimeoutError:
+                    pass
+            finally:
+                self._history_waiters.pop((formatted, period), None)
+
+            await self.send_event("instruments/update", {"asset": formatted, "period": period})
+            await self.send_event("depth/follow", formatted)
             if formatted != asset:
                 try:
-                    await self.send_event("history/load", {
-                        "asset": asset,
-                        "index": browser_index,
-                        "time": now_sec,
-                        "offset": offset,
-                        "period": period,
-                    })
+                    await self.send_event("depth/follow", asset)
                 except Exception:
                     pass
         except BaseException:
@@ -730,49 +908,79 @@ class QuotexLiveData:
             raise self.auth_error
 
         clean_asset = self._tradable_symbol(asset)
+        asset_info = self._asset_index.get(clean_asset)
+        if asset_info is not None and not asset_info.is_open:
+            raise BrokerError(f"Market for {clean_asset} is currently closed on Quotex.")
 
-        # Milliseconds plus a counter. The previous id was whole seconds, so two orders
-        # placed in the same second shared one — and the first acknowledgement to arrive
-        # was handed to whichever of them was still waiting.
+        # Ensure chart subscription & depth stream are active for this asset
+        try:
+            await self.send_event("instruments/update", {"asset": clean_asset, "period": int(duration_seconds)})
+            await self.send_event("chart_notification/get", {"asset": clean_asset, "version": "1.0.0"})
+            await self.send_event("depth/follow", clean_asset)
+        except Exception as e:
+            print(f"[ORDER WARN] pre-order stream subscription error: {e}", flush=True)
+
+        # Milliseconds plus a counter within safe integer range.
         self._order_seq = (self._order_seq + 1) % 1000
-        req_id = int(time.time() * 1000) * 1000 + self._order_seq
+        req_id = int(time.time() * 1000) % 10000000000 + self._order_seq
+        amount_int = max(1, int(round(float(amount))))
 
         future = asyncio.get_running_loop().create_future()
         entry = (req_id, clean_asset, future)
         self._pending_orders.append(entry)
 
-        # The exact shape Quotex's own web client sends for a fast option. Getting any of
-        # the three marked fields wrong makes the broker drop the frame in silence — no
-        # acknowledgement, no error — which is precisely the failure this replaces:
-        #   42["orders/open",{"asset":"CHFJPY_otc","amount":1,"time":60,"action":"call",
-        #                     "isDemo":1,"tournamentId":0,"requestId":...,"optionType":100}]
+        now_ts = int(time.time())
+        exp_time = get_expiration_time_quotex(now_ts, int(duration_seconds))
+
+        settings_payload = {
+            "chartId": "graph",
+            "settings": {
+                "chartId": "graph",
+                "chartType": 2,
+                "currentExpirationTime": exp_time,
+                "isFastOption": True,
+                "isFastAmountOption": False,
+                "isIndicatorsMinimized": False,
+                "isIndicatorsShowing": True,
+                "isShortBetElement": False,
+                "chartPeriod": 4,
+                "currentAsset": {"symbol": clean_asset},
+                "dealValue": amount_int,
+                "dealPercentValue": 1,
+                "isVisible": True,
+                "timePeriod": int(duration_seconds),
+                "gridOpacity": 8,
+                "isAutoScrolling": 1,
+                "isOneClickTrade": True,
+                "upColor": "#0FAF59",
+                "downColor": "#FF6251",
+            },
+            "endTime": exp_time,
+        }
+
         order_payload = {
             "asset": clean_asset,
-            # Integer, not float — the wire format is a whole-number stake.
-            "amount": int(amount),
-            # Duration in seconds (60), NOT an absolute expiry timestamp. This was sending
-            # a unix time where a duration belongs.
+            "amount": amount_int,
             "time": int(duration_seconds),
             "action": direction.lower(),
             "isDemo": 1 if is_demo else 0,
             "tournamentId": 0,
             "requestId": req_id,
-            # 100 = fast option. The previous 3 is not a value Quotex recognises.
             "optionType": 100,
         }
 
-        # Quotex sometimes drops a perfectly valid order frame in silence — the live log
-        # showed the identical payload opening a deal on one attempt and being ignored on
-        # the next. So the send is retried, but only when it is SAFE to: if the balance
-        # moved or any order event was seen after a send, a deal likely opened and we wait
-        # for its acknowledgement rather than risk a duplicate. A resend happens only after
-        # a send that produced no sign of a deal at all.
         sent_at = time.time()
         max_attempts = 3
-        per_attempt = 3.5
+        per_attempt = 4.0
         try:
             for attempt in range(1, max_attempts + 1):
                 balance_before = self.balance_at
+                try:
+                    await self.send_event("settings/apply", settings_payload)
+                    await self.send_raw('42["tick"]')
+                except Exception as e:
+                    print(f"[ORDER WARN] settings/apply or tick error: {e}", flush=True)
+
                 await self.send_event("orders/open", order_payload)
 
                 try:

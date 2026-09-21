@@ -108,6 +108,51 @@ public sealed class BrokerGatewayClient : IBrokerClient
         IsTransportConnected = true;
     }
 
+    /// <summary>
+    /// Pulls live transport state from the gateway. The in-memory flag is otherwise only
+    /// cleared when an HTTP call fails, so a dropped Quotex socket looked healthy until
+    /// the next order — and with the browser closed, that order never came.
+    /// </summary>
+    internal async Task RefreshTransportAsync(CancellationToken ct)
+    {
+        try
+        {
+            var url = $"/sessions/status?user_id={Uri.EscapeDataString(UserId)}&broker={Broker}";
+            var response = await SendAsync(
+                    token => _http.GetAsync(url, token),
+                    ct,
+                    TimeSpan.FromSeconds(8))
+                .ConfigureAwait(false);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                IsTransportConnected = false;
+                Lifecycle = SessionLifecycleState.Disconnected;
+                return;
+            }
+
+            var dto = await response.Content
+                .ReadFromJsonAsync<SessionStatusDto>(Json, ct)
+                .ConfigureAwait(false);
+            if (dto is null)
+            {
+                IsTransportConnected = false;
+                return;
+            }
+
+            IsTransportConnected = dto.TransportConnected;
+            Lifecycle = dto.Lifecycle;
+            // A brief transport drop during handshake must not look like a dead session.
+            // Marking Disconnected here made Get() throw the wrapper away, the chart
+            // returned empty candles, and Demo/Real then tore the live socket down.
+        }
+        catch
+        {
+            IsTransportConnected = false;
+            Lifecycle = SessionLifecycleState.Disconnected;
+        }
+    }
+
     public async Task<BalanceInfo> GetBalanceAsync(CancellationToken ct = default)
     {
         var dto = await GetAsync<BalanceDto>("/account/balance", null, ct).ConfigureAwait(false);
@@ -129,19 +174,19 @@ public sealed class BrokerGatewayClient : IBrokerClient
             _credentials = _credentials with { AccountType = accountType };
         }
 
-        var payload = new
-        {
-            user_id = UserId,
-            broker = Broker,
-            ssid = _credentials?.Ssid,
-            email = _credentials?.Email,
-            password = _credentials?.Password,
-            account_type = accountType.ToString()
-        };
+        _assets = null;
+        _assetsAt = DateTimeOffset.MinValue;
+
+        // In-place switch. Posting /sessions/connect here tore the live socket down and
+        // the UI then said "Connect quotex before continuing" on every Demo/Real toggle.
+        var url =
+            $"/account/account-type?user_id={Uri.EscapeDataString(UserId)}" +
+            $"&broker={Uri.EscapeDataString(Broker)}" +
+            $"&account_type={Uri.EscapeDataString(accountType.ToString())}";
         var response = await SendAsync(
-                token => _http.PostAsJsonAsync("/sessions/connect", payload, Json, token),
+                token => _http.PostAsync(url, content: null, token),
                 ct,
-                TimeSpan.FromSeconds(90))
+                TimeSpan.FromSeconds(30))
             .ConfigureAwait(false);
 
         if (!response.IsSuccessStatusCode)
@@ -197,7 +242,7 @@ public sealed class BrokerGatewayClient : IBrokerClient
     public async Task<HistoryData> GetHistoryAsync(
         string asset, int periodSeconds, CancellationToken ct = default)
     {
-        var query = $"asset={Uri.EscapeDataString(asset)}&period_seconds={periodSeconds}&count=300";
+        var query = $"asset={Uri.EscapeDataString(asset)}&period_seconds={periodSeconds}&count=600";
         var candles = await GetAsync<List<CandleDto>>("/market/candles", query, ct).ConfigureAwait(false);
 
         var history = new HistoryData
@@ -291,8 +336,8 @@ public sealed class BrokerGatewayClient : IBrokerClient
     {
         if (!_warm.TryGetValue(WarmKey(asset, periodSeconds), out var seen))
             return false;
-        // One bar of slack; past that the stream is not keeping the series current.
-        return (DateTimeOffset.UtcNow - seen).TotalSeconds < periodSeconds + 15;
+        // Two bars of slack; prevents transient cache drops during quiet ticks.
+        return (DateTimeOffset.UtcNow - seen).TotalSeconds < Math.Max(120, periodSeconds * 2);
     }
 
     public async Task<OrderResponse> PlaceOrderAsync(
@@ -506,7 +551,7 @@ public sealed class BrokerGatewayClient : IBrokerClient
     {
         var detail = await SafeReadAsync(response, ct).ConfigureAwait(false);
 
-        if (response.StatusCode is HttpStatusCode.Conflict or HttpStatusCode.Unauthorized)
+        if (response.StatusCode is HttpStatusCode.Unauthorized)
         {
             Lifecycle = SessionLifecycleState.Disconnected;
             IsTransportConnected = false;
@@ -616,6 +661,10 @@ public sealed class BrokerGatewayClient : IBrokerClient
         $"{asset}:{periodSeconds}";
 
     // ---- gateway wire shapes ----------------------------------------------
+
+    private sealed record SessionStatusDto(
+        [property: JsonPropertyName("transport_connected")] bool TransportConnected,
+        SessionLifecycleState Lifecycle);
 
     private sealed record BalanceDto(
         decimal Demo,

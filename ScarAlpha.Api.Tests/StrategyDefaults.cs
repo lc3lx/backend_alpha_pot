@@ -20,7 +20,7 @@ internal static class StrategyDefaults
         IndicatorWarmup.MinRsiCandles = IndicatorWarmup.DefaultMinRsiCandles;
         RsiEntryLevels.CallMax = 25m;
         RsiEntryLevels.PutMin = 75m;
-        RsiEntryLevels.MinZoneVisits = 2;
+        RsiEntryLevels.MinZoneVisits = 1;
         RsiEntryLevels.SetupTtlSeconds = 30;
         StrategyGate.RegimeEnabled = false;
     }

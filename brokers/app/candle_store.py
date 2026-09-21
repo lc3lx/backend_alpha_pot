@@ -39,11 +39,11 @@ def _env_int(name: str, default: int) -> int:
 
 
 #: How far back to keep, in hours.
-RETENTION_HOURS = _env_int("QUOTEX_CANDLE_RETENTION_HOURS", 3)
+RETENTION_HOURS = max(_env_int("QUOTEX_CANDLE_RETENTION_HOURS", 10), 10)
 
 #: Never keep fewer bars than this, whatever the timeframe. The indicator warm-up floor
-#: upstream is 150; 250 bars ensures 200-bar indicators and deep history fit cleanly.
-MIN_BARS = _env_int("QUOTEX_CANDLE_MIN_BARS", 250)
+#: upstream is 150; 600 bars ensures 400-bar RSI backtest + warmup fit cleanly.
+MIN_BARS = max(_env_int("QUOTEX_CANDLE_MIN_BARS", 600), 600)
 
 #: Seconds between flushes. Writing on every streamed tick would be hundreds of writes a
 #: minute per pair for data that only has to survive a restart.

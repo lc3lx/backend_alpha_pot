@@ -756,19 +756,69 @@ public sealed class BinollaAppService
         var accountType = ParseAccountType(request.AccountType);
         await EnsureAccountTypeAllowedAsync(_currentUser.UserId, accountType, ct);
 
-        var client = await RequireConnectedClientAsync(ct).ConfigureAwait(false);
+        var userId = _currentUser.UserId;
         var engineType = accountType == DomainAccount.Real ? EngineAccount.Real : EngineAccount.Demo;
-        await client.ChangeAccountAsync(engineType, ct);
+        var link = await _links.GetByUserIdAsync(userId, ct);
+        var broker = Brokers.Normalize(link?.Broker);
 
-        var link = await _links.GetByUserIdAsync(_currentUser.UserId, ct);
+        IBrokerClient client;
+        var existing = _brokers.Get(userId, broker);
+
+        if (existing is not null)
+        {
+            try
+            {
+                await existing.ChangeAccountAsync(engineType, ct);
+                client = existing;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "In-place {Broker} account switch failed for {UserId}; reconnecting without disconnect", broker, userId);
+                var captured = link is null ? null : TryStoredGatewaySession(link);
+                if (captured is null)
+                {
+                    throw new ApiException(
+                        ApiErrorCodes.BinollaNotConnected, $"Connect {broker} before continuing.", 409);
+                }
+
+                client = await ConnectGatewayClientAsync(
+                    userId, broker, captured, new BinollaCredentialRequest(
+                        Email: "",
+                        Password: "",
+                        AccountType: accountType.ToString(),
+                        Broker: broker),
+                    engineType,
+                    ct);
+            }
+        }
+        else
+        {
+            var captured = link is null ? null : TryStoredGatewaySession(link);
+            if (captured is null)
+            {
+                throw new ApiException(
+                    ApiErrorCodes.BinollaNotConnected, $"Connect {broker} before continuing.", 409);
+            }
+
+            client = await ConnectGatewayClientAsync(
+                userId, broker, captured, new BinollaCredentialRequest(
+                    Email: "",
+                    Password: "",
+                    AccountType: accountType.ToString(),
+                    Broker: broker),
+                engineType,
+                ct);
+        }
+
         if (link is not null)
         {
             link.AccountType = accountType;
             link.UpdatedAt = DateTimeOffset.UtcNow;
             await _links.UpsertAsync(link, ct);
-            _access.Invalidate(_currentUser.UserId);
+            _access.Invalidate(userId);
         }
 
+        _ = client;
         return await GetStatusAsync(ct);
     }
 
@@ -791,14 +841,6 @@ public sealed class BinollaAppService
         }
     }
 
-    /// <summary>
-    /// Silent re-login using encrypted Binolla email/password saved on the link.
-    /// Used when SSID/session expires so the user is not forced to type credentials again.
-    /// </summary>
-    /// <summary>
-    /// Whether the failure was the broker refusing this SERVER rather than the account —
-    /// an HTTP 403 / geo block. Those are IP-wide, so they must pause every user.
-    /// </summary>
     /// <summary>
     /// Opens a session on a gateway-backed broker and records the link, mirroring what the
     /// Binolla path does once its capture succeeds.
@@ -826,41 +868,69 @@ public sealed class BinollaAppService
             ApprovalStatus = AdminApprovalStatus.Pending
         };
 
-        var captured = await CaptureGatewaySessionAsync(userId, broker, link, request, ct);
+        BinollaCapturedSession? captured = TryStoredGatewaySession(link);
 
         IBrokerClient client;
-        try
+        var existingLive = _brokers.Get(userId, broker);
+        if (existingLive is not null &&
+            existingLive.IsTransportConnected &&
+            existingLive.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
         {
-            client = await _brokers.GetOrCreateAsync(
-                userId,
-                broker,
-                new BrokerCredentials(
-                    Ssid: captured?.SsidFrame,
-                    CookieHeader: captured?.CookieHeader,
-                    Email: request.Email.Trim(),
-                    Password: request.Password,
-                    AccountType: engineType),
-                ct);
+            _logger.LogInformation("Reusing existing live {Broker} session for user {UserId}", broker, userId);
+            client = existingLive;
         }
-        catch (Exception ex) when (broker == Brokers.Quotex && captured is not null && !string.IsNullOrWhiteSpace(link.EncryptedSsid))
+        else if (captured is not null)
         {
-            _logger.LogWarning(ex, "Connecting with stored SSID failed for {UserId} on {Broker}. Clearing stale SSID and capturing fresh session with headless browser...", userId, broker);
-            link.EncryptedSsid = string.Empty;
-            link.EncryptedCookieHeader = null;
+            try
+            {
+                client = await ConnectGatewayClientAsync(
+                    userId, broker, captured, request, engineType, ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Fast {Broker} reconnect failed for {UserId}; capturing a fresh browser session",
+                    broker, userId);
+                captured = await CaptureGatewayBrowserAsync(userId, broker, request, ct);
+                StoreCapturedSecrets(link, captured);
+                await _links.UpsertAsync(link, ct);
+                _restorer.MarkCaptureStarted(userId);
+                try
+                {
+                    (client, engineType) = await ConnectCapturedWithFallbackAsync(
+                        userId, broker, captured, request, engineType, ct);
+                }
+                finally
+                {
+                    _restorer.MarkCaptureEnded(userId);
+                }
+                accountType = engineType == EngineAccount.Demo ? DomainAccount.Demo : DomainAccount.Real;
+            }
+        }
+        else if (broker == Brokers.Quotex)
+        {
+            captured = await CaptureGatewayBrowserAsync(userId, broker, request, ct);
+            StoreCapturedSecrets(link, captured);
             await _links.UpsertAsync(link, ct);
-
-            using var workCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            workCts.CancelAfter(TimeSpan.FromMinutes(2));
-            captured = await _credentialAuth.LoginAsync(
-                broker, request.Email, request.Password, request.PinCode, workCts.Token);
-            _restorer.ClearAuthFailure(userId);
-
+            _restorer.MarkCaptureStarted(userId);
+            try
+            {
+                (client, engineType) = await ConnectCapturedWithFallbackAsync(
+                    userId, broker, captured, request, engineType, ct);
+            }
+            finally
+            {
+                _restorer.MarkCaptureEnded(userId);
+            }
+            accountType = engineType == EngineAccount.Demo ? DomainAccount.Demo : DomainAccount.Real;
+        }
+        else
+        {
             client = await _brokers.GetOrCreateAsync(
                 userId,
                 broker,
                 new BrokerCredentials(
-                    Ssid: captured?.SsidFrame,
-                    CookieHeader: captured?.CookieHeader,
                     Email: request.Email.Trim(),
                     Password: request.Password,
                     AccountType: engineType),
@@ -986,75 +1056,121 @@ public sealed class BinollaAppService
     }
 
     /// <summary>
-    /// Obtains a browser session for a gateway broker that cannot connect without one.
-    ///
-    /// <para>Quotex is the case that forced this. Its Cloudflare answers the polling
-    /// endpoint but returns 403 on the WebSocket upgrade for anything that did not
-    /// actually sign in, so a connect built from email and password alone reaches the
-    /// broker, is given a session id, and then dies with <c>Session ID unknown</c> the
-    /// moment it tries to use it. Every symptom the user saw — zero balance, no candles,
-    /// five assets instead of a hundred — was that one failure. A real Chromium login
-    /// produces a session the socket accepts.</para>
-    ///
-    /// <para>Returns null for brokers that do not need this, so nothing changes for them.
-    /// Failure throws rather than falling through: without the session the connect cannot
-    /// work, and replacing a precise error with a later obscure one costs the user the
-    /// only clue they had.</para>
+    /// Fast path: reuse a stored Quotex session. This is the ~0.8s login. Browser
+    /// capture is only the fallback when this token is dead.
     /// </summary>
-    private async Task<BinollaCapturedSession?> CaptureGatewaySessionAsync(
+    private BinollaCapturedSession? TryStoredGatewaySession(Domain.Entities.BinollaLink link)
+    {
+        if (string.IsNullOrWhiteSpace(link.EncryptedSsid))
+            return null;
+
+        try
+        {
+            var storedSsid = _protector.Decrypt(link.EncryptedSsid);
+            if (string.IsNullOrWhiteSpace(storedSsid))
+                return null;
+            var storedCookie = !string.IsNullOrWhiteSpace(link.EncryptedCookieHeader)
+                ? _protector.Decrypt(link.EncryptedCookieHeader)
+                : null;
+            return new BinollaCapturedSession(storedSsid, storedCookie ?? string.Empty);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed decrypting stored session for user {UserId}", link.UserId);
+            return null;
+        }
+    }
+
+    private Task<IBrokerClient> ConnectGatewayClientAsync(
         Guid userId,
         string broker,
-        BinollaLink link,
+        BinollaCapturedSession captured,
+        BinollaCredentialRequest request,
+        EngineAccount engineType,
+        CancellationToken ct) =>
+        _brokers.GetOrCreateAsync(
+            userId,
+            broker,
+            new BrokerCredentials(
+                Ssid: captured.SsidFrame,
+                CookieHeader: captured.CookieHeader,
+                Email: request.Email.Trim(),
+                Password: request.Password,
+                AccountType: engineType),
+            ct);
+
+    /// <summary>
+    /// After a browser capture the leftover dead gateway session must be dropped.
+    /// Fresh Quotex tokens authorize as Demo — Real on that first handshake is what
+    /// closed the socket after a successful capture.
+    /// </summary>
+    private async Task<(IBrokerClient Client, EngineAccount Account)> ConnectCapturedWithFallbackAsync(
+        Guid userId,
+        string broker,
+        BinollaCapturedSession captured,
+        BinollaCredentialRequest request,
+        EngineAccount engineType,
+        CancellationToken ct)
+    {
+        await _brokers.RemoveAsync(userId, broker, ct);
+
+        if (broker != Brokers.Quotex)
+        {
+            var otherClient = await ConnectGatewayClientAsync(
+                userId, broker, captured, request, engineType, ct);
+            return (otherClient, engineType);
+        }
+
+        try
+        {
+            var client = await ConnectGatewayClientAsync(
+                userId, broker, captured, request, EngineAccount.Demo, ct);
+            if (engineType == EngineAccount.Real)
+            {
+                try
+                {
+                    await client.ChangeAccountAsync(EngineAccount.Real, ct);
+                    return (client, EngineAccount.Real);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Quotex Demo connected for {UserId} but Real switch failed; keeping Demo",
+                        userId);
+                    return (client, EngineAccount.Demo);
+                }
+            }
+
+            return (client, EngineAccount.Demo);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Quotex Demo connect failed for {UserId}; trying Real",
+                userId);
+            await _brokers.RemoveAsync(userId, broker, ct);
+            var client = await ConnectGatewayClientAsync(
+                userId, broker, captured, request, EngineAccount.Real, ct);
+            return (client, EngineAccount.Real);
+        }
+    }
+
+    private void StoreCapturedSecrets(BinollaLink link, BinollaCapturedSession captured)
+    {
+        link.EncryptedSsid = _protector.Encrypt(captured.SsidFrame);
+        link.EncryptedCookieHeader = string.IsNullOrWhiteSpace(captured.CookieHeader)
+            ? null
+            : _protector.Encrypt(captured.CookieHeader);
+    }
+
+    private async Task<BinollaCapturedSession> CaptureGatewayBrowserAsync(
+        Guid userId,
+        string broker,
         BinollaCredentialRequest request,
         CancellationToken ct)
     {
-        if (broker != Brokers.Quotex)
-            return null;
-
-        // Skip the browser only for a session that is both live AND was opened from a
-        // captured session of its own.
-        //
-        // "Live" alone is not enough, and assuming it was cost a round trip: a Quotex
-        // session built from credentials reports Connected quite happily, then returns
-        // five assets, no candles and a zero balance, because the socket it needs was
-        // refused. Skipping the capture for one of those would leave the user permanently
-        // stuck on the broken session with no way to replace it. A stored SSID is the
-        // thing that distinguishes a session worth keeping from one worth redoing.
-        var live = _brokers.Get(userId, broker);
-        if (live is not null &&
-            live.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected &&
-            !string.IsNullOrWhiteSpace(link.EncryptedSsid))
-        {
-            _logger.LogInformation(
-                "{Broker} session already live for user {UserId}; skipping browser capture",
-                broker, userId);
-            return null;
-        }
-
-        if (!string.IsNullOrWhiteSpace(link.EncryptedSsid))
-        {
-            try
-            {
-                var storedSsid = _protector.Decrypt(link.EncryptedSsid);
-                var storedCookie = !string.IsNullOrWhiteSpace(link.EncryptedCookieHeader)
-                    ? _protector.Decrypt(link.EncryptedCookieHeader)
-                    : null;
-                if (!string.IsNullOrWhiteSpace(storedSsid))
-                {
-                    _logger.LogInformation(
-                        "{Broker} found stored SSID for user {UserId}; reusing stored session instead of headless browser",
-                        broker, userId);
-                    return new BinollaCapturedSession(storedSsid, storedCookie ?? string.Empty);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed decrypting stored SSID for user {UserId}", userId);
-            }
-        }
-
-        // The same throttle as Binolla's capture, for the same reason: this launches a
-        // headless browser, and a client retrying the login would otherwise stack them.
         if (!_restorer.CanAttemptCredentialLogin(userId))
         {
             throw new ApiException(
@@ -1066,6 +1182,7 @@ public sealed class BinollaAppService
         using var workCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         workCts.CancelAfter(TimeSpan.FromMinutes(2));
 
+        _restorer.MarkCaptureStarted(userId);
         try
         {
             var captured = await _credentialAuth.LoginAsync(
@@ -1091,6 +1208,10 @@ public sealed class BinollaAppService
                 ApiErrorCodes.BinollaLoginFailed,
                 $"Unable to sign into {broker} with the provided credentials.",
                 400);
+        }
+        finally
+        {
+            _restorer.MarkCaptureEnded(userId);
         }
     }
 

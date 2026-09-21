@@ -328,7 +328,19 @@ async function main() {
   const email = arg('email') || process.env.BINOLLA_AUTH_EMAIL || '';
   const password = arg('password') || process.env.BINOLLA_AUTH_PASSWORD || '';
   const pinCode = arg('pinCode') || process.env.BINOLLA_AUTH_PIN || process.env.QUOTEX_PIN_CODE || '';
-  const headless = arg('headless', 'true') !== 'false';
+  const headlessArg = arg('headless');
+  const hasDisplay = Boolean(process.env.DISPLAY);
+  let headless = true;
+  if (headlessArg === 'false') {
+    headless = false;
+  } else if (headlessArg === 'true') {
+    headless = true;
+  } else if (hasDisplay) {
+    headless = false;
+  }
+  if (process.platform === 'linux' && !hasDisplay && !headless) {
+    headless = true;
+  }
   // Which venue to capture for. The URLs come from one table in authHelpers so the two
   // brokers cannot drift into different ideas of where a login page is; an explicit
   // --loginUrl still wins for a one-off.
@@ -399,6 +411,7 @@ async function main() {
         '--disable-blink-features=AutomationControlled',
         '--disable-dev-shm-usage',
         '--ignore-certificate-errors',
+        '--window-size=1366,768',
       ],
     };
     if (proxyConfig) {
@@ -512,7 +525,20 @@ async function main() {
       ws.on('framesent', (frame) => onFrame(frame.payload));
     });
 
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+    let pageNavigated = false;
+    const initialUrls = [url, ...(preset.fallbackLoginUrls || [])];
+    for (const targetUrl of initialUrls) {
+      try {
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: Math.min(timeoutMs, 25_000) });
+        pageNavigated = true;
+        break;
+      } catch {
+        /* try next fallback */
+      }
+    }
+    if (!pageNavigated) {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+    }
     // #region agent log
     agentLog('H103', 'capture.mjs:goto', 'page_loaded', { elapsedMs: Date.now() - captureStarted, isSignup });
     // #endregion
@@ -553,10 +579,38 @@ async function main() {
       // --- Fallback: DOM form ---
       if (broker.trim().toLowerCase() === 'quotex') {
         const formSel = isSignup ? 'form[action*="sign-up"]' : 'form[action*="sign-in"]';
+        try {
+          await page.waitForSelector(formSel, { state: 'attached', timeout: 8000 });
+        } catch {
+          /* continue */
+        }
+
         const targetForm = page.locator(formSel).first();
         if ((await targetForm.count()) > 0) {
-          await targetForm.locator('input[name="email"]').first().fill(email);
-          await targetForm.locator('input[name="password"]').first().fill(password);
+          const emailInput = targetForm.locator('input[name="email"], input[type="email"]').first();
+          const passInput = targetForm.locator('input[name="password"], input[type="password"]').first();
+
+          await emailInput.waitFor({ state: 'attached', timeout: 5000 });
+          await passInput.waitFor({ state: 'attached', timeout: 5000 });
+
+          await emailInput.fill(email).catch(() => {});
+          await passInput.fill(password).catch(() => {});
+          await emailInput.evaluate((node, v) => {
+            if (!(node instanceof HTMLInputElement)) return;
+            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+            if (setter) setter.call(node, v); else node.value = v;
+            node.dispatchEvent(new Event('input', { bubbles: true }));
+            node.dispatchEvent(new Event('change', { bubbles: true }));
+          }, email);
+          await passInput.evaluate((node, v) => {
+            if (!(node instanceof HTMLInputElement)) return;
+            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+            if (setter) setter.call(node, v); else node.value = v;
+            node.dispatchEvent(new Event('input', { bubbles: true }));
+            node.dispatchEvent(new Event('change', { bubbles: true }));
+          }, password);
+          await page.waitForTimeout(400);
+
           if (!isSignup) {
             try {
               const rem = targetForm.locator('input[name="remember"]');
@@ -570,8 +624,18 @@ async function main() {
               if ((await nonUs.count()) > 0) await nonUs.check({ timeout: 1500 });
             } catch {}
           }
-          const submitBtn = targetForm.locator('button[type="submit"], button.modal-sign__block-button').first();
-          await submitBtn.click();
+
+          const submitBtn = targetForm.locator(
+            '.modal-sign__block-button, button[type="submit"], button:has-text("Sign in"), button:has-text("Log in"), button:has-text("Sign In")',
+          ).first();
+          if ((await submitBtn.count()) > 0) {
+            await submitBtn.click();
+          } else {
+            await targetForm.evaluate((f) => {
+              if (typeof f.requestSubmit === 'function') f.requestSubmit();
+              else f.submit();
+            });
+          }
         } else {
           const emailOk = await fillFirst(
             page,
@@ -609,75 +673,6 @@ async function main() {
           }
           await clickSubmit(page, isSignup);
         }
-
-        // Post-submit Quotex PIN handling
-        if (!isSignup) {
-          const pinWaitStarted = Date.now();
-          let pinPromptDetected = false;
-          while (Date.now() - pinWaitStarted < 6000) {
-            if (wsToken || apiToken) break;
-            const pinBox = page.locator('input[name="code"], input[placeholder*="code" i]').first();
-            if ((await pinBox.count()) > 0 && (await pinBox.isVisible())) {
-              pinPromptDetected = true;
-              break;
-            }
-            const bodyText = await page.evaluate(() => document.body?.innerText || '').catch(() => '');
-            if (/enter the pin-code|pin-code/i.test(bodyText)) {
-              pinPromptDetected = true;
-              break;
-            }
-            if (page.url().includes('/trade')) break;
-            await page.waitForTimeout(200);
-          }
-
-          if (pinPromptDetected) {
-            if (pinCode) {
-              const pinBox = page.locator('input[name="code"], input[placeholder*="code" i]').first();
-              if ((await pinBox.count()) > 0) {
-                await pinBox.fill(pinCode.trim());
-              } else {
-                await page.fill('input[name="code"]', pinCode.trim());
-              }
-              const pinSubmit = page.locator('button:has-text("Sign in"), button[type="submit"]').first();
-              await pinSubmit.click();
-              await page.waitForTimeout(2500);
-            } else {
-              process.stdout.write(
-                JSON.stringify({
-                  ok: false,
-                  pinRequired: true,
-                  error: `Quotex PIN code required. A 6-digit PIN has been sent to ${email}. Please enter the code to complete connection.`,
-                }),
-              );
-              process.exit(1);
-            }
-          }
-        }
-      } else if (preset.label === 'Quotex' && !isSignup) {
-        const submitted = await page.evaluate(({ email, password }) => {
-          const form = document.querySelector('form[action*="sign-in"]');
-          if (!form) return false;
-          const emailInput = form.querySelector('input[name="email"]');
-          const passInput = form.querySelector('input[name="password"]');
-          if (!emailInput || !passInput) return false;
-
-          emailInput.value = email;
-          emailInput.dispatchEvent(new Event('input', { bubbles: true }));
-          emailInput.dispatchEvent(new Event('change', { bubbles: true }));
-
-          passInput.value = password;
-          passInput.dispatchEvent(new Event('input', { bubbles: true }));
-          passInput.dispatchEvent(new Event('change', { bubbles: true }));
-
-          const btn = form.querySelector('button[type="submit"]');
-          if (btn) btn.click();
-          else form.submit();
-          return true;
-        }, { email, password });
-
-        if (!submitted) {
-          throw new Error(`Could not submit the Quotex sign-in form (${await describeInputs(page)})`);
-        }
       } else {
         const emailOk = await fillFirst(
           page,
@@ -703,8 +698,6 @@ async function main() {
             'input[type="password"]',
             'input[autocomplete="current-password"]',
             'input[autocomplete="new-password"]',
-            // Quotex renders its own control rather than a plainly named input, and the
-            // field can appear a moment after the email one is filled.
             'input[id*="pass" i]',
             'input[placeholder*="pass" i]',
             '[data-testid*="password" i] input',
@@ -728,13 +721,10 @@ async function main() {
             ],
             password,
           );
-          // Required Binolla checkboxes (from live DOM: agreement + isNotUsCitizen).
           for (const name of ['agreement', 'isNotUsCitizen']) {
             try {
               await page.locator(`input[type="checkbox"][name="${name}"]`).check({ timeout: 2000 });
-            } catch {
-              /* try generic below */
-            }
+            } catch {}
           }
           try {
             const boxes = page.locator('input[type="checkbox"]');
@@ -742,28 +732,109 @@ async function main() {
             for (let i = 0; i < Math.min(count, 6); i++) {
               try {
                 await boxes.nth(i).check({ timeout: 1500 });
-              } catch {
-                /* optional */
-              }
+              } catch {}
             }
-          } catch {
-            /* optional */
-          }
+          } catch {}
         }
 
-        const clicked = await clickSubmit(page, isSignup);
-        void clicked;
+        await clickSubmit(page, isSignup);
       }
 
-      const started = Date.now();
-      while (!apiToken && !wsToken && Date.now() - started < waitBudgetMs) {
-        await page.waitForTimeout(150);
-        if (!apiToken) tryCaptureApi(await scanStorage(page), 'storage-poll');
+      const isQuotex = broker.trim().toLowerCase() === 'quotex';
+      if (!isQuotex) {
+        const started = Date.now();
+        while (!apiToken && !wsToken && Date.now() - started < waitBudgetMs) {
+          await page.waitForTimeout(150);
+          if (!apiToken) tryCaptureApi(await scanStorage(page), 'storage-poll');
+        }
+      } else {
+        // Quotex: wait up to 12s for navigation to /trade, while checking for errors or PIN prompt
+        const navWaitStarted = Date.now();
+        const maxQxWait = Math.min(Math.max(waitBudgetMs, 18_000), 20_000);
+        while (!wsToken && Date.now() - navWaitStarted < maxQxWait) {
+          if (page.url().includes('/trade')) break;
+
+          // 1. Check for form error hints
+          const formError = await page.evaluate(() => {
+            const dangerElements = Array.from(document.querySelectorAll(
+              '.hint.-danger, .hint.hint--error, .modal-sign__error, .error-message, .form-error, [role="alert"]',
+            ));
+            for (const el of dangerElements) {
+              const cls = el.className || '';
+              if (typeof cls === 'string' && (cls.includes('misspell-hint') || cls.includes('hide'))) continue;
+              const txt = (el.textContent || '').replace(/\s+/g, ' ').trim();
+              if (txt && !txt.toLowerCase().startsWith('did you mean')) {
+                return txt;
+              }
+            }
+            const body = document.body?.innerText || '';
+            if (/invalid email or password/i.test(body)) return 'Invalid email or password';
+            if (/user not found/i.test(body)) return 'User not found';
+            if (/too many attempts|try again later|unusual activity|temporarily blocked/i.test(body))
+              return 'Too many attempts. Please wait a few minutes and try once.';
+            return null;
+          }).catch(() => null);
+
+          if (formError) {
+            process.stdout.write(JSON.stringify({ ok: false, error: formError }));
+            process.exit(1);
+          }
+
+          // 2. Check for PIN prompt
+          const pinPromptDetected = await page.evaluate(() => {
+            const pinBox = document.querySelector('input[name="code"], input[placeholder*="code" i]');
+            if (pinBox) return true;
+            const body = document.body?.innerText || '';
+            return /enter the pin-code|pin-code|verification code|one-time|enter the code/i.test(body);
+          }).catch(() => false);
+
+          if (pinPromptDetected) {
+            if (pinCode) {
+              const pinBox = page.locator('input[name="code"], input[placeholder*="code" i]').first();
+              if ((await pinBox.count()) > 0) {
+                await pinBox.fill(pinCode.trim());
+              } else {
+                await page.fill('input[name="code"]', pinCode.trim());
+              }
+              const pinSubmit = page.locator(
+                '.modal-sign__block-button, button:has-text("Sign in"), button[type="submit"]',
+              ).first();
+              if ((await pinSubmit.count()) > 0) {
+                await pinSubmit.click();
+              }
+              await page.waitForTimeout(2000);
+            } else {
+              process.stdout.write(
+                JSON.stringify({
+                  ok: false,
+                  pinRequired: true,
+                  error: `Quotex PIN code required. A 6-digit PIN has been sent to ${email}. Please enter the code to complete connection.`,
+                }),
+              );
+              process.exit(1);
+            }
+          }
+
+          await page.waitForTimeout(200);
+        }
       }
     }
 
     if (!apiToken && !wsToken) {
       tryCaptureApi(await scanStorage(page), 'storage-final');
+      // Also inspect cookies for session tokens
+      try {
+        const cks = await context.cookies();
+        for (const c of cks) {
+          if (['session', 'ssid', 'token', 'user_session'].includes(c.name.toLowerCase())) {
+            const val = normalizeToken(c.value);
+            if (val && val.length >= 16) {
+              tryCaptureApi(val, `cookie:${c.name}`);
+              break;
+            }
+          }
+        }
+      } catch {}
     }
 
     // Whether the sign-in went through. An API 200 or a stored token proves it outright;
@@ -780,7 +851,7 @@ async function main() {
     // Open trading so the live Socket.IO client sends its authorization frame. For Quotex
     // that frame IS the session; skipping this step is why a successful login still came
     // back empty-handed.
-    if ((apiResult.okStatus || apiToken || leftLoginPage) && !wsToken) {
+    if ((apiResult.okStatus || apiToken || leftLoginPage || page.url().includes('/trade')) && !wsToken) {
       const tradingCandidates = [tradingUrl, ...(preset.tradingUrls || [])];
       let navigated = false;
       const alreadyOnTrading = page.url().includes('/trade');
@@ -815,6 +886,20 @@ async function main() {
         while (!wsToken && Date.now() - wsStarted < wsAuthWaitMs) {
           await page.waitForTimeout(200);
           if (!apiToken) tryCaptureApi(await scanStorage(page), 'storage-during-ws-wait');
+          if (!apiToken) {
+            try {
+              const cks = await context.cookies();
+              for (const c of cks) {
+                if (['session', 'ssid', 'token'].includes(c.name.toLowerCase())) {
+                  const val = normalizeToken(c.value);
+                  if (val && val.length >= 16) {
+                    tryCaptureApi(val, `cookie:${c.name}`);
+                    break;
+                  }
+                }
+              }
+            } catch {}
+          }
         }
         // #region agent log
         agentLog('H1', 'capture.mjs:trading', 'ws_auth_wait_done', {
@@ -848,6 +933,9 @@ async function main() {
       let error = isSignup
         ? `${preset.label} signup did not return a session token`
         : `${preset.label} login failed or the session token was not captured`;
+      const pageHint = diag
+        ? ` [${diag.url || ''} | ${(diag.textSnippet || '').slice(0, 180)}]`
+        : '';
 
       const lastBody = redactAuthBody(
         [...(apiResult.attempts || [])].reverse().find((a) => a.body)?.body || '',
@@ -886,7 +974,12 @@ async function main() {
         // operator nothing to act on.
         const snippet = lastBody ? ` Server said: ${lastBody.slice(0, 120)}` : '';
         error = `${error} [${apiHint}]${snippet}`;
+      } else if (/too many|try again later|unusual activity|temporarily blocked/i.test(diag?.textSnippet || '')) {
+        error = 'Too many attempts. Please wait a few minutes and try once.';
       }
+
+      if (pageHint && !error.includes(diag?.url || 'no-url'))
+        error = `${error}${pageHint}`;
 
       process.stdout.write(JSON.stringify({ ok: false, error }));
       process.exit(1);

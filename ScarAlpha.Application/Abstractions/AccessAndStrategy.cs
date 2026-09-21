@@ -98,6 +98,15 @@ public interface IBinollaSessionRestorer
     /// per-account, so retrying on behalf of someone else only deepens it.
     /// </summary>
     void MarkCredentialLoginFailed(Guid userId, bool blockedByBroker);
+
+    /// <summary>
+    /// A headless capture is starting. Background restore must stand down so it does not
+    /// take the broker's one proxy IP while the person is signing in.
+    /// </summary>
+    void MarkCaptureStarted(Guid userId);
+
+    /// <summary>Capture finished (success or failure). Restore may resume.</summary>
+    void MarkCaptureEnded(Guid userId);
 }
 
 public enum StrategyCatalogStatus
@@ -148,6 +157,9 @@ public sealed record BotRuntimeConfig(
     string MarketTypeId = "all-markets")
 {
     public decimal EffectiveBaseAmount => BaseAmount > 0 ? BaseAmount : Amount;
+    public bool IsAllAssets =>
+        (Assets is not null && Assets.Any(a => a.Trim() == "*" || string.Equals(a.Trim(), "all", StringComparison.OrdinalIgnoreCase))) ||
+        (!string.IsNullOrWhiteSpace(Asset) && (Asset.Trim() == "*" || string.Equals(Asset.Trim(), "all", StringComparison.OrdinalIgnoreCase)));
     /// <summary>Selected pairs to analyze (falls back to single Asset).</summary>
     public IReadOnlyList<string> ResolvedAssets =>
         Assets is { Count: > 0 }

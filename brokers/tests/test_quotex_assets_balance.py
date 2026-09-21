@@ -154,3 +154,37 @@ async def test_a_pushed_balance_update_is_what_the_next_caller_sees(live):
     balance = await live.get_balance(AccountType.REAL)
     assert balance.real == 412.5
     assert balance.demo == 9_000.0
+
+
+async def test_s_balance_demo_update_preserves_real_balance(live):
+    live.balances = (694.0, 2500.0)
+    live.on_event("s_balance", {"uid": 35373996, "isDemo": 1, "balance": 2699.52})
+    balance = await live.get_balance(AccountType.REAL)
+    assert balance.real == 694.0
+    assert balance.demo == 2699.52
+
+
+async def test_s_balance_real_update_preserves_demo_balance(live):
+    live.balances = (654.0, 10000.0)
+    live.on_event("s_balance", {"uid": 35373996, "isDemo": 0, "balance": 694.0})
+    balance = await live.get_balance(AccountType.REAL)
+    assert balance.real == 694.0
+    assert balance.demo == 10000.0
+
+
+def test_socketio_packets_parse_dynamic_balance(live):
+    from app.quotex_protocol import SocketIOPackets
+    parser = SocketIOPackets()
+    res = parser.parse('42["s_balance",{"uid":35373996,"isDemo":1,"balance":2699.52}]')
+    assert res is not None
+    event, data = res
+    assert event == "s_balance"
+    assert data["balance"] == 2699.52
+
+
+async def test_settlement_triggers_balance_refresh(live):
+    live.connection._ws.sent.clear()
+    live.on_event("s_orders/close", {"id": "12345", "profit": 18.5})
+    await asyncio.sleep(0.05)
+    assert any("s_balance/list" in str(frame) for frame in live.connection._ws.sent)
+

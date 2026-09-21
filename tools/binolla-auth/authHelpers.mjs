@@ -120,12 +120,23 @@ export const BROKER_PRESETS = {
     label: 'Binolla',
   },
   quotex: {
-    loginUrl: 'https://qxbroker.com/en/sign-in',
-    signupUrl: 'https://qxbroker.com/?lid=2345315',
+    loginUrl: 'https://broker-qx.pro/en/sign-in',
+    signupUrl: 'https://broker-qx.pro/en/sign-up',
     // The SSID only appears once the trading socket authorises, so the capture has to
     // reach this page — the sign-in response alone does not carry it.
-    tradingUrl: 'https://qxbroker.com/en/trade',
-    tradingUrls: ['https://qxbroker.com/en/trade', 'https://qxbroker.com/trade'],
+    tradingUrl: 'https://broker-qx.pro/en/trade',
+    tradingUrls: [
+      'https://broker-qx.pro/en/trade',
+      'https://market-qx.pro/en/trade',
+      'https://qxbroker.com/en/trade',
+      'https://quotex.com/en/trade',
+    ],
+    fallbackLoginUrls: [
+      'https://market-qx.pro/en/sign-in',
+      'https://qxbroker.com/en/sign-in',
+      'https://quotex.com/en/sign-in',
+      'https://qxbroker.com/sign-in',
+    ],
     // Deliberately empty. Quotex signs in through a server-rendered form carrying a CSRF
     // token, not a JSON endpoint; posting to a guessed path just burns seconds and can
     // trip the rate limiter before the real form is ever filled. The capture goes
@@ -134,7 +145,7 @@ export const BROKER_PRESETS = {
     signupApiPaths: [],
     // Quotex serves the app and the socket from separate hosts, and the session cookie
     // is set on the parent domain — keeping only one of them loses it.
-    cookieHosts: ['qxbroker.com', 'quotex.com', 'broker-qx.pro'],
+    cookieHosts: ['qxbroker.com', 'quotex.com', 'broker-qx.pro', 'market-qx.pro'],
     label: 'Quotex',
   },
 };

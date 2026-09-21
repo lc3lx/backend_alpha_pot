@@ -98,7 +98,8 @@ public sealed class CohortSignalCache
         int timeframeSeconds,
         DateTimeOffset now,
         Func<DateTimeOffset, CancellationToken, Task<CohortDecision?>> produce,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        bool allowRescanIfEmpty = false)
     {
         if (timeframeSeconds <= 0)
             throw new ArgumentOutOfRangeException(nameof(timeframeSeconds));
@@ -106,14 +107,14 @@ public sealed class CohortSignalCache
         var expectedBar = MarketAnalysisCache.CurrentClosedBarTime(now, timeframeSeconds);
         var entry = _entries.GetOrAdd(cohort.ToString(), _ => new Entry());
 
-        if (IsFresh(entry.Value, expectedBar))
+        if (IsFresh(entry.Value, expectedBar) && (!allowRescanIfEmpty || entry.Value!.Candidates.Count > 0))
             return entry.Value;
 
         // Single-flight: one scan per cohort per bar however many users arrive at once.
         await entry.Gate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            if (IsFresh(entry.Value, expectedBar))
+            if (IsFresh(entry.Value, expectedBar) && (!allowRescanIfEmpty || entry.Value!.Candidates.Count > 0))
                 return entry.Value;
 
             var produced = await produce(expectedBar, ct).ConfigureAwait(false);
@@ -122,7 +123,10 @@ public sealed class CohortSignalCache
 
             // A scan that reached no pair at all is a failed scan, not an empty market.
             if (produced.ClosedBarTime == expectedBar && produced.AssetsScanned > 0)
-                entry.Value = produced;
+            {
+                if (produced.Candidates.Count > 0 || !allowRescanIfEmpty)
+                    entry.Value = produced;
+            }
 
             return produced;
         }

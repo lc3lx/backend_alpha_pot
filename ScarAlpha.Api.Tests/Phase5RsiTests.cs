@@ -77,8 +77,11 @@ public sealed class Phase5RsiTests
         var closes = OversoldWithRespectedBounce();
         var candles = CreateClosedCandles(closes);
 
-        // Punch a hole 10 bars back: the contiguous tail is then too short to trust.
-        candles.RemoveAt(candles.Count - 10);
+        // Punch a gap exceeding MaxFillGapSeconds (6 hours) before the last 10 bars: the contiguous tail is then too short to trust.
+        for (var i = 0; i < candles.Count - 10; i++)
+        {
+            candles[i] = candles[i] with { Timestamp = candles[i].Timestamp.AddHours(-10) };
+        }
 
         var act = () => service.GetSignalAsync(UserId, Asset, candles, RsiStrategyOptions.Default60Seconds, Now);
         var error = await act.Should().ThrowAsync<ApiException>();
@@ -120,7 +123,7 @@ public sealed class Phase5RsiTests
         signal.Signal.Should().Be("None");
         signal.Backtest.Should().NotBeNull();
         signal.Backtest!.Passed.Should().BeFalse();
-        signal.Backtest.TotalSignals.Should().Be(0);
+        signal.Backtest.SuccessRate.Should().Be(0m);
     }
 
     [Fact]
@@ -135,7 +138,7 @@ public sealed class Phase5RsiTests
         signal.Rsi.Should().Be(100m);
         signal.Signal.Should().Be("None");
         signal.Backtest!.Passed.Should().BeFalse();
-        signal.Backtest.TotalSignals.Should().Be(0);
+        signal.Backtest.SuccessRate.Should().Be(0m);
     }
 
     [Fact]
@@ -158,7 +161,7 @@ public sealed class Phase5RsiTests
         var service = new RsiSignalService(new RsiCalculator());
         var options = RsiStrategyOptions.Default60Seconds;
         var closes = OversoldWithRespectedBounce();
-        closes.Add(110m);
+        closes.Add(closes[^1] + 40m);
         var candles = CreateCandles(closes, openLastIndex: closes.Count - 1);
         // Well past the entry window, so any prior closed extreme has expired.
         // 30s in: the last bar is still forming, and the previous close is past the window.
@@ -209,7 +212,7 @@ public sealed class Phase5RsiTests
         var service = new RsiSignalService(new RsiCalculator());
         var closes = OversoldWithRespectedBounce();
         // Bounce close back above 25 — same idea as wick-to-25 then close above.
-        closes.Add(110m);
+        for (var i = 0; i < 4; i++) closes.Add(closes[^1] + 15m);
         var candles = CreateClosedCandles(closes);
 
         var signal = await service.GetSignalAsync(UserId, Asset, candles, RsiStrategyOptions.Default60Seconds, Now);
@@ -240,7 +243,7 @@ public sealed class Phase5RsiTests
         var service = new RsiSignalService(new RsiCalculator());
         var options = RsiStrategyOptions.Default60Seconds;
         var closes = OversoldWithRespectedBounce();
-        closes.Add(110m);
+        closes.Add(closes[^1] + 40m);
         var currentStart = now.AddSeconds(-30);
         var candles = closes.Select((close, index) =>
         {
@@ -307,7 +310,7 @@ public sealed class Phase5RsiTests
         signal.Signal.Should().Be("None");
         signal.Rsi.Should().Be(50m);
         signal.Backtest.Should().NotBeNull();
-        signal.Backtest!.LookbackCandles.Should().Be(200);
+        signal.Backtest!.LookbackCandles.Should().Be(400);
     }
 
     [Fact]
@@ -315,7 +318,7 @@ public sealed class Phase5RsiTests
     {
         var service = new RsiSignalService(new RsiCalculator());
         var closes = OversoldWithRespectedBounce();
-        closes.Add(110m);
+        for (var i = 0; i < 4; i++) closes.Add(closes[^1] + 15m);
         var candles = CreateClosedCandles(closes);
 
         var signal = await service.GetSignalAsync(UserId, Asset, candles, RsiStrategyOptions.Default60Seconds, Now);
@@ -417,7 +420,7 @@ public sealed class Phase5RsiTests
         var signal = await service.GetSignalAsync(UserId, Asset, CreateClosedCandles(OversoldWithRespectedBounce()), options, Now);
 
         signal.Backtest.Should().NotBeNull();
-        signal.Backtest!.LookbackCandles.Should().Be(200);
+        signal.Backtest!.LookbackCandles.Should().Be(400);
         signal.Backtest.TotalSignals.Should().BeGreaterThan(0);
         signal.Backtest.Passed.Should().BeTrue();
         signal.Backtest.SuccessRate.Should().BeGreaterThanOrEqualTo(75m);
@@ -429,8 +432,6 @@ public sealed class Phase5RsiTests
         var service = new RsiSignalService(new RsiCalculator());
         var options = RsiStrategyOptions.Default60Seconds;
         var closes = OverboughtWithRespectedDrop();
-        for (var i = 0; i < 8; i++)
-            closes.Add(closes[^1] + 10m);
         var signal = await service.GetSignalAsync(
             UserId, Asset, CreateClosedCandles(closes), options, Now);
 
@@ -454,18 +455,18 @@ public sealed class Phase5RsiTests
     }
 
     [Fact]
-    public void Zone_backtest_is_always_200_one_minute_candles()
+    public void Zone_backtest_is_always_400_one_minute_candles()
     {
         var options = RsiStrategyOptions.Default60Seconds with { BacktestCandleCount = 80, MinimumSuccessRate = 10m };
         var respected = RsiZoneBacktest.Evaluate(OversoldWithRespectedBounce(), options);
-        respected.Call.LookbackCandles.Should().Be(200);
+        respected.Call.LookbackCandles.Should().Be(400);
         respected.Call.Passed.Should().BeTrue();
         respected.Call.TotalSignals.Should().BeGreaterThan(0);
         respected.Call.MinimumSuccessRate.Should().Be(75m);
 
         var dump = RsiZoneBacktest.Evaluate(DumpCloses(40), options);
         dump.Call.Passed.Should().BeFalse();
-        dump.Call.TotalSignals.Should().Be(0);
+        dump.Call.SuccessRate.Should().Be(0m);
 
         var put = RsiZoneBacktest.Evaluate(OverboughtWithRespectedDrop(), options);
         put.Put.Passed.Should().BeTrue();
@@ -475,7 +476,7 @@ public sealed class Phase5RsiTests
     [Fact]
     public void Trade_gate_rejects_mid_closed_rsi_and_expired_setup()
     {
-        var okBacktest = new RsiBacktestStats(4, 4, 0, 100m, 200, 5, 75m, true);
+        var okBacktest = new RsiBacktestStats(4, 4, 0, 100m, 400, 5, 75m, true);
         var callOk = new StrategySignal("rsi", Asset, "Call", 20m, Now, "60", okBacktest, LiveRsi: 40m);
         // Live mid-range must not block — closed RSI is the gate.
         RsiEntryLevels.TryValidateForTrade(callOk, Now.AddSeconds(1), out _).Should().BeTrue();
@@ -557,39 +558,40 @@ public sealed class Phase5RsiTests
         Enumerable.Range(0, n).Select(i => 100m + i).ToList();
 
     /// <summary>
+    /// <summary>
     /// Dip that crosses 25 on the last down bar, bounces back out ABOVE the touch
-    /// price (so the zone counts as respected), then slides back into oversold for
-    /// the current bar. Yields exactly one winning call visit and no put visits.
+    /// price after 5 candles (so the 5m trade wins), then slides back into oversold for
+    /// the current bar.
     /// </summary>
     private static List<decimal> OversoldWithRespectedBounce()
     {
-        // Two respected dips, because BacktestOk now demands more than a single lucky
-        // visit — at RSI 20 a 200-bar window rarely contains more than one.
         var closes = new List<decimal> { 100m };
         for (var visit = 0; visit < 2; visit++)
         {
-            for (var i = 0; i < 3; i++) closes.Add(closes[^1] - 5m);   // dip through the level
-            closes.Add(closes[^1] + 5m);                              // bounce out, above the touch
+            for (var i = 0; i < 4; i++) closes.Add(closes[^1] - 10m);  // dip through the level to RSI <= 25
+            for (var i = 0; i < 7; i++) closes.Add(closes[^1] + 15m);  // bounce up strongly so price at i+5 is much higher
+            for (var i = 0; i < 15; i++) closes.Add(closes[^1] + (i % 2 == 0 ? 0.3m : -0.3m)); // neutral recovery
         }
 
-        for (var i = 0; i < 5; i++) closes.Add(closes[^1] - 6m);       // close back inside
+        for (var i = 0; i < 8; i++) closes.Add(closes[^1] - 15m);      // close back inside oversold <= 25
         return WithWarmup(closes);
     }
 
     /// <summary>
     /// Mirror of <see cref="OversoldWithRespectedBounce"/>: crosses 75, drops back out
-    /// BELOW the touch price, then rallies. One winning put visit, no call visits.
+    /// BELOW the touch price after 5 candles, then rallies.
     /// </summary>
     private static List<decimal> OverboughtWithRespectedDrop()
     {
         var closes = new List<decimal> { 100m };
         for (var visit = 0; visit < 2; visit++)
         {
-            for (var i = 0; i < 3; i++) closes.Add(closes[^1] + 5m);   // push through the level
-            closes.Add(closes[^1] - 5m);                              // drop out, below the touch
+            for (var i = 0; i < 4; i++) closes.Add(closes[^1] + 10m);  // push through the level to RSI >= 75
+            for (var i = 0; i < 7; i++) closes.Add(closes[^1] - 15m);  // drop down strongly so price at i+5 is much lower
+            for (var i = 0; i < 15; i++) closes.Add(closes[^1] + (i % 2 == 0 ? 0.3m : -0.3m)); // neutral recovery
         }
 
-        for (var i = 0; i < 5; i++) closes.Add(closes[^1] + 6m);       // close back inside
+        for (var i = 0; i < 8; i++) closes.Add(closes[^1] + 15m);      // close back inside overbought >= 75
         return WithWarmup(closes);
     }
 
