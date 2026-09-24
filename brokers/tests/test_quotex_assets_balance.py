@@ -133,11 +133,11 @@ async def test_a_known_balance_is_returned_without_asking_the_broker(live):
     assert live.connection._ws.sent == []
 
 
-async def test_a_stale_balance_is_still_served_at_once(live):
+async def test_a_recent_balance_is_served_while_refreshing(live):
     # The alternative is what used to happen: the caller waits, and a pre-trade check
     # that waits long enough is reported to the user as a broker that cannot be reached.
     live.balances = (250.0, 10_000.0)
-    live.balance_at = time.monotonic() - 3600
+    live.balance_at = time.monotonic() - 15
 
     started = time.monotonic()
     balance = await live.get_balance(AccountType.REAL)
@@ -147,6 +147,51 @@ async def test_a_stale_balance_is_still_served_at_once(live):
     assert elapsed < 0.5
     await asyncio.sleep(0.05)
     assert any("s_balance/list" in str(frame) for frame in live.connection._ws.sent)
+
+
+async def test_an_old_balance_requires_a_fresh_broker_response(live):
+    live.balances = (250.0, 10_000.0)
+    live.balance_at = time.monotonic() - 3600
+    async def respond(*args):
+        live.on_event('s_balance/list', {'liveBalance': 0, 'demoBalance': 20})
+    live.send_event = respond
+    balance = await live.get_balance(AccountType.REAL)
+    assert balance.real == 0
+    assert balance.demo == 20
+
+
+async def test_an_old_balance_without_response_is_unavailable(live, monkeypatch):
+    from app.brokers.base import NotConnected
+    live.balances = (250.0, 10_000.0)
+    live.balance_at = time.monotonic() - 3600
+    async def timeout(coro, *args):
+        coro.close()
+        raise asyncio.TimeoutError
+    monkeypatch.setattr(asyncio, 'wait_for', timeout)
+    with pytest.raises(NotConnected):
+        await live.get_balance(AccountType.REAL)
+
+
+def test_partial_push_does_not_invent_the_other_account_balance(live):
+    live.on_event('s_balance', {'isDemo': 0, 'balance': 25})
+    assert live.balances == (25, None)
+
+
+def test_demo_push_does_not_refresh_age_of_real_balance(live):
+    live.on_event('balance', {'liveBalance': 50, 'demoBalance': 100})
+    old = time.monotonic() - 100
+    live._balance_times[AccountType.REAL] = old
+    live.on_event('s_balance', {'isDemo': 1, 'balance': 200})
+    assert live.balance_age() >= 100
+    assert time.monotonic() - live.balance_at < 1
+
+
+async def test_unchanged_balance_remains_valid_on_authenticated_live_stream(live):
+    live.on_event('balance', {'liveBalance': 50, 'demoBalance': 100})
+    live.balance_at = time.monotonic() - 3600
+    live.last_recv_time = time.monotonic()
+    balance = await live.get_balance(AccountType.REAL)
+    assert balance.real == 50
 
 
 async def test_a_pushed_balance_update_is_what_the_next_caller_sees(live):
@@ -188,3 +233,27 @@ async def test_settlement_triggers_balance_refresh(live):
     await asyncio.sleep(0.05)
     assert any("s_balance/list" in str(frame) for frame in live.connection._ws.sent)
 
+
+async def test_concurrent_readers_share_one_background_balance_refresh(live):
+    live.on_event('balance', {'liveBalance': 25, 'demoBalance': 100})
+    live.balance_at = time.monotonic() - 3600
+    live.last_recv_time = time.monotonic()
+    release = asyncio.Event()
+    calls = 0
+
+    async def request():
+        nonlocal calls
+        calls += 1
+        await release.wait()
+
+    live._request_balance = request
+    results = await asyncio.gather(*(live.get_balance(AccountType.REAL) for _ in range(200)))
+    await asyncio.sleep(0)
+    assert all(result.real == 25 for result in results)
+    assert calls == 1
+    assert len(live._refresh_tasks) == 1
+    release.set()
+    await asyncio.gather(*live._refresh_tasks)
+    await live.get_balance(AccountType.REAL)
+    await asyncio.sleep(0)
+    assert calls == 2

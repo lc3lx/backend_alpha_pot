@@ -310,7 +310,7 @@ public sealed class Phase5RsiTests
         signal.Signal.Should().Be("None");
         signal.Rsi.Should().Be(50m);
         signal.Backtest.Should().NotBeNull();
-        signal.Backtest!.LookbackCandles.Should().Be(400);
+        signal.Backtest!.LookbackCandles.Should().Be(200);
     }
 
     [Fact]
@@ -349,6 +349,15 @@ public sealed class Phase5RsiTests
         RsiStrategyOptions.FromBotDurationSeconds(240).ExpiryCandles.Should().Be(4);
         RsiStrategyOptions.FromBotDurationSeconds(300).ExpiryCandles.Should().Be(5);
         RsiStrategyOptions.FromBotDurationSeconds(60).ExpiryCandles.Should().Be(5);
+    }
+
+    [Fact]
+    public void Trade_duration_is_five_minutes_when_the_bot_stored_one_minute()
+    {
+        RsiStrategyOptions.TradeDurationSeconds(60).Should().Be(300);
+        RsiStrategyOptions.TradeDurationSeconds(60, 5).Should().Be(300);
+        RsiStrategyOptions.TradeDurationSeconds(180).Should().Be(180);
+        RsiStrategyOptions.TradeDurationSeconds(300).Should().Be(300);
     }
 
     [Fact]
@@ -420,7 +429,7 @@ public sealed class Phase5RsiTests
         var signal = await service.GetSignalAsync(UserId, Asset, CreateClosedCandles(OversoldWithRespectedBounce()), options, Now);
 
         signal.Backtest.Should().NotBeNull();
-        signal.Backtest!.LookbackCandles.Should().Be(400);
+        signal.Backtest!.LookbackCandles.Should().Be(200);
         signal.Backtest.TotalSignals.Should().BeGreaterThan(0);
         signal.Backtest.Passed.Should().BeTrue();
         signal.Backtest.SuccessRate.Should().BeGreaterThanOrEqualTo(75m);
@@ -452,14 +461,37 @@ public sealed class Phase5RsiTests
 
         signal.Signal.Should().Be("None");
         signal.Rsi.Should().BeLessThan(RsiEntryLevels.PutMin);
+        // Mid-range still carries both sides so they are ready the moment RSI next touches.
+        signal.CallBacktest.Should().NotBeNull();
+        signal.PutBacktest.Should().NotBeNull();
+        signal.Backtest.Should().NotBeNull();
     }
 
     [Fact]
-    public void Zone_backtest_is_always_400_one_minute_candles()
+    public async Task Cached_backtest_is_used_the_instant_closed_rsi_hits_the_level()
+    {
+        var service = new RsiSignalService(new RsiCalculator());
+        var call = new RsiBacktestStats(4, 4, 0, 100m, 400, 5, 75m, true);
+        var put = new RsiBacktestStats(3, 3, 0, 100m, 400, 5, 75m, true);
+        var candles = CreateClosedCandles(OversoldWithRespectedBounce());
+
+        var signal = await service.GetSignalAsync(
+            UserId, Asset, candles, RsiStrategyOptions.Default60Seconds, Now,
+            cachedCallBacktest: call,
+            cachedPutBacktest: put);
+
+        signal.Signal.Should().Be("Call");
+        signal.CallBacktest.Should().BeSameAs(call);
+        signal.PutBacktest.Should().BeSameAs(put);
+        signal.Backtest.Should().BeSameAs(call);
+    }
+
+    [Fact]
+    public void Zone_backtest_is_always_200_one_minute_candles()
     {
         var options = RsiStrategyOptions.Default60Seconds with { BacktestCandleCount = 80, MinimumSuccessRate = 10m };
         var respected = RsiZoneBacktest.Evaluate(OversoldWithRespectedBounce(), options);
-        respected.Call.LookbackCandles.Should().Be(400);
+        respected.Call.LookbackCandles.Should().Be(200);
         respected.Call.Passed.Should().BeTrue();
         respected.Call.TotalSignals.Should().BeGreaterThan(0);
         respected.Call.MinimumSuccessRate.Should().Be(75m);
@@ -471,6 +503,22 @@ public sealed class Phase5RsiTests
         var put = RsiZoneBacktest.Evaluate(OverboughtWithRespectedDrop(), options);
         put.Put.Passed.Should().BeTrue();
         put.Put.TotalSignals.Should().BeGreaterThan(0);
+    }
+
+    [Fact]
+    public void DisplayFor_picks_the_touch_side_and_the_nearer_side_while_waiting()
+    {
+        var call = new RsiBacktestStats(2, 2, 0, 100m, 400, 5, 75m, true);
+        var put = new RsiBacktestStats(3, 3, 0, 100m, 400, 5, 75m, true);
+        RsiZoneBacktest.DisplayFor(20m, call, put).Should().BeSameAs(call);
+        RsiZoneBacktest.DisplayFor(80m, call, put).Should().BeSameAs(put);
+        RsiZoneBacktest.DisplayFor(40m, call, put).Should().BeSameAs(call);
+        RsiZoneBacktest.DisplayFor(60m, call, put).Should().BeSameAs(put);
+
+        var empty = new RsiBacktestStats(0, 0, 0, 0m, 400, 5, 75m, false);
+        RsiZoneBacktest.DisplayFor(40m, empty, put).Should().BeSameAs(put);
+        RsiZoneBacktest.DisplayFor(60m, call, empty).Should().BeSameAs(call);
+        RsiZoneBacktest.DisplayFor(40m, empty, empty).Should().BeSameAs(empty);
     }
 
     [Fact]

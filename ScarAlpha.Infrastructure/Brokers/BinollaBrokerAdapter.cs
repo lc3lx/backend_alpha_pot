@@ -45,6 +45,14 @@ public sealed class BinollaBrokerAdapter : IBrokerClient
     public bool TryGetCachedQuote(string asset, out QuoteData? quote) =>
         _inner.TryGetCachedQuote(asset, out quote);
 
+    public Task<IReadOnlyList<QuoteData>> RefreshQuotesAsync(CancellationToken ct = default)
+    {
+        _ = ct;
+        // Binolla already pushes ticks into the session cache; GetBoard reads them
+        // per pair via TryGetCachedQuote.
+        return Task.FromResult<IReadOnlyList<QuoteData>>(Array.Empty<QuoteData>());
+    }
+
     public Task SubscribePairAsync(string asset, int periodSeconds = 60, CancellationToken ct = default) =>
         _inner.SubscribePairAsync(asset, periodSeconds, ct);
 

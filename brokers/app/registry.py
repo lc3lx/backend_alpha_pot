@@ -46,7 +46,7 @@ class _Throttle:
     #: bounded so a restart cannot open a hundred handshakes at the broker together.
     max_concurrent: int = 50
     #: Cooldown lockout on failed attempts (disabled by default so user is not blocked).
-    enable_user_cooldown: bool = False
+    enable_user_cooldown: bool = True
 
     _user_retry_after: dict[str, float] = field(default_factory=dict)
     _user_failures: dict[str, int] = field(default_factory=dict)
@@ -59,12 +59,12 @@ class _Throttle:
 
     def can_attempt(self, user_id: str) -> bool:
         now = time.monotonic()
-        # Cooldown removed per user request: allow immediate retries without artificial delay
         if user_id in self._in_flight:
-            if now - self._last_started > 15.0:
-                self._in_flight.discard(user_id)
-            else:
-                return False
+            return False
+        if now < self._global_retry_after or now < self._user_retry_after.get(user_id, 0):
+            return False
+        if self._recent_failures and now - self._last_started < self.min_interval_seconds:
+            return False
         if len(self._in_flight) >= self.max_concurrent:
             return False
 
@@ -74,11 +74,16 @@ class _Throttle:
 
     def mark_failed(self, user_id: str, *, blocked_by_broker: bool = False) -> None:
         self._release(user_id)
-        self._recent_failures = 0
-        self._user_failures.pop(user_id, None)
-        self._user_retry_after.pop(user_id, None)
-        self._global_failures = 0
-        self._global_retry_after = 0.0
+        now = time.monotonic()
+        self._recent_failures += 1
+        self._last_started = now
+        failures = self._user_failures.get(user_id, 0) + 1
+        self._user_failures[user_id] = failures
+        if self.enable_user_cooldown:
+            self._user_retry_after[user_id] = now + min(self.max_seconds, self.base_seconds * 2 ** min(failures - 1, 10))
+        if blocked_by_broker:
+            self._global_failures += 1
+            self._global_retry_after = now + min(self.max_seconds, self.base_seconds * 2 ** min(self._global_failures - 1, 10))
 
     def mark_succeeded(self, user_id: str) -> None:
         self._release(user_id)
@@ -100,6 +105,9 @@ class _Throttle:
         """Why an attempt was refused, in words a user can act on."""
         if user_id in self._in_flight:
             return "A sign-in for this account is already running. Give it a moment."
+        until = max(self._global_retry_after, self._user_retry_after.get(user_id, 0))
+        if until > time.monotonic():
+            return f"Broker sign-in failed. Retry in {max(1, int(until - time.monotonic()) + 1)} seconds."
         return "Sign-in in progress. Please wait a moment."
 
 

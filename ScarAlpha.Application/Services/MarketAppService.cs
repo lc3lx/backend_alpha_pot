@@ -359,6 +359,16 @@ public sealed class MarketAppService
             return client;
         }
 
+        // Pairs and candles are market data. A missing wrapper on this user must not
+        // blank the chart while another live Quotex session is already feeding the store.
+        var shared = _sessions.GetAny(broker);
+        if (shared is not null &&
+            shared.IsTransportConnected &&
+            shared.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
+        {
+            return shared;
+        }
+
         return null;
     }
 }

@@ -192,15 +192,6 @@ public sealed class TimeSignalWorker : IHostedService
                         client.Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected))
                     {
                         restorer.EnsureBackgroundRestore(userId);
-                        try
-                        {
-                            using (AmbientUserContext.Use(userId))
-                            {
-                                var binolla = userScope.ServiceProvider.GetRequiredService<BinollaAppService>();
-                                await binolla.TryReloginFromStoredCredentialsAsync(token).ConfigureAwait(false);
-                            }
-                        }
-                        catch { /* soft */ }
                     }
 
                     // Check daily limits

@@ -14,7 +14,7 @@ public sealed record RsiStrategyOptions(
     decimal Oversold,
     decimal Overbought,
     int TimeframeSeconds,
-    int BacktestCandleCount = 400,
+    int BacktestCandleCount = 200,
     int ExpiryCandles = 5,
     decimal MinimumSuccessRate = 75m,
     /// <summary>
@@ -44,6 +44,22 @@ public sealed record RsiStrategyOptions(
             candles = 5;
         return Default60Seconds with { ExpiryCandles = candles };
     }
+
+    /// <summary>
+    /// Analysis stays on 1-minute candles. The option bought is the 3–5 minute
+    /// backtest window (default 5). A stored 60s value is the chart timeframe, not
+    /// the deal — entering turbo 1m is what this returns 300 to prevent.
+    /// </summary>
+    public static int TradeDurationSeconds(int botDurationSeconds, int expiryCandles = 5)
+    {
+        if (botDurationSeconds <= 60)
+        {
+            var candles = expiryCandles is >= 3 and <= 5 ? expiryCandles : 5;
+            return candles * 60;
+        }
+
+        return botDurationSeconds is >= 5 and <= 3600 ? botDurationSeconds : 300;
+    }
 }
 
 /// <summary>
@@ -51,7 +67,8 @@ public sealed record RsiStrategyOptions(
 /// 1) Wait for the 1m candle that touched the entry level to CLOSE.
 /// 2) Put only if closed RSI stayed at/above <see cref="PutMin"/>; Call only if it
 ///    stayed at/below <see cref="CallMax"/>. Closing back inside the range → no entry.
-/// 3) Backtest has ZERO entry value until step 2 is true, then must Pass (≥ 75%).
+/// 3) Both backtests are already computed on this bar. They have ZERO entry value
+///    until step 2 is true, then the matching side must Pass (≥ 75% and min visits).
 /// 4) Setup must still be within <see cref="SetupTtlSeconds"/> of that candle's close.
 /// </summary>
 public static class RsiEntryLevels
@@ -300,7 +317,16 @@ public sealed record StrategySignal(
     /// <summary>True when the regime filter was actually evaluated for this signal.</summary>
     bool RegimeApplied = false,
     decimal? RelativeVolume = null,
-    bool VolumeOk = true);
+    bool VolumeOk = true,
+    /// <summary>Call-side zone backtest for this closed bar — always filled when ready, even mid-range.</summary>
+    RsiBacktestStats? CallBacktest = null,
+    /// <summary>Put-side zone backtest for this closed bar — always filled when ready, even mid-range.</summary>
+    RsiBacktestStats? PutBacktest = null,
+    /// <summary>
+    /// Why a zone touch did not become a trade. Empty when there is no setup or the
+    /// row is a live Call/Put. Codes: WIN_CONDITION, LOW_PAYOUT, or LOW_PAYOUT:63.
+    /// </summary>
+    string? EntryBlockReason = null);
 
 public interface IRsiCalculator
 {
@@ -314,7 +340,10 @@ public interface IRsiCalculator
 public interface IRsiSignalService
 {
     /// <summary>
-    /// Computes closed + live RSI and a 200×1m zone-respect backtest on every snapshot.
+    /// Computes closed + live RSI. Call and Put backtests are taken from the shared
+    /// per-bar cache when present (already evaluated in <c>GetSharedAnalysis</c>) so
+    /// they are ready the moment closed RSI hits 25/75. Cache miss still evaluates
+    /// both sides before the RSI gate.
     /// Call = last CLOSED bar RSI ≤ 25, then call backtest must pass.
     /// Put  = last CLOSED bar RSI ≥ 75, then put backtest must pass.
     /// Forming-bar (live) RSI is display-only — a wick to 75/25 that closes back inside does not enter.
@@ -328,7 +357,9 @@ public interface IRsiSignalService
         IReadOnlyList<RsiCandle> candles,
         RsiStrategyOptions options,
         DateTimeOffset now,
-        CancellationToken ct = default);
+        CancellationToken ct = default,
+        RsiBacktestStats? cachedCallBacktest = null,
+        RsiBacktestStats? cachedPutBacktest = null);
 
     /// <summary>
     /// Records that a Call/Put for this candle was consumed (trade placed),

@@ -56,12 +56,18 @@ class MarketData:
         #: The liveness check is supplied by the feeding session itself, so this store
         #: never has to know what a session is or reach into a registry to ask.
         self._feed: dict[tuple[str, int], tuple[str, Callable[[], bool]]] = {}
+        self._feed_started: dict[tuple[str, int], float] = {}
         #: asset -> (epoch seconds, price)
         self._quotes: dict[str, tuple[float, float]] = {}
         #: (asset, timeframe) -> monotonic time of the last history/load we asked for.
         #: Without a cooldown a gappy series would fire history/load on every chart poll.
         self._history_reload_at: dict[tuple[str, int], float] = {}
         self._history_reload_cooldown = 30.0
+        # Short series (under the 200-bar backtest window) get one older page
+        # at a time. A page that adds nothing waits 15 minutes instead of looping.
+        self._backfill_at: dict[tuple[str, int], float] = {}
+        self._backfill_seen: dict[tuple[str, int], int] = {}
+        self._backfill_stall_until: dict[tuple[str, int], float] = {}
         self._lock = asyncio.Lock()
 
     # ---- reading ----------------------------------------------------------
@@ -76,6 +82,18 @@ class MarketData:
             return False
         # One bar of slack; past that the stream is not keeping the series current.
         return (time.monotonic() - seen) < (period_seconds + 15)
+
+    def last_bar_age(self, asset: str, period_seconds: int) -> float | None:
+        bucket = self._series(asset, period_seconds)
+        if not bucket:
+            return None
+        return time.time() - max(bucket)
+
+    def is_series_current(self, asset: str, period_seconds: int) -> bool:
+        age = self.last_bar_age(asset, period_seconds)
+        if age is None:
+            return False
+        return age <= (period_seconds * 3)
 
     def _series(self, asset: str, period_seconds: int) -> Series:
         bucket = self._bars.get((asset, period_seconds))
@@ -111,7 +129,36 @@ class MarketData:
         if not self.needs_history(asset, period_seconds):
             return False
         last = self._history_reload_at.get((asset, period_seconds), 0.0)
-        return (time.monotonic() - last) >= self._history_reload_cooldown
+        # A frozen last bar is a dead feed, not a gappy one. 30s used to skip
+        # resubscribe while RSI stayed on the same closed minute for an hour.
+        cooldown = 8.0 if not self.is_series_current(asset, period_seconds) else self._history_reload_cooldown
+        return (time.monotonic() - last) >= cooldown
+
+    def backfill_end(self, asset: str, period_seconds: int, target: int = 200) -> int | None:
+        """Unix end for the next older history page, or None when this series can wait.
+
+        One page every 3 minutes. If the previous page did not add bars, wait 15 minutes.
+        """
+        bucket = self._bars.get((asset, period_seconds), {})
+        if len(bucket) >= target:
+            return None
+        now = time.monotonic()
+        key = (asset, period_seconds)
+        if now < self._backfill_stall_until.get(key, 0.0):
+            return None
+        last = self._backfill_at.get(key, 0.0)
+        if now - last < 180.0:
+            return None
+        seen = self._backfill_seen.get(key)
+        if seen is not None and len(bucket) <= seen:
+            self._backfill_stall_until[key] = now + 900.0
+            self._backfill_seen[key] = len(bucket)
+            return None
+        self._backfill_at[key] = now
+        self._backfill_seen[key] = len(bucket)
+        if not bucket:
+            return int(time.time())
+        return int(min(bucket))
 
     def mark_history_reload(self, asset: str, period_seconds: int) -> None:
         now = time.monotonic()
@@ -130,7 +177,26 @@ class MarketData:
             if symbol == asset and bucket:
                 start = max(bucket)
                 return (float(start), bucket[start][3])
+        alt = asset[:-4] if asset.endswith("_otc") else f"{asset}_otc"
+        hit = self._quotes.get(alt)
+        if hit is not None:
+            return hit
         return None
+
+    def live_quotes(self) -> list[tuple[str, float, float]]:
+        """Every pair's latest tick (or forming 1m close). The monitor board reads this."""
+        now = time.time()
+        merged: dict[str, tuple[float, float]] = {}
+        for (symbol, period), bucket in self._bars.items():
+            if period != 60 or not bucket:
+                continue
+            start = max(bucket)
+            ts = float(start) if (now - start) <= 180 else now
+            merged[symbol] = (ts, float(bucket[start][3]))
+        for asset, (ts, price) in self._quotes.items():
+            tick_ts = float(ts) if (now - ts) <= 180 else now
+            merged[asset] = (tick_ts, float(price))
+        return [(asset, ts, price) for asset, (ts, price) in merged.items()]
 
     def has_feed(self, asset: str, period_seconds: int) -> bool:
         return (asset, period_seconds) in self._feed
@@ -160,6 +226,8 @@ class MarketData:
         key = (asset, period_seconds)
 
         async with self._lock:
+            # Give a newly requested feed time to deliver its first bars. Readers
+            # arriving together must not each start the same subscription.
             held = self._feed.get(key)
             if held is not None:
                 holder_alive = held[1]
@@ -169,10 +237,14 @@ class MarketData:
                 except Exception:
                     alive = False  # an unanswerable session counts as gone
 
-                # Skip a live feed only when the stored series is also complete.
-                # Ticks arriving on top of a multi-hour hole look fresh and used to
-                # skip history/load, leaving RSI with 2–3 contiguous bars.
-                if alive and not self.should_reload_history(asset, period_seconds):
+                # A connected socket with a last bar older than 3 periods is dead.
+                # Skipping it was what froze RSI while health still said websocket:1.
+                if (
+                    alive
+                    and (time.monotonic() - self._feed_started.get(key, 0) < 10.0
+                         or (self.is_series_current(asset, period_seconds)
+                             and not self.should_reload_history(asset, period_seconds)))
+                ):
                     return
 
             # Load whatever previous runs left on disk before the first tick arrives, so
@@ -181,6 +253,7 @@ class MarketData:
                 self._bars[key] = self._store.load(asset, period_seconds)
 
             self._feed[key] = (user_id, is_alive)
+            self._feed_started[key] = time.monotonic()
             if self.needs_history(asset, period_seconds):
                 self.mark_history_reload(asset, period_seconds)
 
@@ -195,6 +268,7 @@ class MarketData:
                 held = self._feed.get(key)
                 if held is not None and held[0] == user_id:
                     self._feed.pop(key, None)
+                    self._feed_started.pop(key, None)
             raise
 
     async def release_feeds(self, user_id: str) -> None:
@@ -203,6 +277,7 @@ class MarketData:
             for key, held in list(self._feed.items()):
                 if held[0] == user_id:
                     self._feed.pop(key, None)
+                    self._feed_started.pop(key, None)
 
     # ---- writing ----------------------------------------------------------
 
@@ -216,6 +291,13 @@ class MarketData:
         key = (asset, period_seconds)
         start = int(ts) - (int(ts) % period_seconds)
         bucket = self._bars.setdefault(key, {})
+        now = time.time()
+        last = max(bucket) if bucket else None
+        # Vendor ticks sometimes repeat the last bar's clock for tens of minutes.
+        # Those must open a new wall-clock minute or RSI freezes and every chart waits 5s.
+        if last is not None and start <= last and (now - last) > (period_seconds * 2):
+            ts = now
+            start = int(ts) - (int(ts) % period_seconds)
         high = _num(row.get("high")) or close
         low = _num(row.get("low")) or close
         volume = _num(row.get("volume")) or 0.0
@@ -278,6 +360,8 @@ class MarketData:
         if price is None:
             return
         ts = _epoch_seconds(_num(row.get("time") or row.get("timestamp"))) or time.time()
+        if time.time() - ts > 120:
+            ts = time.time()
         self._quotes[asset] = (float(ts), price)
 
     def flush(self) -> None:

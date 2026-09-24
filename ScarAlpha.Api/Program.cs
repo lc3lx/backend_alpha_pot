@@ -188,6 +188,7 @@ try
     app.MapMarketEndpoints();
     app.MapAccountEndpoints();
     app.MapStrategyEndpoints();
+    app.MapAiEndpoints();
     app.MapBotEndpoints();
     app.MapAdminEndpoints();
     app.MapNotificationEndpoints();

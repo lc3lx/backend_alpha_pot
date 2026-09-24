@@ -78,6 +78,256 @@ public sealed class RsiSignalAppService
         CancellationToken ct) =>
         ExecuteIfRequestedAsync(signal, options, autoExecute: true, ct);
 
+    /// <summary>
+    /// Live monitor for the Pairs-and-RSI door. Reads the worker's shared closed-bar
+    /// cache and overlays the latest quote RSI so the board ticks every poll instead of
+    /// waiting on 28 history fetches.
+    /// </summary>
+    public async Task<StrategyBoardResponse> GetBoardAsync(
+        IReadOnlyList<string>? assets,
+        CancellationToken ct)
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (await _demo.IsMarketingDemoAsync(_currentUser.UserId, ct).ConfigureAwait(false))
+            return new StrategyBoardResponse(now, Array.Empty<StrategySignal>());
+
+        var access = await _botAccess.CheckAsync(_currentUser.UserId, ct).ConfigureAwait(false);
+        AccountAppService.EnsureConnectedForMarket(access);
+
+        var bot = _botRuntime.Get(_currentUser.UserId);
+        var strategyId = string.IsNullOrWhiteSpace(bot.StrategyId) ? "rsi" : bot.StrategyId;
+        var timeframe = StrategyTimeframes.For(strategyId);
+        var broker = await CurrentBrokerAsync(ct).ConfigureAwait(false);
+        var analyses = _analysisCache.ListRecent(broker, timeframe, now);
+
+        var requested = assets?
+            .Select(a => a.Trim())
+            .Where(a => a.Length > 0)
+            .ToList();
+        var requestedAll = requested is null
+            || requested.Count == 0
+            || requested.Any(a => a == "*" || a.Equals("all", StringComparison.OrdinalIgnoreCase));
+        var selected = !requestedAll
+            ? requested
+            : bot.IsAllAssets
+                ? null
+                : bot.ResolvedAssets;
+
+        var client = await EnsureLiveClientAsync(ct).ConfigureAwait(false);
+        var quotes = new Dictionary<string, QuoteData>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            foreach (var quote in await _brokers.RefreshMarketQuotesAsync(broker, ct).ConfigureAwait(false))
+            {
+                if (!string.IsNullOrWhiteSpace(quote.Pair) && quote.Price > 0)
+                    quotes[quote.Pair] = quote;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "RSI board quote refresh failed");
+        }
+
+        if (quotes.Count == 0 && client is not null)
+        {
+            try
+            {
+                foreach (var quote in await client.RefreshQuotesAsync(ct).ConfigureAwait(false))
+                {
+                    if (!string.IsNullOrWhiteSpace(quote.Pair) && quote.Price > 0)
+                        quotes[quote.Pair] = quote;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "RSI board fallback quote refresh failed");
+            }
+        }
+
+        IReadOnlyDictionary<string, int> payouts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        if (client is not null && PairPayoutGate.MinPayoutPercent > 0)
+        {
+            try
+            {
+                payouts = await PairPayoutGate.BuildPayoutMapAsync(client, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "RSI board payout snapshot failed");
+            }
+        }
+
+        var rows = new List<StrategySignal>(analyses.Count);
+        foreach (var analysis in analyses)
+        {
+            if (selected is not null && !BotAssetList.Contains(selected, analysis.Asset))
+                continue;
+            var quote = FindLiveQuote(quotes, client, analysis.Asset);
+            rows.Add(WithEntryBlock(ToLiveBoardRow(analysis, quote, strategyId, timeframe, now), payouts));
+        }
+
+        rows.Sort((a, b) =>
+        {
+            var aReady = a.Signal is "Call" or "Put" && a.Backtest?.Passed == true;
+            var bReady = b.Signal is "Call" or "Put" && b.Backtest?.Passed == true;
+            if (aReady != bReady) return aReady ? -1 : 1;
+            var aBlocked = string.IsNullOrEmpty(a.EntryBlockReason) ? 1 : 0;
+            var bBlocked = string.IsNullOrEmpty(b.EntryBlockReason) ? 1 : 0;
+            if (aBlocked != bBlocked) return aBlocked - bBlocked;
+            var aLive = a.LiveRsi ?? a.Rsi;
+            var bLive = b.LiveRsi ?? b.Rsi;
+            return bLive.CompareTo(aLive);
+        });
+
+        if (quotes.Count == 0)
+            _logger.LogWarning("RSI board has no live quotes (client={HasClient} rows={Rows})", client is not null, rows.Count);
+
+        return new StrategyBoardResponse(now, rows);
+    }
+
+    /// <summary>
+    /// One pair for the advisor: the board row plus the shared closed-bar analysis
+    /// (regime and candles) when that bar is still on the board.
+    /// </summary>
+    public async Task<(StrategySignal Row, MarketAnalysis? Analysis)?> LoadAiPairAsync(
+        string asset,
+        CancellationToken ct)
+    {
+        var board = await GetBoardAsync(new[] { asset }, ct).ConfigureAwait(false);
+        StrategySignal? row = null;
+        foreach (var pair in board.Pairs)
+        {
+            if (string.Equals(pair.Asset, asset, StringComparison.OrdinalIgnoreCase)
+                || BotAssetList.Contains(new[] { asset }, pair.Asset))
+            {
+                row = pair;
+                break;
+            }
+        }
+        if (row is null)
+            return null;
+
+        var broker = await CurrentBrokerAsync(ct).ConfigureAwait(false);
+        var timeframe = StrategyTimeframes.For("rsi");
+        MarketAnalysis? analysis = null;
+        foreach (var item in _analysisCache.ListRecent(broker, timeframe, DateTimeOffset.UtcNow))
+        {
+            if (string.Equals(item.Asset, row.Asset, StringComparison.OrdinalIgnoreCase)
+                || BotAssetList.Contains(new[] { row.Asset }, item.Asset))
+            {
+                analysis = item;
+                break;
+            }
+        }
+        return (row, analysis);
+    }
+
+    private static QuoteData? FindLiveQuote(
+        IReadOnlyDictionary<string, QuoteData> quotes,
+        IBrokerClient? client,
+        string asset)
+    {
+        if (quotes.TryGetValue(asset, out var hit))
+            return hit;
+        if (asset.EndsWith("_otc", StringComparison.OrdinalIgnoreCase))
+        {
+            var weekday = asset[..^4];
+            if (quotes.TryGetValue(weekday, out hit))
+                return hit;
+        }
+        else if (quotes.TryGetValue(asset + "_otc", out hit))
+        {
+            return hit;
+        }
+
+        if (client is not null && client.TryGetCachedQuote(asset, out var cached) && cached is not null)
+            return cached;
+        return null;
+    }
+
+    /// <summary>
+    /// A zone touch that stayed None tells the board why: the win-rate rule failed,
+    /// the pair pays too little, or both. Mid-range rows stay blank.
+    /// </summary>
+    private static StrategySignal WithEntryBlock(
+        StrategySignal row,
+        IReadOnlyDictionary<string, int> payouts)
+    {
+        if (row.Signal is "Call" or "Put")
+            return row;
+
+        var closedInZone = RsiEntryLevels.IsCallRsi(row.Rsi) || RsiEntryLevels.IsPutRsi(row.Rsi);
+        var live = row.LiveRsi ?? row.Rsi;
+        var liveInZone = RsiEntryLevels.IsCallRsi(live) || RsiEntryLevels.IsPutRsi(live);
+        if (!closedInZone && !liveInZone)
+            return row;
+
+        var zoneRsi = closedInZone ? row.Rsi : live;
+        var side = RsiEntryLevels.IsCallRsi(zoneRsi) ? row.CallBacktest : row.PutBacktest;
+        var parts = new List<string>(2);
+        if (!RsiEntryLevels.BacktestOk(side))
+            parts.Add("WIN_CONDITION");
+        if (TryBoardPayout(payouts, row.Asset, out var payout) && !PairPayoutGate.IsTradable(payout))
+            parts.Add($"LOW_PAYOUT:{payout}");
+        if (parts.Count == 0)
+            return row;
+        return row with { EntryBlockReason = string.Join("|", parts) };
+    }
+
+    private static bool TryBoardPayout(IReadOnlyDictionary<string, int> payouts, string asset, out int payout)
+    {
+        payout = 0;
+        if (payouts.Count == 0 || string.IsNullOrWhiteSpace(asset))
+            return false;
+        if (payouts.TryGetValue(asset, out payout))
+            return true;
+        var alt = asset.EndsWith("_otc", StringComparison.OrdinalIgnoreCase)
+            ? asset[..^4]
+            : asset + "_otc";
+        return payouts.TryGetValue(alt, out payout);
+    }
+
+    private static StrategySignal ToLiveBoardRow(
+        MarketAnalysis analysis,
+        QuoteData? quote,
+        string strategyId,
+        int timeframe,
+        DateTimeOffset now)
+    {
+        var closedRsi = analysis.Rsi;
+        var livePrice = quote is not null && quote.Price > 0 ? (decimal)quote.Price : (decimal?)null;
+        var overlay = LiveBoardOverlay.Rsi(analysis.Closes, livePrice);
+        var liveRsi = overlay > 0m ? overlay : closedRsi;
+
+        var secondsSinceClose = (now - analysis.ClosedBarTime).TotalSeconds;
+        var withinTtl = secondsSinceClose >= 0 && secondsSinceClose <= RsiEntryLevels.SetupTtlSeconds;
+        var signal = "None";
+        RsiBacktestStats? entry = null;
+        if (withinTtl && RsiEntryLevels.IsCallRsi(closedRsi) && RsiEntryLevels.BacktestOk(analysis.CallBacktest))
+        {
+            signal = "Call";
+            entry = analysis.CallBacktest;
+        }
+        else if (withinTtl && RsiEntryLevels.IsPutRsi(closedRsi) && RsiEntryLevels.BacktestOk(analysis.PutBacktest))
+        {
+            signal = "Put";
+            entry = analysis.PutBacktest;
+        }
+
+        var display = entry ?? RsiZoneBacktest.DisplayFor(closedRsi, analysis.CallBacktest, analysis.PutBacktest);
+        return new StrategySignal(
+            StrategyId: strategyId,
+            Asset: analysis.Asset,
+            Signal: signal,
+            Rsi: closedRsi,
+            CandleTime: analysis.ClosedBarTime,
+            Timeframe: timeframe.ToString(),
+            Backtest: display,
+            LiveRsi: liveRsi,
+            CallBacktest: analysis.CallBacktest,
+            PutBacktest: analysis.PutBacktest);
+    }
+
     public async Task<StrategySignal> GetSignalAsync(
         string asset,
         int periodSeconds,
@@ -159,14 +409,16 @@ public sealed class RsiSignalAppService
             return SoftNone(symbol, wirePeriod) with { AutomationError = "OPEN_TRADE_EXISTS" };
         }
 
-        // GetHistoryAsync already SubscribePair on a cache miss. Only warm when
-        // candles are in RAM but the live quote went stale (refresh quotes, no 2nd history dump).
         const int maxQuoteAgeSeconds = 15;
         var quoteFresh = client.TryGetCachedQuote(symbol, out var cachedQuote)
             && cachedQuote is not null
             && (DateTimeOffset.UtcNow - cachedQuote.ReceivedAt).TotalSeconds <= maxQuoteAgeSeconds;
-        if (client.HasFreshHistory(symbol, wirePeriod) && !quoteFresh)
+        // GetHistory can return a dump of OLD bars. Warm whenever the series is not
+        // advancing, even if a quote cache from the UI looks fresh — otherwise closing
+        // the browser leaves the bot reading a frozen chart.
+        if (!client.HasFreshHistory(symbol, wirePeriod) || !quoteFresh)
             client.EnsureMarketDataWarm(symbol, wirePeriod);
+        MarketAnalysis? analysis = null;
         try
         {
             if (autoExecute && !skipMarketAccess && await IsAnalysisPausedAsync(ct))
@@ -185,7 +437,7 @@ public sealed class RsiSignalAppService
             // Two accounts on the same pair therefore always see the same signal, and
             // 100 users cost the same history traffic as one.
             var alternating = AlternatingStrategy.Is(strategyId);
-            var analysis = await GetSharedAnalysisAsync(
+            analysis = await GetSharedAnalysisAsync(
                 client, symbol, wirePeriod, options, now, ct,
                 minCandles: alternating ? AlternatingOptions.Default.PatternLength + 1 : null);
             if (analysis is null)
@@ -193,14 +445,14 @@ public sealed class RsiSignalAppService
 
             var candles = analysis.ClosedCandles.ToList();
             if (candles.Count == 0)
-                return SoftNone(symbol, wirePeriod);
+                return SoftNone(symbol, wirePeriod, 0m, analysis);
 
             // Pine's checkpoint + win/loss counters, advanced on the closed series.
             _emaTracker.Resolve(_currentUser.UserId, symbol, analysis.ClosedCandles, wirePeriod);
 
             if (autoExecute && !skipMarketAccess && await IsAnalysisPausedAsync(ct))
             {
-                return SoftNone(symbol, wirePeriod, analysis.Rsi) with { AutomationError = "OPEN_TRADE_EXISTS" };
+                return SoftNone(symbol, wirePeriod, analysis.Rsi, analysis) with { AutomationError = "OPEN_TRADE_EXISTS" };
             }
 
             _ = ApplyLiveQuoteToCandles(client, symbol, candles, wirePeriod, now);
@@ -226,7 +478,7 @@ public sealed class RsiSignalAppService
                 var staleRsi = analysis.Rsi > 0m ? analysis.Rsi : (analysis.Closes.Count >= options.Period + 1
                     ? Math.Round(Indicators.Rsi(analysis.Closes, options.Period)!.Value, 2, MidpointRounding.AwayFromZero)
                     : 0m);
-                return SoftNone(symbol, wirePeriod, staleRsi);
+                return SoftNone(symbol, wirePeriod, staleRsi, analysis);
             }
 
             // EMA runs purely on its own settings — no coupling to the regime switch.
@@ -261,7 +513,7 @@ public sealed class RsiSignalAppService
                 : strategyId;
             if (engineId is null)
             {
-                return SoftNone(symbol, wirePeriod, analysis.Rsi) with
+                return SoftNone(symbol, wirePeriod, analysis.Rsi, analysis) with
                 {
                     AutomationError = RegimeRouting.RejectUnclear,
                     Regime = analysis.Regime?.Regime ?? MarketRegime.Unclear,
@@ -288,7 +540,9 @@ public sealed class RsiSignalAppService
                     candles: candles,
                     options: options,
                     now: now,
-                    ct: ct);
+                    ct: ct,
+                    cachedCallBacktest: analysis.CallBacktest,
+                    cachedPutBacktest: analysis.PutBacktest);
 
             signal = signal with
             {
@@ -298,6 +552,9 @@ public sealed class RsiSignalAppService
                 RelativeVolume = analysis.Regime?.RelativeVolume,
                 VolumeOk = analysis.Regime?.VolumeOk ?? true,
             };
+
+            if (!IsEma(engineId) && !alternating)
+                signal = AttachReadyBacktests(signal, analysis);
 
             return await ExecuteIfRequestedAsync(signal, options, autoExecute, ct, analysis.Regime);
         }
@@ -314,25 +571,25 @@ public sealed class RsiSignalAppService
                 "rsi_soft_timeout",
                 new { symbol, wirePeriod });
             // #endregion
-            return SoftNone(symbol, wirePeriod);
+            return SoftNone(symbol, wirePeriod, analysis?.Rsi ?? 0m, analysis);
         }
         catch (OperationCanceledException)
         {
-            return SoftNone(symbol, wirePeriod);
+            return SoftNone(symbol, wirePeriod, analysis?.Rsi ?? 0m, analysis);
         }
         catch (BinollaConnectionException)
         {
-            return SoftNone(symbol, wirePeriod);
+            return SoftNone(symbol, wirePeriod, analysis?.Rsi ?? 0m, analysis);
         }
         catch (ApiException ex) when (ex.Code == ApiErrorCodes.ValidationError)
         {
             // Insufficient candles — soft None, not 400/500 spam.
-            return SoftNone(symbol, wirePeriod);
+            return SoftNone(symbol, wirePeriod, analysis?.Rsi ?? 0m, analysis);
         }
         catch (ApiException) { throw; }
         catch (Exception)
         {
-            return SoftNone(symbol, wirePeriod);
+            return SoftNone(symbol, wirePeriod, analysis?.Rsi ?? 0m, analysis);
         }
     }
 
@@ -504,6 +761,12 @@ public sealed class RsiSignalAppService
                 {
                     var partialCloses = prepared.Closes;
                     var partialRsi = Math.Round(Indicators.Rsi(partialCloses, options.Period)!.Value, 2, MidpointRounding.AwayFromZero);
+                    // The board and the entry gate both need a number. A short tail still
+                    // has a backtest over the candles that exist; only the rate is thinner.
+                    RsiBacktestStats? partialCall = null;
+                    RsiBacktestStats? partialPut = null;
+                    if (prepared.Count >= options.Period + options.ExpiryCandles + 2)
+                        (partialCall, partialPut) = RsiZoneBacktest.Evaluate(partialCloses, options);
                     return new MarketAnalysis(
                         Asset: symbol,
                         TimeframeSeconds: wirePeriod,
@@ -511,8 +774,8 @@ public sealed class RsiSignalAppService
                         ClosedCandles: prepared.Closed,
                         Closes: partialCloses,
                         Rsi: partialRsi,
-                        CallBacktest: null,
-                        PutBacktest: null,
+                        CallBacktest: partialCall,
+                        PutBacktest: partialPut,
                         Regime: null);
                 }
                 return null;
@@ -546,14 +809,43 @@ public sealed class RsiSignalAppService
                 Regime: regime);
         }, ct);
 
-    private static StrategySignal SoftNone(string symbol, int periodSeconds, decimal rsi = 0m) =>
-        new(
+    /// <summary>
+    /// Pins both backtests onto the signal so the UI/worker already have them while
+    /// closed RSI is still mid-range. Entry still waits for 25/75; the numbers do not.
+    /// </summary>
+    private static StrategySignal AttachReadyBacktests(StrategySignal signal, MarketAnalysis analysis)
+    {
+        var call = signal.CallBacktest ?? analysis.CallBacktest;
+        var put = signal.PutBacktest ?? analysis.PutBacktest;
+        var display = signal.Backtest ?? RsiZoneBacktest.DisplayFor(signal.Rsi, call, put);
+        return signal with
+        {
+            Backtest = display,
+            CallBacktest = call,
+            PutBacktest = put
+        };
+    }
+
+    private static StrategySignal SoftNone(
+        string symbol,
+        int periodSeconds,
+        decimal rsi = 0m,
+        MarketAnalysis? analysis = null)
+    {
+        var resolvedRsi = rsi > 0m ? rsi : analysis?.Rsi ?? 0m;
+        var call = analysis?.CallBacktest;
+        var put = analysis?.PutBacktest;
+        return new(
             StrategyId: "rsi",
             Asset: symbol,
             Signal: "None",
-            Rsi: rsi,
-            CandleTime: DateTimeOffset.UtcNow,
-            Timeframe: periodSeconds.ToString());
+            Rsi: resolvedRsi,
+            CandleTime: analysis?.ClosedBarTime ?? DateTimeOffset.UtcNow,
+            Timeframe: periodSeconds.ToString(),
+            Backtest: RsiZoneBacktest.DisplayFor(resolvedRsi, call, put),
+            CallBacktest: call,
+            PutBacktest: put);
+    }
 
     private async Task<StrategySignal> ExecuteIfRequestedAsync(
         StrategySignal signal,
@@ -706,11 +998,14 @@ public sealed class RsiSignalAppService
             if (runningRows.Concat(pendingRows).Any(t => OpenTradeGate.IsBlocking(t, DateTimeOffset.UtcNow)))
                 return signal with { AutomationError = "OPEN_TRADE_EXISTS" };
 
-            // Trade duration must match the backtest expiry window (3–5 minutes on 1m).
+            // Analyse 1-minute bars; buy the 3–5 minute option the backtest used.
+            // A stored 60s value is the chart timeframe, not a turbo deal.
             var expiryCandles = signal.Backtest.ExpiryCandles;
             if (!AlternatingStrategy.Is(signal.StrategyId) && expiryCandles is < 3 or > 5)
                 expiryCandles = options.ExpiryCandles is >= 3 and <= 5 ? options.ExpiryCandles : 5;
-            var durationSeconds = expiryCandles * StrategyTimeframes.For(signal.StrategyId);
+            var durationSeconds = AlternatingStrategy.Is(signal.StrategyId)
+                ? AlternatingStrategy.TimeframeSeconds
+                : RsiStrategyOptions.TradeDurationSeconds(bot.DurationSeconds, expiryCandles);
             OpenTradeGate.MarkUserHeld(userId, durationSeconds);
 
             var strategyKey = AlternatingStrategy.Is(signal.StrategyId)
@@ -813,12 +1108,35 @@ public sealed class RsiSignalAppService
             }
             catch (ApiException ex)
             {
-                OpenTradeGate.ReleaseUser(userId);
-                _logger.LogWarning(
-                    "RSI place skipped {Asset} {Direction} code={Code}",
-                    signal.Asset,
-                    signal.Signal,
-                    ex.Code);
+                // A timeout often means the order landed and the ack was missed.
+                // Releasing here is what let the next pair open on top of it.
+                if (ex.Code is ApiErrorCodes.BinollaNotConnected
+                    or ApiErrorCodes.BinollaSessionExpired
+                    or ApiErrorCodes.MarketUnavailable
+                    or ApiErrorCodes.BinollaMarketUnavailable
+                    or ApiErrorCodes.ValidationError
+                    or ApiErrorCodes.InvalidTrade
+                    or ApiErrorCodes.RealTradingDisabled
+                    or ApiErrorCodes.StrategyDisabled)
+                {
+                    OpenTradeGate.ReleaseUser(userId);
+                }
+                if (ex.Code == ApiErrorCodes.InsufficientBalance)
+                {
+                    // Stake bigger than the book: do not retry this user every second
+                    // for the rest of the 30s TTL — that is what filled the logs while
+                    // funded bots sat behind the old 90s hold.
+                    OpenTradeGate.MarkUserHeld(userId, RsiEntryLevels.SetupTtlSeconds);
+                }
+                if (OpenTradeGate.ShouldLogSkip(userId))
+                {
+                    _logger.LogWarning(
+                        "RSI place skipped {Asset} {Direction} code={Code} detail={Detail}",
+                        signal.Asset,
+                        signal.Signal,
+                        ex.Code,
+                        ex.Message);
+                }
                 return signal with { AutomationError = ex.Code };
             }
         }
@@ -871,24 +1189,12 @@ public sealed class RsiSignalAppService
         if (AsLiveClient(_brokers.Get(userId, broker)) is { } live)
             return live;
 
-        if (AsLiveClient(_brokers.Get(userId, broker)) is { } restored)
-            return restored;
-
+        // Market data (quotes/candles) may ride a live sibling session. Balance and
+        // orders never come through here — PlaceTrade / GetBalance use Get(userId).
         if (!string.Equals(broker, Brokers.Binolla, StringComparison.OrdinalIgnoreCase))
         {
-            var userClient = _brokers.Get(userId, broker);
-            if (userClient is not null && userClient.IsTransportConnected)
-                return userClient;
-
-            var anyClient = _brokers.GetAny(broker);
-            if (anyClient is not null && anyClient.IsTransportConnected)
-                return anyClient;
-
-            if (userClient is not null)
-                return userClient;
-
-            if (anyClient is not null)
-                return anyClient;
+            if (AsLiveClient(_brokers.GetAny(broker)) is { } shared)
+                return shared;
         }
 
         return null;
@@ -1043,6 +1349,8 @@ public sealed class RsiSignalAppService
         }
 
         var quoteTs = quote.Timestamp > 0 ? quote.Timestamp : now.ToUnixTimeSeconds();
+        if (now.ToUnixTimeSeconds() - quoteTs > wirePeriod * 2)
+            quoteTs = now.ToUnixTimeSeconds();
         var bucketStartUnix = MinuteBars.BucketStartUnix(quoteTs, wirePeriod);
         var bucketStart = DateTimeOffset.FromUnixTimeSeconds(bucketStartUnix);
         var price = (decimal)quote.Price;
@@ -1052,6 +1360,25 @@ public sealed class RsiSignalAppService
             c.Timestamp >= bucketStart ||
             c.EndTimestamp is null ||
             c.EndTimestamp > now);
+
+        // Vendor history can freeze while ticks still arrive. A live quote means the
+        // previous minute has closed — fill the gap so SoftNone does not block every
+        // entry for a quarter of an hour.
+        if (candles.Count > 0)
+        {
+            var cursor = candles[^1].Timestamp.ToUnixTimeSeconds() + wirePeriod;
+            var filled = 0;
+            while (cursor < bucketStartUnix && filled < 180)
+            {
+                var lastGap = cursor + wirePeriod >= bucketStartUnix;
+                candles.Add(new RsiCandle(
+                    Timestamp: DateTimeOffset.FromUnixTimeSeconds(cursor),
+                    Close: lastGap ? price : candles[^1].Close,
+                    EndTimestamp: DateTimeOffset.FromUnixTimeSeconds(cursor + wirePeriod)));
+                cursor += wirePeriod;
+                filled++;
+            }
+        }
 
         var lastClosedClose = candles.Count > 0 ? candles[^1].Close : (decimal?)null;
         candles.Add(new RsiCandle(

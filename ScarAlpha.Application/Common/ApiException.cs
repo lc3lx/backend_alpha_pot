@@ -11,6 +11,11 @@ public static class ApiErrorCodes
     public const string UseDemoLogin = "USE_DEMO_LOGIN";
     public const string PasswordNotSet = "PASSWORD_NOT_SET";
     public const string BinollaNotConnected = "BINOLLA_NOT_CONNECTED";
+    /// <summary>
+    /// The account is linked. The server is bringing the broker socket back.
+    /// The client shows a connecting notice and retries — it does not ask the user to connect.
+    /// </summary>
+    public const string BrokerReconnecting = "BROKER_RECONNECTING";
     public const string BinollaSessionExpired = "BINOLLA_SESSION_EXPIRED";
     public const string BinollaConnectionFailed = "BINOLLA_CONNECTION_FAILED";
     public const string BinollaLoginFailed = "BINOLLA_LOGIN_FAILED";

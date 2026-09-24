@@ -275,6 +275,16 @@ def test_empty_read_closes_connection_instead_of_busy_looping():
     assert closed == [True]
 
 
+def test_pongs_reach_account_liveness_without_becoming_market_events():
+    from types import SimpleNamespace
+    frames = iter(['3', ''])
+    transport = WebSocketTransport('wss://example/')
+    transport._ws = SimpleNamespace(recv=lambda: next(frames), close=lambda: None)
+    transport._running.set()
+    transport._read_loop()
+    assert transport.recv() == '3'
+
+
 def test_both_transport_environment_names_use_one_policy(monkeypatch):
     from app.quotex_ws import _enabled
     monkeypatch.setenv('QUOTEX_WS_TRANSPORT', '1')
@@ -308,6 +318,24 @@ def test_unknown_polling_sid_stops_receiving_and_marks_transport_dead():
     transport = WebSocketTransport(delegate.url)
     transport._delegate = delegate
     transport._poll_loop(delegate)
+    assert not transport.is_connected()
+
+
+def test_polling_receive_updates_silence_watchdog():
+    import time
+    transport = WebSocketTransport('https://example/')
+    transport._delegate = _FakeOriginal(transport.url)
+    transport._last_recv_time = time.monotonic() - 1000
+    assert transport.recv()
+    assert time.monotonic() - transport._last_recv_time < 1
+
+
+def test_polling_watchdog_failure_closes_delegate():
+    transport = WebSocketTransport('https://example/')
+    transport._delegate = _FakeOriginal(transport.url)
+    transport._delegate.connected = True
+    transport._running.set()
+    transport._fail(TimeoutError('silent'))
     assert not transport.is_connected()
 
 
@@ -357,4 +385,3 @@ def test_open_with_curl_calls_ws_connect(monkeypatch):
     assert res is not None
     assert len(connected_urls) == 1
     assert "wss://ws2.qxbroker.com" in connected_urls[0][0]
-

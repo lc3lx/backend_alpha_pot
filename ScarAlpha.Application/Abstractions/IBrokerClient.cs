@@ -67,6 +67,12 @@ public interface IBrokerClient
     bool TryGetCachedQuote(string asset, out QuoteData? quote);
 
     /// <summary>
+    /// Latest tick for every streamed pair. The monitor board overlays live RSI from
+    /// this instead of waiting on a stale per-pair quote cache.
+    /// </summary>
+    Task<IReadOnlyList<QuoteData>> RefreshQuotesAsync(CancellationToken ct = default);
+
+    /// <summary>
     /// Keeps a pair streaming so its candles stay resident.
     ///
     /// <para>Residency is what makes a bar-close scan cost nothing. Fetching on demand
@@ -120,6 +126,12 @@ public interface IBrokerSessionManager
     /// <summary>Any active client on the named broker, useful for shared read-only market data.</summary>
     IBrokerClient? GetAny(string broker);
 
+    /// <summary>
+    /// Live ticks for the Pairs-and-RSI board. Does not need the caller's own session —
+    /// market quotes are shared, balances and orders are not.
+    /// </summary>
+    Task<IReadOnlyList<QuoteData>> RefreshMarketQuotesAsync(string broker, CancellationToken ct = default);
+
     /// <summary>Opens or reuses a session on the named broker.</summary>
     Task<IBrokerClient> GetOrCreateAsync(
         Guid userId,
@@ -135,6 +147,28 @@ public interface IBrokerSessionManager
     /// is what makes a closed browser look like a live bot.
     /// </summary>
     Task RefreshGatewaySessionsAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// After an API restart the Python gateway still holds live sockets. Bind this user's
+    /// wrapper to their existing session — no handshake, so nobody else's socket is stolen.
+    /// </summary>
+    /// <param name="fresh">
+    /// A person is placing a trade or switching Demo/Real. Ignore the short miss
+    /// cache so one failed status poll cannot block them for the next minute.
+    /// </param>
+    Task<bool> TryAdoptAsync(Guid userId, string broker, CancellationToken ct = default, bool fresh = false);
+
+    /// <summary>
+    /// True when the Python gateway answers /health. Opening the API before this is up
+    /// used to fire a handshake storm and mark every account as cooling-down.
+    /// </summary>
+    Task<bool> IsGatewayReachableAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// How many live sockets the gateway holds right now. Used to skip a handshake that
+    /// would 409 while another account is already connected.
+    /// </summary>
+    Task<int> GatewaySessionCountAsync(CancellationToken ct = default);
 
     int ActiveSessionCount { get; }
 }
@@ -157,7 +191,8 @@ public sealed record BrokerCredentials(
     string? CookieHeader = null,
     string? Email = null,
     string? Password = null,
-    AccountType AccountType = AccountType.Real);
+    AccountType AccountType = AccountType.Real,
+    bool Takeover = false);
 
 /// <summary>
 /// Which broker a user is linked to, cached.

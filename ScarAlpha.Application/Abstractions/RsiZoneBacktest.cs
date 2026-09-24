@@ -1,19 +1,44 @@
 namespace ScarAlpha.Application.Abstractions;
 
 /// <summary>
-/// 200×1-minute zone-respect backtest. Always computed in parallel with live RSI
-/// so it is ready the moment RSI touches 25 (Call) or 75 (Put). It has no entry
-/// value until that live touch happens.
+/// 200×1-minute zone-respect backtest. Always computed on every closed bar — Call
+/// and Put in the same pass — so both sides are already in cache when RSI later
+/// closes at 25 or 75. Entry still waits for that closed touch; the numbers do not.
 ///
 /// Call visit: RSI touched ≤ 25, then left the zone, and price was higher after
 /// (zone respected — bounced up).
 /// Put visit: RSI touched ≥ 75, then left the zone, and price was lower after
 /// (zone respected — dropped).
-/// Passed when visits &gt; 0 and success ≥ 75%.
+/// Passed when visits ≥ <see cref="RsiEntryLevels.MinZoneVisits"/> and success ≥ 75%.
 /// </summary>
 public static class RsiZoneBacktest
 {
-    public const int LookbackCandles = 400;
+    public const int LookbackCandles = 200;
+
+    /// <summary>
+    /// The side the UI/worker should look at for this closed RSI: Call at/below 25,
+    /// Put at/above 75, otherwise the nearer side so the rate is visible while waiting.
+    /// </summary>
+    public static RsiBacktestStats? DisplayFor(
+        decimal closedRsi,
+        RsiBacktestStats? call,
+        RsiBacktestStats? put)
+    {
+        var preferred = RsiEntryLevels.IsCallRsi(closedRsi)
+            ? call
+            : RsiEntryLevels.IsPutRsi(closedRsi)
+                ? put
+                : closedRsi >= 50m ? put : call;
+        // A side with no zone visits is an empty result, not a missing backtest.
+        // Show the other side so the board still has the rate that was computed.
+        if (HasSamples(preferred)) return preferred;
+        var other = ReferenceEquals(preferred, call) ? put : call;
+        if (HasSamples(other)) return other;
+        return preferred ?? other;
+    }
+
+    private static bool HasSamples(RsiBacktestStats? stats) =>
+        stats is { TotalSignals: > 0 };
 
     public static (RsiBacktestStats Call, RsiBacktestStats Put) Evaluate(
         IReadOnlyList<decimal> closedCloses,
@@ -75,6 +100,7 @@ public static class RsiZoneBacktest
             ? 0m
             : Math.Round(wins * 100m / total, 2, MidpointRounding.AwayFromZero);
         var minimum = Math.Max(options.MinimumSuccessRate, RsiEntryLevels.MinSuccessRate);
+        var visitsOk = total >= RsiEntryLevels.MinZoneVisits;
         return new RsiBacktestStats(
             TotalSignals: total,
             SuccessfulSignals: wins,
@@ -83,6 +109,6 @@ public static class RsiZoneBacktest
             LookbackCandles: lookback,
             ExpiryCandles: options.ExpiryCandles is >= 3 and <= 5 ? options.ExpiryCandles : 5,
             MinimumSuccessRate: minimum,
-            Passed: total > 0 && successRate >= minimum);
+            Passed: visitsOk && successRate >= minimum);
     }
 }

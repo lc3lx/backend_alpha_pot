@@ -32,7 +32,7 @@ public static class StakeProgression
             RedSignalPro => baseAmount,
             AlphaMomentum => last * 1.5m,
             ScarPrecision => last * 2m,
-            TrendBreaker => last * 3m,
+            TrendBreaker => last * 2.5m,
             _ => baseAmount,
         };
         return ClampAndRound(next);

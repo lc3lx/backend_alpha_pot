@@ -92,6 +92,9 @@ class ConnectRequest(BaseModel):
     email: str | None = None
     password: str | None = None
     account_type: AccountType = AccountType.REAL
+    #: The person at the keyboard is switching account or placing a trade.
+    #: Drop the other Quotex socket first. Background restore never sets this.
+    takeover: bool = False
 
 
 class OrderRequestBody(BaseModel):
@@ -173,6 +176,10 @@ async def health() -> dict[str, object]:
         "ok": True,
         "brokers": sorted(ADAPTERS),
         "sessions": registry.count,
+        # A dead Quotex session stays in the registry after the token expires.
+        # Counting it as live stopped restore from signing in again, and the
+        # pair board stayed empty until somebody restarted the process.
+        "live_sessions": sum(1 for session in registry.all_sessions() if _socket_is_live(session)),
         # Whether broker traffic is actually leaving through the proxy is the single most
         # common cause of "the broker refuses everything", so it is visible here rather
         # than only discoverable from a log. Host and port only — never the credentials.
@@ -220,6 +227,18 @@ async def _await_session(user_id: str, broker: str, account_type: AccountType) -
     return None
 
 
+def _socket_is_live(session) -> bool:
+    """True only while a handshake is in progress or the transport is up.
+
+    AuthenticationFailed still occupies a registry slot. Treating that slot as
+    a live socket is what left every pair without analysis after the token died.
+    """
+    if session.transport_connected:
+        return True
+    life = str(getattr(session, "lifecycle", "")).split(".")[-1].upper()
+    return life == "CONNECTING"
+
+
 @app.post("/sessions/connect", response_model=SessionStatus, dependencies=[Guarded])
 async def connect(
     body: ConnectRequest | None = None,
@@ -254,8 +273,14 @@ async def connect(
                 await existing.change_account(body.account_type)
             except Exception as change_err:
                 print(f"change_account on existing session: {change_err}")
-        if not (body.ssid and body.ssid != getattr(existing, "ssid", None)):
-            return _status(existing)
+        # Always reuse a live session for THIS user. A different SSID used to fall
+        # through, hit the another-account guard, 409, and the UI said the connection dropped.
+        if body.ssid:
+            existing.ssid = body.ssid
+        return _status(existing)
+
+    # Each adapter owns its client, transport and balances. Only market data is
+    # shared; another user's live session must not prevent this account signing in.
 
     # Wait OUTSIDE the handshake lock. Waiting inside it deadlocks the connect that
     # already holds the lock and is the session we would be joining.
@@ -267,13 +292,19 @@ async def connect(
     async with _handshake_lock(broker):
         existing = registry.get(body.user_id, broker)
         if existing is not None and existing.transport_connected:
-            if not (body.ssid and body.ssid != getattr(existing, "ssid", None)):
-                return _status(existing)
+            if existing.account_type != body.account_type:
+                await existing.change_account(body.account_type)
+            if body.ssid:
+                existing.ssid = body.ssid
+            return _status(existing)
+
 
         # Dead-but-known session: reconnect in place. Removing it first is what killed
         # live trading when the browser closed — background restore tore the socket down
         # and the replacement handshake then failed.
         if existing is not None:
+            if not throttle.can_attempt(body.user_id):
+                raise HTTPException(status_code=429, detail=throttle.describe(body.user_id))
             try:
                 await existing.connect(
                     ssid=body.ssid or getattr(existing, "ssid", None),
@@ -282,22 +313,30 @@ async def connect(
                     account_type=body.account_type,
                 )
                 if existing.transport_connected:
+                    throttle.mark_succeeded(body.user_id)
                     return _status(existing)
             except Exception as reconnect_err:
-                print(f"in-place reconnect failed {body.user_id}: {reconnect_err}", flush=True)
+                print(f"in-place reconnect failed {body.user_id}: {type(reconnect_err).__name__}: {reconnect_err}", flush=True)
+                if existing.transport_connected:
+                    throttle.mark_succeeded(body.user_id)
+                    return _status(existing)
+                throttle.mark_failed(body.user_id, blocked_by_broker=isinstance(reconnect_err, BlockedError))
+                raise _fail(reconnect_err)
+            finally:
+                throttle._release(body.user_id)
 
         # Ask before trying. A broker that is refusing logins keeps refusing, and the caller
         # retries on its own schedule — without this the gateway relays the storm.
-        if not throttle.can_attempt(body.user_id):
-            # Say which of the several reasons applies; "wait a moment" told a user nothing
-            # about whether the problem was theirs, the broker's, or just timing.
-            raise HTTPException(status_code=429, detail=throttle.describe(body.user_id))
-
         if not (body.ssid or (body.email and body.password)):
             raise HTTPException(
                 status_code=409,
                 detail=f"{broker.capitalize()} session is not connected and no credentials were provided to reconnect.",
             )
+
+        if not throttle.can_attempt(body.user_id):
+            # Say which of the several reasons applies; "wait a moment" told a user nothing
+            # about whether the problem was theirs, the broker's, or just timing.
+            raise HTTPException(status_code=429, detail=throttle.describe(body.user_id))
 
         await registry.remove(body.user_id, broker)
         session = cls(body.user_id)
@@ -308,7 +347,16 @@ async def connect(
                 password=body.password,
                 account_type=body.account_type,
             )
+        except asyncio.CancelledError:
+            throttle._release(body.user_id)
+            await session.disconnect()
+            raise
         except Exception as exc:
+            print(f"connect raised {body.user_id}: {type(exc).__name__}: {exc}", flush=True)
+            if session.transport_connected:
+                throttle.mark_succeeded(body.user_id)
+                await registry.put(session)
+                return _status(session)
             throttle.mark_failed(body.user_id, blocked_by_broker=isinstance(exc, BlockedError))
             raise _fail(exc)
 
@@ -352,6 +400,18 @@ async def quote(user_id: str, broker: str, asset: str) -> Quote | None:
         return await _market_session(user_id, broker).get_quote(asset)
     except Exception as exc:
         raise _fail(exc)
+
+
+@app.get("/market/quotes", response_model=list[Quote], dependencies=[Guarded])
+async def quotes(broker: str = "quotex") -> list[Quote]:
+    """Live ticks from the shared store — no per-pair round trip."""
+    store = all_stores().get(broker.strip().lower())
+    if store is None:
+        return []
+    return [
+        Quote(asset=asset, timestamp=ts, price=price)
+        for asset, ts, price in store.live_quotes()
+    ]
 
 
 @app.post("/market/subscribe", dependencies=[Guarded])
@@ -481,6 +541,10 @@ async def diag_session_market(user_id: str, broker: str):
     live_diag = {}
     if live:
         live_diag = {
+            "auth_confirmed": live.auth_ready.is_set() and live.auth_error is None,
+            "balance_known": [value is not None for value in live.balances] if live.balances else [False, False],
+            "balance_age_seconds": round(live.balance_age(), 1),
+            "receive_age_seconds": round(live.seconds_silent(), 1),
             "periods": [list(p) for p in live.periods],
             "recent_events": list(live._recent_events),
             "assets_count": len(live._asset_index) if live._asset_index else 0,
@@ -495,6 +559,59 @@ async def diag_session_market(user_id: str, broker: str):
     }
 
 
+async def _backfill_one_short_series(session, market, subscribed) -> None:
+    """One older history page per pass, for a 1-minute series still under 200 bars."""
+    live = getattr(session, "_live", None)
+    load = getattr(live, "load_older_history", None) if live is not None else None
+    if load is None or market is None:
+        return
+    seen: set[str] = set()
+    for asset, period in list(subscribed):
+        if int(period) != 60:
+            continue
+        name = asset if str(asset).endswith("_otc") else f"{asset}_otc"
+        if name in seen:
+            continue
+        seen.add(name)
+        try:
+            end = market.backfill_end(name, 60, 200)
+        except Exception:
+            continue
+        if end is None:
+            continue
+        try:
+            await load(name, 60, end)
+            print(f"history-backfill {name} end={end}", flush=True)
+        except Exception as exc:
+            print(f"history-backfill {name}: {exc}", flush=True)
+        return
+
+
+async def _heal_stale_feeds(session) -> None:
+    if not getattr(session, "transport_connected", False):
+        return
+    market = getattr(session, "_market", None)
+    subscribed = getattr(session, "_subscribed", None)
+    subscribe = getattr(session, "subscribe", None)
+    if market is None or not subscribed or subscribe is None:
+        return
+    stale = 0
+    total = 0
+    for asset, period in list(subscribed):
+        total += 1
+        try:
+            if not market.is_series_current(asset, period):
+                stale += 1
+                if market.should_reload_history(asset, period):
+                    await subscribe(asset, period)
+        except Exception as exc:
+            print(f"heal-feed {session.user_id} {asset}: {exc}", flush=True)
+    await _backfill_one_short_series(session, market, subscribed)
+    # A quiet feed is fixed by subscribing again. Rebuilding the socket here
+    # dropped a live login every few minutes and trades stopped until the
+    # next handshake.
+
+
 async def _keep_sessions_alive() -> None:
     """
     Reconnect dropped Quotex sockets without the customer browser.
@@ -504,13 +621,14 @@ async def _keep_sessions_alive() -> None:
     scanning every pair.
     """
     while True:
-        await asyncio.sleep(8)
+        await asyncio.sleep(3)
         for session in list(registry.all_sessions()):
             ensure = getattr(session, "_ensure_connected", None)
             if ensure is None:
                 continue
             try:
                 await ensure()
+                await _heal_stale_feeds(session)
             except Exception as exc:
                 print(f"keep-alive {session.user_id}: {exc}", flush=True)
 

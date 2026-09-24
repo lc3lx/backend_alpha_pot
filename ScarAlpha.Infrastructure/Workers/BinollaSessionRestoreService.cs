@@ -26,10 +26,16 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
     private readonly ISecretProtector _protector;
     private readonly BinollaSessionRestoreOptions _options;
     private readonly ILogger<BinollaSessionRestoreService> _logger;
-    private readonly ConcurrentDictionary<Guid, byte> _authFailed = new();
+    /// <summary>
+    /// Auth lockout with an expiry. A permanent flag is what left the bot dark
+    /// overnight after one dead SSID — restore never tried again until a restart.
+    /// </summary>
+    private readonly ConcurrentDictionary<Guid, DateTimeOffset> _authFailedUntil = new();
+    private DateTimeOffset _gatewayDarkSinceUtc;
     private readonly ConcurrentDictionary<Guid, SemaphoreSlim> _userGates = new();
     private readonly ConcurrentDictionary<Guid, byte> _bgRestoreQueued = new();
     private readonly ConcurrentDictionary<Guid, DateTimeOffset> _retryAfterUtc = new();
+    private readonly SemaphoreSlim _quotexRestoreGate = new(1, 1);
     private readonly TaskCompletionSource _initialDone = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private CancellationTokenSource? _cts;
 
@@ -50,6 +56,21 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
     }
 
     public Task WhenInitialRestoreCompleted => _initialDone.Task;
+
+    private bool IsAuthLocked(Guid userId)
+    {
+        if (!_authFailedUntil.TryGetValue(userId, out var until))
+            return false;
+        if (until > DateTimeOffset.UtcNow)
+            return true;
+        _authFailedUntil.TryRemove(userId, out _);
+        return false;
+    }
+
+    private void LockAuth(Guid userId, int minutes = 20)
+        => _authFailedUntil[userId] = DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(minutes, 2, 60));
+
+    private void UnlockAuth(Guid userId) => _authFailedUntil.TryRemove(userId, out _);
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
@@ -106,7 +127,8 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
         {
             try
             {
-            await Task.Delay(TimeSpan.FromSeconds(30), ct).ConfigureAwait(false);
+            await Task.Delay(TimeSpan.FromSeconds(5), ct).ConfigureAwait(false);
+                await WatchGatewayDarkAsync(ct).ConfigureAwait(false);
                 await RestoreApprovedSessionsAsync(ct, verbose: false).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -118,6 +140,52 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                 _logger.LogWarning(ex, "Session keep-alive restore wave failed; next pass in 30s");
             }
         }
+    }
+
+    /// <summary>
+    /// Layer: C# wrappers can look connected while Python has zero sockets.
+    /// A 409 cooldown while the gateway is empty is what kept restore off for
+    /// 15 minutes. Drop those cooldowns after 45s dark. Auth lockouts keep
+    /// their TTL so a PIN/captcha does not relaunch Chromium every wave.
+    /// </summary>
+    private async Task WatchGatewayDarkAsync(CancellationToken ct)
+    {
+        var sessions = await _brokerSessions.GatewaySessionCountAsync(ct).ConfigureAwait(false);
+        if (sessions < 0)
+            return;
+        if (sessions > 0)
+        {
+            _gatewayDarkSinceUtc = DateTimeOffset.MinValue;
+            return;
+        }
+
+        if (_gatewayDarkSinceUtc == DateTimeOffset.MinValue)
+            _gatewayDarkSinceUtc = DateTimeOffset.UtcNow;
+
+        if (DateTimeOffset.UtcNow - _gatewayDarkSinceUtc < TimeSpan.FromSeconds(8))
+            return;
+
+        var unlocked = 0;
+        foreach (var key in _retryAfterUtc.Keys.ToArray())
+        {
+            // A 45s pause after a failed sign-in stays. Only a multi-minute
+            // hold is a stuck cooldown, and the socket is already dark.
+            if (!_retryAfterUtc.TryGetValue(key, out var until) ||
+                until <= DateTimeOffset.UtcNow.AddMinutes(2))
+                continue;
+            if (_retryAfterUtc.TryRemove(key, out _))
+                unlocked++;
+        }
+
+        if (unlocked > 0)
+        {
+            _logger.LogWarning(
+                "Watchdog: Quotex has been dark for {Seconds}s; cleared {Count} restore cooldown(s)",
+                (int)(DateTimeOffset.UtcNow - _gatewayDarkSinceUtc).TotalSeconds,
+                unlocked);
+        }
+
+        _gatewayDarkSinceUtc = DateTimeOffset.UtcNow;
     }
 
     public Task RestoreApprovedSessionsAsync(CancellationToken ct = default) =>
@@ -149,6 +217,8 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
             _logger.LogDebug(ex, "Gateway session refresh before restore failed");
         }
 
+        await AdoptLiveGatewaySessionsAsync(ct, verbose).ConfigureAwait(false);
+
         IReadOnlyList<(Guid UserId, Guid LinkId, string Broker)> targets;
         try
         {
@@ -164,11 +234,11 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                     (l.ApprovalStatus == AdminApprovalStatus.Approved ||
                      l.ApprovalStatus == AdminApprovalStatus.Pending) &&
                     l.ApprovalStatus != AdminApprovalStatus.Rejected)
-                .Select(l => (l.UserId, l.Id, Brokers.Normalize(l.Broker)))
+                .Select(l => (UserId: l.UserId, LinkId: l.Id, Broker: Brokers.Normalize(l.Broker)))
                 .Where(t => !IsLive(t.UserId)
                             && !IsCoolingDown(t.UserId)
                             && !IsCapturing(t.UserId)
-                            && !_authFailed.ContainsKey(t.UserId))
+                            && !IsAuthLocked(t.UserId))
                 .ToList();
         }
         catch (Exception ex)
@@ -214,8 +284,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
 
         await Task.WhenAll(tasks).ConfigureAwait(false);
 
-        // Quotex handshakes share process-level transport install. Three at once is what
-        // produced NOT_CONNECTED on the second and third users while the first stayed up.
+        // Restore every missing account sequentially, including when others are live.
         foreach (var item in gateway)
         {
             if (ct.IsCancellationRequested) break;
@@ -235,7 +304,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
         if (IsLive(userId))
             return true;
 
-        if (_authFailed.ContainsKey(userId))
+        if (IsAuthLocked(userId))
             return false;
 
         if (IsCoolingDown(userId))
@@ -245,9 +314,20 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
             .ConfigureAwait(false);
     }
 
+    public Task<bool> ClaimInteractiveAsync(Guid userId, CancellationToken ct = default)
+    {
+        // The person at the keyboard is switching Demo/Real or placing a trade.
+        // Background restore must not steal the socket; this call may.
+        UnlockAuth(userId);
+        _retryAfterUtc.TryRemove(userId, out _);
+        // Never takeover. A second handshake disconnects the one socket that feeds
+        // candles and pairs to every user.
+        return RestoreOneAsync(userId, maxAttempts: 1, ct, takeover: false);
+    }
+
     public void ClearAuthFailure(Guid userId)
     {
-        _authFailed.TryRemove(userId, out _);
+        UnlockAuth(userId);
         _retryAfterUtc.TryRemove(userId, out _);
         _credentialFailures.TryRemove(userId, out _);
         _credentialInFlight.TryRemove(userId, out _);
@@ -341,9 +421,92 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
         }
     }
 
+    public async Task<bool> EnsureUserLiveAsync(
+        Guid userId, CancellationToken ct = default, bool waitForRestore = false)
+    {
+        if (IsLive(userId))
+            return true;
+
+        if (await TryAdoptFreshAsync(userId, ct).ConfigureAwait(false))
+            return true;
+
+        if (!waitForRestore)
+        {
+            EnsureBackgroundRestore(userId);
+            return IsLive(userId);
+        }
+
+        var gateway = await ReadGatewayCountAsync(ct).ConfigureAwait(false);
+        if (gateway < 0)
+        {
+            // Health did not answer. Do not open a handshake we cannot see.
+            EnsureBackgroundRestore(userId);
+            return IsLive(userId);
+        }
+
+        // This user's session is missing, regardless of other connected accounts.
+        // Keep the restore running if the HTTP request stops waiting.
+        var restore = TryRestoreUserAsync(userId, CancellationToken.None);
+        try
+        {
+            var finished = await Task.WhenAny(
+                    restore, Task.Delay(TimeSpan.FromSeconds(35), ct))
+                .ConfigureAwait(false);
+            if (finished == restore)
+                return await restore.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            return IsLive(userId);
+        }
+
+        return IsLive(userId);
+    }
+
+    private async Task<bool> TryAdoptFreshAsync(Guid userId, CancellationToken ct)
+    {
+        foreach (var broker in Brokers.All)
+        {
+            if (string.Equals(broker, Brokers.Binolla, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            try
+            {
+                if (await _brokerSessions.TryAdoptAsync(userId, broker, ct, fresh: true)
+                        .ConfigureAwait(false) &&
+                    IsLive(userId))
+                {
+                    return true;
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Adopt before a user action failed for user {UserId}", userId);
+            }
+        }
+
+        return IsLive(userId);
+    }
+
+    private async Task<int> ReadGatewayCountAsync(CancellationToken ct)
+    {
+        try
+        {
+            return await _brokerSessions.GatewaySessionCountAsync(ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            return -1;
+        }
+    }
+
     public void EnsureBackgroundRestore(Guid userId)
     {
-        if (!_options.Enabled || IsLive(userId) || _authFailed.ContainsKey(userId))
+        if (!_options.Enabled || IsLive(userId) || IsAuthLocked(userId))
             return;
 
         if (IsCoolingDown(userId))
@@ -401,7 +564,8 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
         string? ssidCipher,
         string? emailCipher,
         string? passwordCipher,
-        EngineAccount accountType)
+        EngineAccount accountType,
+        bool takeover = false)
     {
         var existing = _brokerSessions.Get(userId, broker);
         if (existing is not null &&
@@ -411,6 +575,23 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
             return true;
         }
 
+        // API restarts wipe C# wrappers. The gateway still holds the socket — adopt it
+        // before any handshake so opening the server never disconnects a live account.
+        if (await _brokerSessions.TryAdoptAsync(userId, broker, CancellationToken.None).ConfigureAwait(false))
+        {
+            _logger.LogInformation(
+                "Session restore: adopted live {Broker} session for user {UserId} link={LinkId}",
+                broker, userId, linkId);
+            await TouchLastConnectedAsync(userId, CancellationToken.None).ConfigureAwait(false);
+            return true;
+        }
+
+        // Space browser logins while retaining a separate socket for each account.
+        // A healthy session owned by somebody else must not block this user's restore.
+        if (broker == Brokers.Quotex)
+            await _quotexRestoreGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
         // The session captured at sign-in comes first. On Quotex it is the only thing that
         // works: its Cloudflare refuses the WebSocket upgrade for a connection that did not
         // actually sign in through a browser, so a restore built from email and password
@@ -455,11 +636,19 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
 
         if (string.IsNullOrWhiteSpace(ssid))
         {
-            // Quotex will not authenticate from email/password on this socket. Trying it
-            // every keep-alive pass is what raced the customer's sign-in and made
-            // Playwright fail to capture a token.
             if (broker == Brokers.Quotex)
-                return false;
+            {
+                if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(password))
+                    return false;
+                // An expired token may already have been cleared. Use the same
+                // guarded browser-login path as expiry recovery, instead of
+                // silently skipping this account on every subsequent restore wave.
+                var relogged = await TryCredentialReloginAsync(userId, CancellationToken.None)
+                    .ConfigureAwait(false);
+                if (!relogged)
+                    _retryAfterUtc[userId] = DateTimeOffset.UtcNow.AddSeconds(45);
+                return relogged;
+            }
 
             if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(password))
                 return false;
@@ -471,12 +660,16 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                     userId,
                     broker,
                     new BrokerCredentials(
-                        Ssid: ssid, Email: email, Password: password, AccountType: accountType),
+                        Ssid: ssid,
+                        Email: email,
+                        Password: password,
+                        AccountType: accountType,
+                        Takeover: takeover),
                     CancellationToken.None)
                 .ConfigureAwait(false);
 
             await TouchLastConnectedAsync(userId, CancellationToken.None).ConfigureAwait(false);
-            _authFailed.TryRemove(userId, out _);
+            UnlockAuth(userId);
             _retryAfterUtc.TryRemove(userId, out _);
             _credentialFailures.TryRemove(userId, out _);
 
@@ -495,7 +688,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                 var relogged = await TryCredentialReloginAsync(userId, CancellationToken.None).ConfigureAwait(false);
                 if (relogged)
                 {
-                    _authFailed.TryRemove(userId, out _);
+                    UnlockAuth(userId);
                     _retryAfterUtc.TryRemove(userId, out _);
                     _credentialFailures.TryRemove(userId, out _);
                     return true;
@@ -504,17 +697,59 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
 
             if (broker == Brokers.Quotex)
             {
-                // Connection refused / timeout is the gateway bouncing, not a dead SSID.
-                // Treating it as auth-failed is what froze restore after a deploy and
-                // left the chart empty until someone signed in again.
-                if (ex is ApiException api && api.StatusCode is 503 or 504)
-                    return false;
+                if (ex is ApiException api && api.StatusCode is 409 or 503 or 504)
+                {
+                    // Only a live other-account 409 should wait 15 minutes.
+                    // NOT_CONNECTED is also HTTP 409 — treating it as "another
+                    // account" locked every user for 15 minutes while sessions=0.
+                    var anotherAccount = api.StatusCode == 409 &&
+                        api.Message.Contains("Another Quotex account", StringComparison.OrdinalIgnoreCase);
+                    var expiredSsid = api.Message.Contains("expired", StringComparison.OrdinalIgnoreCase)
+                        || api.Message.Contains("SSID is invalid", StringComparison.OrdinalIgnoreCase);
+                    if (!expiredSsid)
+                    {
+                        MarkGatewayRestoreFailed(
+                            userId,
+                            authFailed: false,
+                            gatewayNotReady: !anotherAccount,
+                            anotherAccount: anotherAccount);
+                        return IsLive(userId);
+                    }
+                }
 
-                _authFailed[userId] = 1;
+                // Stored SSID is dead. Sign in with the saved email/password and
+                // replace it — waiting for the customer to click Connect is what
+                // left analysis and trades off after every token expiry.
+                UnlockAuth(userId);
+                _retryAfterUtc.TryRemove(userId, out _);
+                await ClearExpiredGatewaySsidAsync(userId, CancellationToken.None).ConfigureAwait(false);
+                _logger.LogWarning(
+                    "Session restore: Quotex SSID dead for user {UserId}; capturing a fresh session",
+                    userId);
+                var relogged = await TryCredentialReloginAsync(userId, CancellationToken.None).ConfigureAwait(false);
+                if (relogged)
+                {
+                    UnlockAuth(userId);
+                    _retryAfterUtc.TryRemove(userId, out _);
+                    _credentialFailures.TryRemove(userId, out _);
+                    return true;
+                }
+
+                // A failed capture must not park the account for 20 minutes.
+                // The socket is down; the next pass signs in again from the
+                // credentials already stored on the server.
+                _retryAfterUtc[userId] = DateTimeOffset.UtcNow.AddSeconds(45);
+                return false;
             }
 
             MarkGatewayRestoreFailed(userId, authFailed: true);
             return false;
+        }
+        }
+        finally
+        {
+            if (broker == Brokers.Quotex)
+                _quotexRestoreGate.Release();
         }
     }
 
@@ -534,13 +769,116 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
     /// entry point already checks — holds this user off without a second mechanism to
     /// keep in step.</para>
     /// </summary>
-    private void MarkGatewayRestoreFailed(Guid userId, bool authFailed = false)
+    private void MarkGatewayRestoreFailed(
+        Guid userId,
+        bool authFailed = false,
+        bool gatewayNotReady = false,
+        bool anotherAccount = false)
     {
+        if (gatewayNotReady)
+        {
+            _retryAfterUtc[userId] = DateTimeOffset.UtcNow.AddSeconds(8);
+            return;
+        }
+
+        if (anotherAccount)
+        {
+            // Another live socket is holding the vendor. Retrying every 2 minutes
+            // was still a 409 storm. Wait until that session actually drops.
+            _retryAfterUtc[userId] = DateTimeOffset.UtcNow.AddMinutes(15);
+            return;
+        }
+
         var failures = _credentialFailures.AddOrUpdate(userId, 1, (_, n) => n + 1);
         var baseSeconds = authFailed ? 300 : Math.Max(60, _options.FailureCooldownSeconds);
         var factor = Math.Min(1 << Math.Min(failures - 1, 4), 8);
         var delay = Math.Min(baseSeconds * factor, 900);
         _retryAfterUtc[userId] = DateTimeOffset.UtcNow.AddSeconds(delay);
+    }
+
+    /// <summary>
+    /// Bind C# wrappers to sockets the gateway already holds. No POST /sessions/connect,
+    /// so opening the API never races three handshakes and never steals a live account.
+    /// </summary>
+    private async Task AdoptLiveGatewaySessionsAsync(CancellationToken ct, bool verbose)
+    {
+        IReadOnlyList<(Guid UserId, string Broker)> candidates;
+        try
+        {
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var links = scope.ServiceProvider.GetRequiredService<IBinollaLinkRepository>();
+            var all = await links.ListAsync(approvalStatus: null, ct).ConfigureAwait(false);
+            candidates = all
+                .Where(l =>
+                    l.Status == BinollaLinkStatus.Connected &&
+                    l.ApprovalStatus != AdminApprovalStatus.Rejected)
+                .Select(l => (UserId: l.UserId, Broker: Brokers.Normalize(l.Broker)))
+                .Where(t => t.Broker != Brokers.Binolla && !IsLive(t.UserId))
+                .Distinct()
+                .ToList();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Session adopt: failed to load linked users");
+            return;
+        }
+
+        if (candidates.Count == 0)
+            return;
+
+        if (verbose)
+            await WaitForGatewayAsync(ct, TimeSpan.FromSeconds(45)).ConfigureAwait(false);
+        else if (!await _brokerSessions.IsGatewayReachableAsync(ct).ConfigureAwait(false))
+            return;
+
+        var adopted = 0;
+        await Task.WhenAll(candidates.Select(async item =>
+        {
+            try
+            {
+                if (await _brokerSessions.TryAdoptAsync(item.UserId, item.Broker, ct).ConfigureAwait(false))
+                {
+                    Interlocked.Increment(ref adopted);
+                    _logger.LogInformation(
+                        "Session adopt: attached live {Broker} session for user {UserId} without a handshake",
+                        item.Broker, item.UserId);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(
+                    ex, "Session adopt skipped for user {UserId} on {Broker}", item.UserId, item.Broker);
+            }
+        })).ConfigureAwait(false);
+
+        if (verbose || adopted > 0)
+        {
+            _logger.LogInformation(
+                "Session adopt finished; attached={Adopted} candidates={Candidates} gateway={Gateway}",
+                adopted, candidates.Count, _brokerSessions.ActiveSessionCount);
+        }
+    }
+
+    private async Task WaitForGatewayAsync(CancellationToken ct, TimeSpan budget)
+    {
+        var deadline = DateTimeOffset.UtcNow + budget;
+        while (!ct.IsCancellationRequested && DateTimeOffset.UtcNow < deadline)
+        {
+            if (await _brokerSessions.IsGatewayReachableAsync(ct).ConfigureAwait(false))
+                return;
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(1), ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return;
+            }
+        }
+
+        _logger.LogWarning(
+            "Broker gateway was not reachable within {Seconds}s — restore will adopt when it comes up",
+            (int)budget.TotalSeconds);
     }
 
     private bool IsLive(Guid userId)
@@ -570,7 +908,8 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
         return false;
     }
 
-    private async Task<bool> RestoreOneAsync(Guid userId, int maxAttempts, CancellationToken ct)
+    private async Task<bool> RestoreOneAsync(
+        Guid userId, int maxAttempts, CancellationToken ct, bool takeover = false)
     {
         var userGate = _userGates.GetOrAdd(userId, _ => new SemaphoreSlim(1, 1));
         try
@@ -595,10 +934,10 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
             if (IsLive(userId))
                 return true;
 
-            if (_authFailed.ContainsKey(userId))
+            if (!takeover && IsAuthLocked(userId))
                 return false;
 
-            if (IsCoolingDown(userId))
+            if (!takeover && IsCoolingDown(userId))
                 return false;
 
             string? ciphertext = null;
@@ -651,7 +990,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
             if (broker != Brokers.Binolla)
             {
                 return await RestoreGatewayLinkAsync(
-                    userId, linkId, broker, ciphertext, emailCipher, passwordCipher, gatewayAccountType)
+                    userId, linkId, broker, ciphertext, emailCipher, passwordCipher, gatewayAccountType, takeover)
                     .ConfigureAwait(false);
             }
 
@@ -729,7 +1068,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                     _ = client;
 
                     await TouchLastConnectedAsync(userId, CancellationToken.None).ConfigureAwait(false);
-                    _authFailed.TryRemove(userId, out _);
+                    UnlockAuth(userId);
                     _retryAfterUtc.TryRemove(userId, out _);
 
                     _logger.LogInformation(
@@ -748,12 +1087,12 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
                     var relogged = await TryCredentialReloginAsync(userId, CancellationToken.None).ConfigureAwait(false);
                     if (relogged)
                     {
-                        _authFailed.TryRemove(userId, out _);
+                        UnlockAuth(userId);
                         _retryAfterUtc.TryRemove(userId, out _);
                         return true;
                     }
 
-                    _authFailed[userId] = 1;
+                    LockAuth(userId);
                     _retryAfterUtc.TryRemove(userId, out _);
                     await MarkLinkDisconnectedAsync(userId, "SSID_EXPIRED", CancellationToken.None).ConfigureAwait(false);
                     return false;
@@ -812,7 +1151,7 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
             var binolla = scope.ServiceProvider.GetRequiredService<BinollaAppService>();
             using (AmbientUserContext.Use(userId))
             {
-                _authFailed.TryRemove(userId, out _);
+                UnlockAuth(userId);
                 var result = await binolla.TryReloginFromStoredCredentialsAsync(ct).ConfigureAwait(false);
                 var ok = result is { Connected: true };
                 // #region agent log
@@ -829,6 +1168,29 @@ public sealed class BinollaSessionRestoreService : IBinollaSessionRestorer, IHos
         {
             _logger.LogWarning(ex, "Stored-credential relogin failed for user {UserId}", userId);
             return false;
+        }
+    }
+
+    private async Task ClearExpiredGatewaySsidAsync(Guid userId, CancellationToken ct)
+    {
+        try
+        {
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var links = scope.ServiceProvider.GetRequiredService<IBinollaLinkRepository>();
+            var link = await links.GetByUserIdAsync(userId, ct).ConfigureAwait(false);
+            if (link is null || string.IsNullOrWhiteSpace(link.EncryptedSsid))
+                return;
+
+            link.EncryptedSsid = string.Empty;
+            link.EncryptedCookieHeader = null;
+            link.UpdatedAt = DateTimeOffset.UtcNow;
+            await links.UpsertAsync(link, ct).ConfigureAwait(false);
+            _logger.LogInformation(
+                "Session restore: cleared expired gateway SSID for user {UserId}", userId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Session restore: failed clearing expired SSID for user {UserId}", userId);
         }
     }
 

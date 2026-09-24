@@ -347,6 +347,10 @@ public sealed class BotRuntimeService : IBotRuntimeService
             throw new ArgumentOutOfRangeException(nameof(baseAmount));
         if (durationSeconds is < 5 or > 3600)
             throw new ArgumentOutOfRangeException(nameof(durationSeconds));
+        // The bot analyses 1-minute candles. A 60s duration is that chart, not the
+        // option — store the 5-minute entry the strategies actually buy.
+        if (durationSeconds <= 60)
+            durationSeconds = 300;
         if (dailyProfitTarget < 0 || dailyLossLimit < 0)
             throw new ArgumentOutOfRangeException(nameof(dailyProfitTarget));
         if (riskLevel is not ("risk-low" or "risk-medium" or "risk-high"))
@@ -513,7 +517,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
                 state,
                 assets.Count > 0 ? assets[0] : null,
                 amount,
-                DurationSeconds is < 5 or > 3600 ? 300 : DurationSeconds,
+                DurationSeconds <= 60 || DurationSeconds is < 5 or > 3600 ? 300 : DurationSeconds,
                 DailyProfitTarget < 0 ? 50m : DailyProfitTarget,
                 DailyLossLimit < 0 ? 30m : DailyLossLimit,
                 DateTimeOffset.UtcNow,

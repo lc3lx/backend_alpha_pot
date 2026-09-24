@@ -12,6 +12,7 @@ using ScarAlpha.Binolla.Abstractions;
 using ScarAlpha.Binolla.Session;
 using ScarAlpha.Domain.Enums;
 using ScarAlpha.Infrastructure.Access;
+using ScarAlpha.Infrastructure.Ai;
 using ScarAlpha.Infrastructure.Auth;
 using ScarAlpha.Infrastructure.Binolla;
 using ScarAlpha.Infrastructure.BrokerGateway;
@@ -229,6 +230,13 @@ public static class DependencyInjection
         });
 
         services.AddSingleton<IBinollaInteractiveAuth, NodeBinollaInteractiveAuth>();
+
+        services.AddHttpClient(AiAdvisorAppService.HttpClientName, http =>
+        {
+            http.BaseAddress = new Uri("https://openrouter.ai/api/v1/");
+            http.Timeout = TimeSpan.FromSeconds(25);
+        });
+        services.AddScoped<AiAdvisorAppService>();
 
         services.Configure<BinollaSessionRestoreOptions>(options =>
         {

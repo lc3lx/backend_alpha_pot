@@ -49,6 +49,23 @@ public static class BotAssetList
         return list.Count > 0 ? list : Array.Empty<string>();
     }
 
-    public static bool Contains(IReadOnlyList<string> assets, string symbol) =>
-        IsAll(assets) || assets.Any(a => string.Equals(a, symbol, StringComparison.OrdinalIgnoreCase));
+    public static bool Contains(IReadOnlyList<string> assets, string symbol)
+    {
+        if (IsAll(assets)) return true;
+        if (assets.Any(a => string.Equals(a, symbol, StringComparison.OrdinalIgnoreCase)))
+            return true;
+        var twin = OtcTwin(symbol);
+        return twin is not null &&
+               assets.Any(a => string.Equals(a, twin, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>EURUSD ↔ EURUSD_otc — the signal and the user's list often disagree on the suffix.</summary>
+    public static string? OtcTwin(string? symbol)
+    {
+        if (string.IsNullOrWhiteSpace(symbol)) return null;
+        var trimmed = symbol.Trim();
+        return trimmed.EndsWith("_otc", StringComparison.OrdinalIgnoreCase)
+            ? trimmed[..^4]
+            : trimmed + "_otc";
+    }
 }

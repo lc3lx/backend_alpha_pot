@@ -139,6 +139,11 @@ public sealed record StrategyDto(
 
 public sealed record StrategiesResponse(IReadOnlyList<StrategyDto> Strategies);
 
+/// <summary>Live monitor board: one row per open pair, closed signal + forming RSI.</summary>
+public sealed record StrategyBoardResponse(
+    DateTimeOffset GeneratedAt,
+    IReadOnlyList<StrategySignal> Pairs);
+
 public sealed record BotStartRequest(
     string? Asset = null,
     decimal Amount = 25m,
@@ -225,6 +230,33 @@ public sealed record PlaceTradeRequest(
     decimal Amount,
     int DurationSeconds,
     string StrategyId = "rsi");
+
+/// <summary>
+/// Chat advice for one pair. Direction is Call, Put, or Wait.
+/// Source is "openrouter" when the wording came from the model, otherwise "rules".
+/// </summary>
+public sealed record AiAdviseRequest(string Asset, string? Lang = null);
+
+public sealed record AiAdviceResponse(
+    string Asset,
+    string Direction,
+    string Summary,
+    string Source,
+    decimal? ClosedRsi,
+    decimal? LiveRsi,
+    decimal? BacktestRate,
+    int? BacktestVisits,
+    string? BlockReason);
+
+public sealed record AiChatTurn(string Role, string Text);
+
+public sealed record AiChatRequest(
+    string Message,
+    string? Lang = null,
+    int? TzOffsetMinutes = null,
+    IReadOnlyList<AiChatTurn>? History = null);
+
+public sealed record AiChatResponse(string Reply, string Source);
 
 public sealed record TradeDto(
     string Id,

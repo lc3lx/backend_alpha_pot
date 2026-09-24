@@ -22,7 +22,7 @@ module.exports = {
       name: 'scaralpha-brokers',
       cwd: __dirname,
       script: path.join(venvBin, 'uvicorn'),
-      args: `app.main:app --host ${host} --port ${port}`,
+      args: `app.main:app --host ${host} --port ${port} --no-access-log`,
       interpreter: 'none',
       instances: 1,
       // Sessions live in this process's memory, so a second copy would hold a second set

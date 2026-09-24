@@ -3,6 +3,7 @@ import base64
 import json
 import queue
 from types import SimpleNamespace
+import time
 
 import pytest
 
@@ -21,6 +22,9 @@ class Socket:
 
     def is_connected(self):
         return self.connected
+
+    def close(self):
+        self.connected = False
 
     def send(self, message):
         self.sent.append(message)
@@ -88,10 +92,12 @@ async def test_real_account_authorizes_before_any_balance_request(live):
     assert ws.sent == []
 
 
-async def test_instruments_list_after_auth_counts_as_connected(live):
+async def test_private_balance_after_instruments_confirms_authorization(live):
     async def send(event, data=None):
         assert event == "authorization"
         live.on_event("instruments/list", [[368, "EURUSD_otc", "EUR/USD OTC", "currency", 1, 90]])
+        assert not live.auth_ready.is_set()
+        live.on_event('balance', {'liveBalance': 12, 'demoBalance': 100})
 
     live.send_event = send
     await live.authenticate("fresh-token", AccountType.DEMO)
@@ -165,6 +171,34 @@ async def test_disconnected_socket_does_not_serve_cached_balance(live):
         await live.get_balance(AccountType.REAL)
 
 
+async def test_public_instruments_do_not_prove_account_authorization(live, monkeypatch):
+    async def send(*args):
+        live.on_event('instruments/list', [])
+    async def timeout(coro, *args):
+        coro.close()
+        raise asyncio.TimeoutError
+    live.send_event = send
+    monkeypatch.setattr(asyncio, 'wait_for', timeout)
+    with pytest.raises(AuthError, match='authorization timed out'):
+        await live.authenticate('unconfirmed-session', AccountType.REAL)
+    assert not live.auth_ready.is_set()
+
+
+def test_a_silent_socket_stays_up_but_is_not_receiving(live):
+    live.last_recv_time = time.monotonic() - 60
+    assert live.is_alive() is True
+    assert live.is_receiving() is False
+    live.last_recv_time = time.monotonic()
+    assert live.is_alive() is True
+    assert live.is_receiving() is True
+
+
+def test_a_disconnected_socket_is_dead(live):
+    live.connection._ws.connected = False
+    assert live.is_alive() is False
+    assert live.is_receiving() is False
+
+
 async def test_ticks_feed_each_subscribed_period(live):
     candles, quotes = [], []
     live.market.apply_quote = lambda *a: quotes.append(a)
@@ -221,6 +255,7 @@ async def test_session_connect_uses_wire_auth_and_balance_and_closes_on_failure(
 
         async def connect(self):
             self.receiver = asyncio.create_task(self.connection._receive_messages())
+            self.connection._receive_task = self.receiver
 
         async def disconnect(self):
             self.closed = True
@@ -238,12 +273,12 @@ async def test_session_connect_uses_wire_auth_and_balance_and_closes_on_failure(
             pytest.fail('Constructor already selected the account')
 
     monkeypatch.setattr(quotex, '_load_client_cls', lambda: Client)
-    monkeypatch.setattr(quotex, 'install_websocket_transport', lambda: False)
     session = quotex.QuotexSession('protocol-test')
     if reject:
         with pytest.raises(AuthError):
             await session.connect(ssid='token', account_type=AccountType.REAL)
-        assert Client.instance.closed
+        assert not Client.instance.connection._ws.is_connected()
+        assert Client.instance.receiver.done()
         assert not session.transport_connected
         assert session.lifecycle is LifecycleState.AUTH_FAILED
     else:

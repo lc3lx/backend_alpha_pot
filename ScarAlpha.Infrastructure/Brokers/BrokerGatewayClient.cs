@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
@@ -35,7 +36,7 @@ public sealed class BrokerGatewayClient : IBrokerClient
     private readonly Guid _userId;
 
     /// <summary>Quotes are cached so the hot path can read without a round trip.</summary>
-    private readonly Dictionary<string, QuoteData> _quotes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, QuoteData> _quotes = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>(asset, period) -> when candles were last confirmed present.</summary>
     private readonly Dictionary<string, DateTimeOffset> _warm = new(StringComparer.OrdinalIgnoreCase);
@@ -90,7 +91,8 @@ public sealed class BrokerGatewayClient : IBrokerClient
             ssid = credentials.Ssid,
             email = credentials.Email,
             password = credentials.Password,
-            account_type = credentials.AccountType.ToString()
+            account_type = credentials.AccountType.ToString(),
+            takeover = credentials.Takeover
         };
         var response = await SendAsync(
                 token => _http.PostAsJsonAsync("/sessions/connect", payload, Json, token),
@@ -100,10 +102,40 @@ public sealed class BrokerGatewayClient : IBrokerClient
 
         if (!response.IsSuccessStatusCode)
         {
+            if ((int)response.StatusCode == 409)
+            {
+                // This user may already be live on the gateway. A second handshake is
+                // refused so it cannot steal another account's socket. Attach to OUR
+                // existing session instead of marking auth-failed — that is what made
+                // the UI flash Connect quotex every second.
+                await RefreshTransportAsync(ct).ConfigureAwait(false);
+                if (IsTransportConnected &&
+                    Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
+                {
+                    return;
+                }
+
+                Lifecycle = SessionLifecycleState.Disconnected;
+                IsTransportConnected = false;
+                throw await TranslateAsync(response, ct).ConfigureAwait(false);
+            }
+
             Lifecycle = SessionLifecycleState.AuthenticationFailed;
             throw await TranslateAsync(response, ct).ConfigureAwait(false);
         }
 
+        Lifecycle = SessionLifecycleState.Connected;
+        IsTransportConnected = true;
+    }
+
+    /// <summary>
+    /// Marks this wrapper live without a gateway handshake. Used when another user
+    /// already holds the process's one Quotex socket — a second /sessions/connect
+    /// would tear that socket down and the UI would say Connect quotex before continuing.
+    /// </summary>
+    internal void MarkAttachedLive(BrokerCredentials? credentials)
+    {
+        _credentials = credentials;
         Lifecycle = SessionLifecycleState.Connected;
         IsTransportConnected = true;
     }
@@ -126,8 +158,14 @@ public sealed class BrokerGatewayClient : IBrokerClient
 
             if (!response.IsSuccessStatusCode)
             {
-                IsTransportConnected = false;
-                Lifecycle = SessionLifecycleState.Disconnected;
+                // 409/401 means this user really has no session. Timeouts and 5xx used to
+                // mark the wrapper dead, the chart went empty, and the UI said the
+                // connection dropped while Quotex was still up.
+                if ((int)response.StatusCode is 401 or 409)
+                {
+                    IsTransportConnected = false;
+                    Lifecycle = SessionLifecycleState.Disconnected;
+                }
                 return;
             }
 
@@ -146,10 +184,13 @@ public sealed class BrokerGatewayClient : IBrokerClient
             // Marking Disconnected here made Get() throw the wrapper away, the chart
             // returned empty candles, and Demo/Real then tore the live socket down.
         }
+        catch (OperationCanceledException)
+        {
+            // A slow status poll must not look like a dead socket.
+        }
         catch
         {
-            IsTransportConnected = false;
-            Lifecycle = SessionLifecycleState.Disconnected;
+            // Keep the last known live flags. The next successful poll will correct them.
         }
     }
 
@@ -268,7 +309,11 @@ public sealed class BrokerGatewayClient : IBrokerClient
         }
 
         if (candles.Count > 0)
-            _warm[WarmKey(asset, periodSeconds)] = DateTimeOffset.UtcNow;
+        {
+            var lastStart = candles.Max(c => c.Timestamp);
+            _warm[WarmKey(asset, periodSeconds)] =
+                DateTimeOffset.FromUnixTimeSeconds(lastStart) + TimeSpan.FromSeconds(periodSeconds);
+        }
 
         return history;
     }
@@ -297,6 +342,40 @@ public sealed class BrokerGatewayClient : IBrokerClient
 
     public bool TryGetCachedQuote(string asset, out QuoteData? quote) =>
         _quotes.TryGetValue(asset, out quote);
+
+    public async Task<IReadOnlyList<QuoteData>> RefreshQuotesAsync(CancellationToken ct = default)
+    {
+        var parsed = await PullMarketQuotesAsync(_http, Broker, ct).ConfigureAwait(false);
+        foreach (var quote in parsed)
+            _quotes[quote.Pair] = quote;
+
+        return parsed.Count > 0 ? parsed : _quotes.Values.ToArray();
+    }
+
+    /// <summary>
+    /// Gateway tick dump. Independent of whose session is live — the store is process-wide.
+    /// </summary>
+    public static async Task<IReadOnlyList<QuoteData>> PullMarketQuotesAsync(
+        HttpClient http,
+        string broker,
+        CancellationToken ct)
+    {
+        var url = $"/market/quotes?broker={Uri.EscapeDataString(Brokers.Normalize(broker))}";
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(TimeSpan.FromSeconds(4));
+        try
+        {
+            using var response = await http.GetAsync(url, timeout.Token).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+                return Array.Empty<QuoteData>();
+            var json = await response.Content.ReadAsStringAsync(timeout.Token).ConfigureAwait(false);
+            return BrokerQuoteJson.Parse(json);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            return Array.Empty<QuoteData>();
+        }
+    }
 
     public async Task SubscribePairAsync(
         string asset, int periodSeconds = 60, CancellationToken ct = default)
@@ -334,10 +413,9 @@ public sealed class BrokerGatewayClient : IBrokerClient
 
     public bool HasFreshHistory(string asset, int periodSeconds)
     {
-        if (!_warm.TryGetValue(WarmKey(asset, periodSeconds), out var seen))
+        if (!_warm.TryGetValue(WarmKey(asset, periodSeconds), out var lastBarEnd))
             return false;
-        // Two bars of slack; prevents transient cache drops during quiet ticks.
-        return (DateTimeOffset.UtcNow - seen).TotalSeconds < Math.Max(120, periodSeconds * 2);
+        return MarketHistoryFreshness.IsFresh(lastBarEnd, DateTimeOffset.UtcNow, periodSeconds);
     }
 
     public async Task<OrderResponse> PlaceOrderAsync(
@@ -681,7 +759,10 @@ public sealed class BrokerGatewayClient : IBrokerClient
     private sealed record CandleDto(
         long Timestamp, decimal Open, decimal High, decimal Low, decimal Close, decimal? Volume);
 
-    private sealed record QuoteDto(string Asset, double Timestamp, decimal Price);
+    private sealed record QuoteDto(
+        [property: JsonPropertyName("asset")] string Asset,
+        [property: JsonPropertyName("timestamp")] double Timestamp,
+        [property: JsonPropertyName("price")] decimal Price);
 
     private sealed record OrderDto(
         [property: JsonPropertyName("order_id")] string OrderId,

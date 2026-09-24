@@ -59,6 +59,13 @@ public interface IBinollaSessionRestorer
     Task<bool> TryRestoreUserAsync(Guid userId, CancellationToken ct = default);
 
     /// <summary>
+    /// The logged-in user is switching Demo/Real or placing a manual trade.
+    /// Attaches their own Quotex session, replacing another user's socket if one is live.
+    /// Background restore must not call this.
+    /// </summary>
+    Task<bool> ClaimInteractiveAsync(Guid userId, CancellationToken ct = default);
+
+    /// <summary>
     /// Clears the sticky auth-failure skip so a fresh credential login can restore again.
     /// </summary>
     void ClearAuthFailure(Guid userId);
@@ -67,6 +74,13 @@ public interface IBinollaSessionRestorer
     /// Kick a non-blocking restore if the user is not live. Safe to call on every status poll.
     /// </summary>
     void EnsureBackgroundRestore(Guid userId);
+
+    /// <summary>
+    /// Attach this user's wrapper to a socket the gateway already holds.
+    /// When <paramref name="waitForRestore"/> is set and nothing is live, wait for the
+    /// existing restore path. Never opens a second Quotex handshake while one socket is up.
+    /// </summary>
+    Task<bool> EnsureUserLiveAsync(Guid userId, CancellationToken ct = default, bool waitForRestore = false);
 
     /// <summary>
     /// Whether a fresh credential login may be attempted for this user right now.

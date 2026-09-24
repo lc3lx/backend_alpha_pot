@@ -28,6 +28,15 @@ import inspect
 import json
 import os
 import time
+
+#: One Quotex handshake at a time. Per-session locks still let three keep-alives
+#: open sockets together and steal the process-wide transport.
+_PROCESS_CONNECT = asyncio.Lock()
+#: Last time this user had a server-side token refresh. Not once-per-process:
+#: a dead session has to be able to sign in again after the cooldown, with
+#: nobody sitting on the website.
+_SSID_REFRESH_AT: dict[str, float] = {}
+_SSID_REFRESH_GAP = 45.0
 from typing import Any
 
 from app.market_data import market_data
@@ -189,6 +198,9 @@ async def _auto_extract_ssid(email: str, password: str) -> str | None:
                 text=True,
                 timeout=75,
             )
+            err = (res.stderr or "").replace(email, "***").strip()
+            if res.returncode != 0 or err:
+                _log(f"ssid capture exit={res.returncode} stderr={err[:300]}")
             for line in res.stdout.strip().split("\n"):
                 s = line.find("{")
                 e = line.rfind("}")
@@ -197,10 +209,11 @@ async def _auto_extract_ssid(email: str, password: str) -> str | None:
                         data = json.loads(line[s:e + 1])
                         if data.get("ok") and data.get("token"):
                             return str(data["token"])
+                        _log(f"ssid capture json ok={data.get('ok')} err={str(data.get('error') or '')[:160]}")
                     except Exception:
                         pass
-        except Exception:
-            pass
+        except Exception as cap_exc:
+            _log(f"ssid capture failed: {type(cap_exc).__name__}: {cap_exc}")
         return None
 
     try:
@@ -229,7 +242,8 @@ class QuotexSession(BrokerSession):
         self._last_balance: Balance | None = None
         self._connect_lock = asyncio.Lock()
         self._last_reconnect_attempt: float = 0.0
-        self._reconnect_cooldown: float = 5.0
+        self._last_ping: float = 0.0
+        self._reconnect_cooldown: float = 3.0
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -240,9 +254,14 @@ class QuotexSession(BrokerSession):
         email: str | None = None,
         password: str | None = None,
         account_type: AccountType = AccountType.REAL,
+        force: bool = False,
     ) -> None:
-        async with self._connect_lock:
-            if self.transport_connected and self._client is not None:
+        async with _PROCESS_CONNECT:
+          async with self._connect_lock:
+            # A healthy socket is reused. force=True is only the stale-feed heal:
+            # transport_connected stays true while candle packets have stopped, and
+            # returning here left every pair frozen and every order unacked.
+            if self.transport_connected and self._client is not None and not force:
                 if self.account_type != account_type:
                     await self.change_account(account_type)
                 return
@@ -260,10 +279,14 @@ class QuotexSession(BrokerSession):
             # full disconnect() path here — that also releases shared market feeds.
             if self._client is not None:
                 stale, self._client = self._client, None
+                stale_live = self._live
                 self._live = None
                 self._data = None
                 try:
-                    await _maybe_await(stale.disconnect())
+                    if stale_live is not None:
+                        await stale_live.close()
+                    else:
+                        await _maybe_await(stale.disconnect())
                 except Exception:
                     pass
 
@@ -311,22 +334,40 @@ class QuotexSession(BrokerSession):
             try:
                 if self._live is not None and not ssid:
                     raise AuthError("Quotex requires a valid session token. Please check your credentials.")
-                connected = await _maybe_await(client.connect())
-                if connected is False:
+                # Vendor connect() waits on its own auth after "Successfully connected".
+                # If we send authorization only after it returns, the socket is often
+                # already closing and every restore dies with NOT_CONNECTED.
+                auth_task: asyncio.Task | None = None
+                if self._live is not None and ssid:
+                    auth_task = asyncio.create_task(
+                        self._authenticate_when_live(ssid, account_type))
+                try:
+                    connected = await _maybe_await(client.connect())
+                    if auth_task is not None:
+                        await asyncio.wait_for(asyncio.shield(auth_task), 20.0)
+                finally:
+                    if auth_task is not None and not auth_task.done():
+                        auth_task.cancel()
+                        await asyncio.gather(auth_task, return_exceptions=True)
+                live = self._live
+                socket_live = (live is not None and live.auth_error is None
+                               and live.is_alive() and live.auth_ready.is_set())
+                if connected is False and not socket_live:
                     raise NotConnected("Quotex connection failed.")
                 if self._live is not None:
                     try:
-                        await self._live.authenticate(ssid, account_type)
+                        if self._live.auth_error is not None:
+                            raise self._live.auth_error
+                        if not self._live.auth_ready.is_set():
+                            await self._live.authenticate(ssid, account_type)
+                    except NotConnected as nc:
+                        _log(f"auth NotConnected {self.user_id}: {nc}")
+                        raise
                     except AuthError:
-                        if email and password:
-                            new_ssid = await _auto_extract_ssid(email, password)
-                            if new_ssid:
-                                self.ssid = ssid = new_ssid
-                                await self._live.authenticate(ssid, account_type)
-                            else:
-                                raise
-                        else:
-                            raise
+                        # A second browser here aborted the one already signing in
+                        # (exit 134) and the account missed the trade. Renewal is
+                        # one login, started after this handshake has stopped.
+                        raise
                     try:
                         await self._live.get_balance(account_type)
                     except Exception as b_exc:
@@ -340,7 +381,29 @@ class QuotexSession(BrokerSession):
                     except Exception as b_exc:
                         _log(f"non-fatal balance fetch on connect: {b_exc}")
             except BaseException as exc:
-                await self.disconnect()
+                live = self._live
+                if (
+                    isinstance(exc, NotConnected)
+                    and live is not None
+                    and live.auth_error is None
+                    and live.is_alive()
+                    and live.auth_ready.is_set()
+                ):
+                    _log(f"connect NotConnected but socket live {self.user_id}: {exc}")
+                    self._data = _find_data_service(client)
+                    self.lifecycle = LifecycleState.CONNECTED
+                    return
+                # Do not call vendor disconnect() here. That close is process-global and
+                # was wiping every other user's live Quotex socket after a failed login.
+                _log(f"connect failed {self.user_id}: {type(exc).__name__}: {exc}")
+                if live is not None:
+                    try:
+                        await live.close()
+                    except Exception:
+                        pass
+                self._client = None
+                self._live = None
+                self._data = None
                 self.lifecycle = LifecycleState.AUTH_FAILED if isinstance(exc, AuthError) else LifecycleState.FAULTED
                 if isinstance(exc, asyncio.CancelledError):
                     raise
@@ -350,6 +413,18 @@ class QuotexSession(BrokerSession):
 
             self._data = _find_data_service(client)
             self.lifecycle = LifecycleState.CONNECTED
+
+    async def _authenticate_when_live(self, ssid: str, account_type: AccountType) -> None:
+        """Send authorization as soon as the vendor socket is up, not after connect() returns."""
+        live = self._live
+        if live is None:
+            return
+        for _ in range(1200):
+            if live.is_alive():
+                await live.authenticate(ssid, account_type)
+                return
+            await asyncio.sleep(0.1)
+        raise NotConnected("Quotex transport did not open for authorization.")
 
     async def _explicit_login(
         self, client: Any, ssid: str | None, email: str | None, password: str | None
@@ -422,9 +497,32 @@ class QuotexSession(BrokerSession):
         except Exception:
             return False
 
-    async def _ensure_connected(self) -> None:
-        if self.transport_connected:
+    async def _ensure_connected(self, *, force: bool = False) -> None:
+        auth_dead = self.lifecycle == LifecycleState.AUTH_FAILED or (
+            self._live is not None and self._live.auth_error is not None
+        )
+        if auth_dead:
+            # The token is dead. Reconnecting it again kills the single server
+            # login that replaces it. Stay down so that login can finish.
             return
+        if _PROCESS_CONNECT.locked():
+            return
+        if self.transport_connected and not force:
+            live = self._live
+            if live is not None and live.is_alive():
+                # Quotex closes a socket that never sends a protocol ping, even
+                # while quotes are still arriving. That drop was about every
+                # ten minutes, and the next login waited on a cooldown.
+                now = time.monotonic()
+                if live.seconds_silent() > 15.0 or now - self._last_ping > 20.0:
+                    try:
+                        await live.send_raw("2")
+                        self._last_ping = now
+                        return
+                    except Exception as ping_err:
+                        _log(f"keep-alive ping failed {self.user_id}: {ping_err}")
+                else:
+                    return
         if not (self.ssid or (self._email and self._password)):
             return
         # A handshake is already running. Waiting on the lock used to serialize
@@ -445,6 +543,7 @@ class QuotexSession(BrokerSession):
                 email=self._email,
                 password=self._password,
                 account_type=self.account_type,
+                force=force,
             )
             self._reconnect_cooldown = 5.0
             if self._subscribed:
@@ -480,8 +579,6 @@ class QuotexSession(BrokerSession):
         if client is None or not self.transport_connected:
             if self._live is not None and self._live.auth_error is not None:
                 raise self._live.auth_error
-            if self._last_balance is not None:
-                return self._last_balance
             raise NotConnected("Quotex session is not connected.")
 
         if self._live is not None:
@@ -494,7 +591,9 @@ class QuotexSession(BrokerSession):
                 if self._live.auth_error is not None:
                     self.lifecycle = LifecycleState.AUTH_FAILED
                     raise self._live.auth_error
-                _log(f"live get_balance fallback: {ex}")
+                # The vendor can return sample/cached values. A failed live read
+                # must stay unavailable rather than presenting those as broker money.
+                raise NotConnected("Quotex live balance is unavailable.") from ex
 
         enums = _enums()
         demo_type = _enum_member(enums.AccountType, "DEMO", "PRACTICE")
@@ -630,30 +729,13 @@ class QuotexSession(BrokerSession):
             return self._market.bars(alt, period_seconds)
 
         bucket = _bucket()
-        # Shared history is enough to draw the chart even while this socket
-        # reconnects. Reload when the series is missing, stale, OR has a hole
-        # that would leave RSI with only the last few live minutes.
-        now = time.time()
-        last_ts = max(bucket.keys()) if bucket else 0
-        need_history = self._market.should_reload_history(asset, period_seconds) or (
-            len(bucket) < min(count, 100) or (now - last_ts) > (period_seconds * 3)
-        )
-        if need_history:
+        # Never sleep the chart request. A stale series used to block 5s per pair
+        # on every scan; reload runs in the background instead.
+        if (not bucket) or self._market.should_reload_history(asset, period_seconds):
             try:
-                await self._ensure_connected()
-                if self.transport_connected:
-                    await self.subscribe(asset, period_seconds)
-                    for _ in range(50):
-                        await asyncio.sleep(0.1)
-                        bucket = _bucket()
-                        last_ts = max(bucket.keys()) if bucket else 0
-                        if not self._market.needs_history(asset, period_seconds) and (
-                            len(bucket) >= min(count, 50)
-                            and (now - last_ts) <= (period_seconds * 3)
-                        ):
-                            break
+                asyncio.create_task(self._reload_series(asset, period_seconds))
             except Exception:
-                bucket = _bucket()
+                pass
 
         now = time.time()
         cutoff = int(now) - (int(now) % period_seconds)
@@ -672,6 +754,14 @@ class QuotexSession(BrokerSession):
             if start <= cutoff
         ]
         return candles[-count:]
+
+    async def _reload_series(self, asset: str, period_seconds: int) -> None:
+        try:
+            await self._ensure_connected()
+            if self.transport_connected:
+                await self.subscribe(asset, period_seconds)
+        except Exception as exc:
+            _log(f"background history reload {asset}: {exc}")
 
     async def get_quote(self, asset: str) -> Quote | None:
         hit = self._market.quote(asset)
@@ -777,6 +867,7 @@ class QuotexSession(BrokerSession):
             order_id = str(res.get("id") or res.get("order_id") or res.get("uuid") or res.get("ticket") or "")
             open_price = float(res.get("openPrice") or res.get("open_price") or 0.0)
             now_ts = time.time()
+            used = int(res.get("_scar_duration") or duration_seconds)
             return OrderResponse(
                 order_id=order_id,
                 asset=asset,
@@ -784,7 +875,7 @@ class QuotexSession(BrokerSession):
                 amount=float(amount),
                 open_price=open_price,
                 placed_at=now_ts,
-                expiry_at=now_ts + duration_seconds,
+                expiry_at=now_ts + used,
                 account_type=self.account_type,
             )
 

@@ -22,7 +22,9 @@ public sealed class RsiSignalService : IRsiSignalService
         IReadOnlyList<RsiCandle> candles,
         RsiStrategyOptions options,
         DateTimeOffset now,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        RsiBacktestStats? cachedCallBacktest = null,
+        RsiBacktestStats? cachedPutBacktest = null)
     {
         if (string.IsNullOrWhiteSpace(asset))
             throw new ApiException(ApiErrorCodes.ValidationError, "asset is required.");
@@ -60,8 +62,12 @@ public sealed class RsiSignalService : IRsiSignalService
         var closeTime = currentCandle.Timestamp + barLength;
         var closes = prepared.Closes;
         var currentRsi = _calculator.CalculateRsi(closes, options);
-        // Backtest is always ready before the closed RSI gate is consulted.
-        var (callBacktest, putBacktest) = RsiZoneBacktest.Evaluate(closes, options);
+        // Prefer the shared per-bar cache so Call/Put stats are already sitting there
+        // the instant closed RSI hits 25/75 — Evaluate is only the cache-miss path.
+        var callBacktest = cachedCallBacktest;
+        var putBacktest = cachedPutBacktest;
+        if (callBacktest is null || putBacktest is null)
+            (callBacktest, putBacktest) = RsiZoneBacktest.Evaluate(closes, options);
 
         // Raw Wilder RSI — no broker "alignment" offset. If this disagrees with the
         // platform the cause is the input series (warmup/gaps), never a constant.
@@ -131,10 +137,7 @@ public sealed class RsiSignalService : IRsiSignalService
         var touchedOverbought = RsiEntryLevels.IsPutRsi(roundedRsi);
 
         var timeframe = options.TimeframeSeconds.ToString();
-        // Display: when closed at extreme show that side's backtest; otherwise show either for info only.
-        var displayBacktest = touchedOversold ? callBacktest
-            : touchedOverbought ? putBacktest
-            : roundedRsi >= 50m ? putBacktest : callBacktest;
+        var displayBacktest = RsiZoneBacktest.DisplayFor(roundedRsi, callBacktest, putBacktest);
         var key = EmissionKey(userId, asset, options.TimeframeSeconds);
 
         if (signalType == RsiSignalType.None || entryBacktest is null)
@@ -181,7 +184,9 @@ public sealed class RsiSignalService : IRsiSignalService
                 Timeframe: timeframe,
                 Backtest: displayBacktest,
                 LiveRsi: liveRsi,
-                AutomationError: midSkip == "closeLag" ? "SETUP_EXPIRED" : null));
+                AutomationError: midSkip == "closeLag" ? "SETUP_EXPIRED" : null,
+                CallBacktest: callBacktest,
+                PutBacktest: putBacktest));
         }
 
         var watch = _setups.AddOrUpdate(
@@ -241,9 +246,11 @@ public sealed class RsiSignalService : IRsiSignalService
                 Rsi: roundedRsi,
                 CandleTime: watch.CloseTime,
                 Timeframe: timeframe,
-                Backtest: entryBacktest,
+                Backtest: entryBacktest ?? displayBacktest,
                 LiveRsi: liveRsi,
-                AutomationError: watch.Consumed ? "SETUP_CONSUMED" : "SETUP_EXPIRED"));
+                AutomationError: watch.Consumed ? "SETUP_CONSUMED" : "SETUP_EXPIRED",
+                CallBacktest: callBacktest,
+                PutBacktest: putBacktest));
         }
 
         return Task.FromResult(new StrategySignal(
@@ -254,7 +261,9 @@ public sealed class RsiSignalService : IRsiSignalService
             CandleTime: watch.CloseTime,
             Timeframe: timeframe,
             Backtest: entryBacktest,
-            LiveRsi: liveRsi));
+            LiveRsi: liveRsi,
+            CallBacktest: callBacktest,
+            PutBacktest: putBacktest));
     }
 
     public void MarkSignalEmitted(

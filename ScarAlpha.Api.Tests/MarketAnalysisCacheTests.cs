@@ -119,12 +119,12 @@ public sealed class MarketAnalysisCacheTests
         MarketAnalysisCache.CurrentClosedBarTime(BarClose.AddSeconds(60), 60).Should().Be(BarClose.AddMinutes(1));
     }
 
-    private static MarketAnalysis Analysis(DateTimeOffset barClose, decimal rsi)
+    private static MarketAnalysis Analysis(DateTimeOffset barClose, decimal rsi, string? asset = null)
     {
         var stats = new RsiBacktestStats(1, 1, 0, 100m, 200, 5, 75m, true);
         var candle = new RsiCandle(barClose.AddMinutes(-1), 100m, barClose);
         return new MarketAnalysis(
-            Asset: Asset,
+            Asset: asset ?? Asset,
             TimeframeSeconds: 60,
             ClosedBarTime: barClose,
             ClosedCandles: new[] { candle },
@@ -132,8 +132,7 @@ public sealed class MarketAnalysisCacheTests
             Rsi: rsi,
             CallBacktest: stats,
             PutBacktest: stats);
-
-}
+    }
     
     /// <summary>
     /// The same symbol on two venues is two different price series, and the cache must not
@@ -152,5 +151,23 @@ public sealed class MarketAnalysisCacheTests
 
         cache.TryGet(Brokers.Binolla, Asset, 60, now)!.Rsi.Should().Be(71m);
         cache.TryGet(Brokers.Quotex, Asset, 60, now)!.Rsi.Should().Be(29m);
+    }
+
+    [Fact]
+    public async Task ListRecent_returns_this_broker_and_timeframe_only()
+    {
+        var cache = new MarketAnalysisCache();
+        var now = BarClose.AddSeconds(2);
+
+        await cache.GetOrAddAsync(Brokers.Quotex, "EURUSD", 60, now, _ =>
+            Task.FromResult<MarketAnalysis?>(Analysis(BarClose, rsi: 41m, asset: "EURUSD")));
+        await cache.GetOrAddAsync(Brokers.Quotex, "GBPUSD", 60, now, _ =>
+            Task.FromResult<MarketAnalysis?>(Analysis(BarClose, rsi: 62m, asset: "GBPUSD")));
+        await cache.GetOrAddAsync(Brokers.Binolla, "EURUSD", 60, now, _ =>
+            Task.FromResult<MarketAnalysis?>(Analysis(BarClose, rsi: 11m, asset: "EURUSD")));
+
+        var board = cache.ListRecent(Brokers.Quotex, 60, now);
+        board.Should().HaveCount(2);
+        board.Select(x => x.Asset).Should().BeEquivalentTo("EURUSD", "GBPUSD");
     }
 }

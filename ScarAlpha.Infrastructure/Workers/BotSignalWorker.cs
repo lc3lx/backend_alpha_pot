@@ -227,11 +227,12 @@ public sealed class BotSignalWorker : IHostedService
         var options = RsiStrategyOptions.Default60Seconds with { ExpiryCandles = cohort.ExpiryCandles };
 
         var secIntoMin = SecondsIntoMinute();
-        var allowRescan = secIntoMin < 20;
+        var allowRescan = secIntoMin < RsiEntryLevels.SetupTtlSeconds;
 
         // When this bar has already been decided with nothing to trade, only bail out if we are
-        // past the initial candle close arrival window (20s). In the first 20 seconds, candles
-        // can land asynchronously from Quotex WebSocket.
+        // past the setup TTL. Inside that window candles can still land from Quotex WebSocket,
+        // and the cached Call/Put backtest is already on the analysis — so a late close at
+        // 25/75 can still enter immediately.
         var settled = _decisions.TryGet(cohort, timeframe, DateTimeOffset.UtcNow);
         if (settled is { Candidates.Count: 0 } && !allowRescan) return;
 
@@ -250,7 +251,11 @@ public sealed class BotSignalWorker : IHostedService
         var eligible = bots
             .Where(b => readiness.TryGetValue(b.UserId, out var r) && r.Eligible)
             .ToList();
-        if (eligible.Count == 0) return;
+
+        // The monitor board needs a scan even when nobody can trade (open trade, no
+        // session). Stopping here froze Pairs-and-RSI the moment every bot was held.
+        IReadOnlyList<BotRuntimeConfig> scanBots = eligible.Count > 0 ? eligible : bots;
+        if (scanBots.Count == 0) return;
 
         var scanStarted = DateTimeOffset.UtcNow;
 
@@ -259,11 +264,11 @@ public sealed class BotSignalWorker : IHostedService
             cohort,
             timeframe,
             DateTimeOffset.UtcNow,
-            (barTime, token) => ScanCohortAsync(cohort, eligible, options, barTime, token),
+            (barTime, token) => ScanCohortAsync(cohort, scanBots, options, barTime, token),
             ct,
             allowRescanIfEmpty: allowRescan).ConfigureAwait(false);
 
-        if (decision is null || decision.Candidates.Count == 0) return;
+        if (eligible.Count == 0 || decision is null || decision.Candidates.Count == 0) return;
 
         var scanMs = (DateTimeOffset.UtcNow - scanStarted).TotalMilliseconds;
         var placed = 0;
@@ -325,7 +330,9 @@ public sealed class BotSignalWorker : IHostedService
             var sessions = scope.ServiceProvider.GetRequiredService<IBrokerSessionManager>();
             var restorer = scope.ServiceProvider.GetRequiredService<IBinollaSessionRestorer>();
 
-            // Auto-heal broker session so Running bots keep trading without manual Start.
+            // Auto-heal via the keep-alive restorer. Do NOT TryRelogin on every tick:
+            // that raced three headless captures, cleared live SSIDs, and dropped the
+            // sockets that the restore wave was already bringing back.
             var broker = await _brokerResolver.GetAsync(bot.UserId, ct).ConfigureAwait(false);
             var client = sessions.Get(bot.UserId, broker);
             if (client is null ||
@@ -333,19 +340,6 @@ public sealed class BotSignalWorker : IHostedService
                 client.Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected))
             {
                 restorer.EnsureBackgroundRestore(bot.UserId);
-                try
-                {
-                    using (AmbientUserContext.Use(bot.UserId))
-                    {
-                        var binolla = scope.ServiceProvider.GetRequiredService<BinollaAppService>();
-                        await binolla.TryReloginFromStoredCredentialsAsync(ct).ConfigureAwait(false);
-                    }
-                }
-                catch
-                {
-                    // soft — next tick retries
-                }
-
                 client = sessions.Get(bot.UserId, broker);
             }
 
@@ -477,6 +471,20 @@ public sealed class BotSignalWorker : IHostedService
         var bag = new ConcurrentBag<CohortCandidate>();
         var scanned = 0;
 
+        // Fill live ticks on the server so the scan does not depend on an open browser.
+        try
+        {
+            await using var quoteScope = _scopeFactory.CreateAsyncScope();
+            var sessions = quoteScope.ServiceProvider.GetRequiredService<IBrokerSessionManager>();
+            var client = sessions.Get(scanUserId, cohort.Broker);
+            if (client is not null)
+                await client.RefreshQuotesAsync(ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Closed-bar scan still runs if the tick dump misses.
+        }
+
         // Parallel scan for fast brokers (Quotex), serial for Binolla socket constraints.
         var parallelism = GetScanParallelism(cohort.Broker);
         await Parallel.ForEachAsync(
@@ -551,6 +559,13 @@ public sealed class BotSignalWorker : IHostedService
                     !client.IsTransportConnected ||
                     client.Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected))
                 {
+                    if (!string.Equals(broker, Brokers.Binolla, StringComparison.OrdinalIgnoreCase))
+                        client = sessions.GetAny(broker);
+                }
+                if (client is null ||
+                    !client.IsTransportConnected ||
+                    client.Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected))
+                {
                     continue;
                 }
 
@@ -592,8 +607,14 @@ public sealed class BotSignalWorker : IHostedService
         CancellationToken ct)
     {
         var userId = bot.UserId;
-        if (OpenTradeGate.IsUserHeld(userId) || ct.IsCancellationRequested)
+        if (ct.IsCancellationRequested)
             return false;
+        // Reserve the slot before any pair is tried. A second signal, a second
+        // cohort, or the next pair in this list cannot enter until it ends.
+        var reserved = RsiStrategyOptions.TradeDurationSeconds(bot.DurationSeconds);
+        if (!OpenTradeGate.TryHold(userId, reserved))
+            return false;
+        var keepSlot = false;
 
         var allowedAssets = bot.IsAllAssets
             ? decision.Candidates.Select(c => c.Asset).ToList()
@@ -605,11 +626,15 @@ public sealed class BotSignalWorker : IHostedService
 
         var now = DateTimeOffset.UtcNow;
         var candidates = decision.Candidates
-            .Where(c => (selected == null || selected.Contains(c.Asset))
+            .Where(c => (selected == null || selected.Contains(c.Asset) || BotAssetList.Contains(allowedAssets, c.Asset))
                      && !PairCooldownRegistry.IsBenched(userId, bot.StrategyId, c.Asset, now))
             .ToList();
 
-        if (candidates.Count == 0) return false;
+        if (candidates.Count == 0)
+        {
+            OpenTradeGate.ReleaseUser(userId);
+            return false;
+        }
 
         foreach (var pick in candidates)
         {
@@ -625,7 +650,6 @@ public sealed class BotSignalWorker : IHostedService
                 var rsi = execScope.ServiceProvider.GetRequiredService<RsiSignalAppService>();
                 using (AmbientUserContext.Use(userId))
                 {
-                    OpenTradeGate.MarkUserHeld(userId, bot.DurationSeconds);
                     // #region agent log
                     ScarAlpha.Binolla.Diagnostics.AgentDebug1892.Write(
                         "H-LIVE",
@@ -648,19 +672,44 @@ public sealed class BotSignalWorker : IHostedService
 
                     var executed = await rsi.TryAutoExecuteAsync(pick.Signal, options, ct).ConfigureAwait(false);
                     if (!string.IsNullOrEmpty(executed.AutomatedTradeId))
+                    {
+                        keepSlot = true;
                         return true;
+                    }
 
-                    OpenTradeGate.ReleaseUser(userId);
+                    // The order may already be at the broker even when no id came back.
+                    // Only a reject that happens before sending may try the next pair.
+                    if (!MayTryNextPair(executed.AutomationError))
+                    {
+                        keepSlot = true;
+                        return false;
+                    }
                 }
             }
             catch
             {
-                OpenTradeGate.ReleaseUser(userId);
+                keepSlot = true;
+                return false;
             }
         }
 
+        if (!keepSlot)
+            OpenTradeGate.ReleaseUser(userId);
         return false;
     }
+
+    /// <summary>Rejects that happen before an order is sent. Anything else keeps the one-trade slot.</summary>
+    private static bool MayTryNextPair(string? error) =>
+        error is null
+            or "PAYOUT_TOO_LOW"
+            or "ASSET_NOT_SELECTED"
+            or "STRATEGY_MISMATCH"
+            or "NO_SIGNAL"
+            or "SETUP_EXPIRED"
+            or "DAILY_PROFIT_TARGET_REACHED"
+            or "DAILY_LOSS_LIMIT_REACHED"
+            or "NOT_CONNECTED"
+            or "INSUFFICIENT_HISTORY";
 
     private static async Task<bool> HasBlockingOpenTradeAsync(
         ITradeRepository trades,
@@ -727,7 +776,7 @@ public sealed class BotSignalWorker : IHostedService
 
         var now = DateTimeOffset.UtcNow;
         return decision.Candidates.FirstOrDefault(c =>
-            (selected == null || selected.Contains(c.Asset))
+            (selected == null || selected.Contains(c.Asset) || BotAssetList.Contains(selectedAssets, c.Asset))
             && (!userId.HasValue || !PairCooldownRegistry.IsBenched(userId.Value, strategyId, c.Asset, now)));
     }
 

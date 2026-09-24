@@ -26,6 +26,7 @@ public sealed class TradeAppService
     private readonly INotificationWriter _notifications;
     private readonly IMarketingDemoService _demo;
     private readonly IReferralQualificationService _referralQualification;
+    private readonly IBinollaSessionRestorer _restorer;
     private readonly ILogger<TradeAppService> _logger;
 
     /// <summary>
@@ -49,6 +50,7 @@ public sealed class TradeAppService
         INotificationWriter notifications,
         IMarketingDemoService demo,
         IReferralQualificationService referralQualification,
+        IBinollaSessionRestorer restorer,
         ILogger<TradeAppService> logger)
     {
         _currentUser = currentUser;
@@ -63,10 +65,15 @@ public sealed class TradeAppService
         _notifications = notifications;
         _demo = demo;
         _referralQualification = referralQualification;
+        _restorer = restorer;
         _logger = logger;
     }
 
-    public async Task<TradeDto> PlaceTradeAsync(PlaceTradeRequest request, string idempotencyKey, CancellationToken ct)
+    public async Task<TradeDto> PlaceTradeAsync(
+        PlaceTradeRequest request,
+        string idempotencyKey,
+        CancellationToken ct,
+        bool interactive = false)
     {
         if (string.IsNullOrWhiteSpace(idempotencyKey))
             throw new ApiException(ApiErrorCodes.ValidationError, "Idempotency-Key header is required.");
@@ -103,10 +110,28 @@ public sealed class TradeAppService
             throw new ApiException(ApiErrorCodes.BinollaNotConnected, $"Connect {broker} before trading.", 409);
 
         // Trade on whichever venue this user is linked to — the link is the record of it.
+        // A dropped socket used to fail here with "not connected" and leave the user
+        // to reconnect by hand. Attach to the gateway first; if it is down, the
+        // interactive path waits for the same restore that runs after an idle expiry.
         var client = _brokers.Get(userId, broker);
-        if (client is null ||
-            client.Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected))
+        if (!IsTradingClient(client))
         {
+            await _restorer.EnsureUserLiveAsync(userId, ct, waitForRestore: interactive)
+                .ConfigureAwait(false);
+            client = _brokers.Get(userId, broker);
+        }
+
+        if (!IsTradingClient(client))
+        {
+            if (interactive)
+            {
+                _restorer.EnsureBackgroundRestore(userId);
+                throw new ApiException(
+                    ApiErrorCodes.BrokerReconnecting,
+                    "Reconnecting to the broker.",
+                    409);
+            }
+
             throw new ApiException(
                 ApiErrorCodes.BinollaNotConnected,
                 $"{broker} session is not connected.",
@@ -191,7 +216,28 @@ public sealed class TradeAppService
         }
 
         var assets = await client.GetTradingAssetsAsync(ct);
-        var match = assets.FirstOrDefault(a => string.Equals(a.Symbol, request.Asset.Trim(), StringComparison.OrdinalIgnoreCase));
+        var assetName = request.Asset.Trim();
+        var match = assets.FirstOrDefault(a => string.Equals(a.Symbol, assetName, StringComparison.OrdinalIgnoreCase));
+        if (match is not null && !match.IsOpen)
+        {
+            // Quotex often closes the spot name and keeps the OTC twin open (and the
+            // reverse on weekdays). The signal was computed on a live series; send the
+            // order to the twin that is actually open instead of refusing every second.
+            var twinName = assetName.EndsWith("_otc", StringComparison.OrdinalIgnoreCase)
+                ? assetName[..^4]
+                : assetName + "_otc";
+            var twin = assets.FirstOrDefault(a => string.Equals(a.Symbol, twinName, StringComparison.OrdinalIgnoreCase));
+            if (twin is { IsOpen: true })
+            {
+                _logger.LogInformation(
+                    "Trade asset {Asset} is closed; using open twin {Twin}",
+                    assetName, twin.Symbol);
+                assetName = twin.Symbol;
+                match = twin;
+                request = request with { Asset = twin.Symbol };
+            }
+        }
+
         if (match is not null)
         {
             if (!match.IsOpen)
@@ -276,6 +322,11 @@ public sealed class TradeAppService
 
             trade.Status = status;
             trade.BinollaOrderId = order.OrderId;
+            var actualDuration = (int)Math.Round((order.ExpiryTime - order.PlacedAt).TotalSeconds);
+            // Never shorten the slot. A shorter broker echo used to free the gate
+            // while the 5-minute trade was still running, and the next pair entered.
+            if (actualDuration > trade.DurationSeconds && actualDuration <= 3600)
+                trade.DurationSeconds = actualDuration;
             trade.UpdatedAt = DateTimeOffset.UtcNow;
             await _trades.UpdateAsync(trade, ct);
 
@@ -416,6 +467,11 @@ public sealed class TradeAppService
                 trade.UserId, trade.Id, errorCode);
         }
     }
+
+    private static bool IsTradingClient(IBrokerClient? client) =>
+        client is not null &&
+        client.IsTransportConnected &&
+        client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected;
 
     private static void ValidateTradeRequest(PlaceTradeRequest request)
     {

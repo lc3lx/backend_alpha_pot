@@ -240,6 +240,7 @@ class WebSocketTransport:
             return False
 
         self._delegate = delegate
+        self._last_recv_time = time.monotonic()
         self.sid = getattr(delegate, "sid", None)
         self._stopped.clear()
         self._running.set()
@@ -323,6 +324,7 @@ class WebSocketTransport:
                 if response.status_code != 200:
                     raise ConnectionError(f"Polling receive failed: HTTP {response.status_code}")
                 for packet in delegate._parse_polling_payload(response.text):
+                    self._last_recv_time = time.monotonic()
                     delegate.message_queue.put(packet)
             except Exception as exc:
                 delegate.close()
@@ -331,7 +333,10 @@ class WebSocketTransport:
 
     def recv(self, timeout: float | None = None) -> str | None:
         if self._delegate is not None:
-            return self._delegate.recv(timeout)
+            packet = self._delegate.recv(timeout)
+            if packet:
+                self._last_recv_time = time.monotonic()
+            return packet
         try:
             return self.message_queue.get(timeout=timeout) if timeout else (
                 self.message_queue.get_nowait()
@@ -384,6 +389,9 @@ class WebSocketTransport:
 
             # Engine.IO housekeeping never reaches the protocol layer above.
             if text == _PONG:
+                # The account layer also tracks receive liveness. An idle account
+                # may have no quote subscriptions but still receive healthy pongs.
+                self.message_queue.put(text)
                 continue
             if text == _PING:
                 # Some servers ping the client; answer or be dropped as unresponsive.
@@ -433,6 +441,11 @@ class WebSocketTransport:
     def _fail(self, exc: Exception) -> None:
         self._running.clear()
         self._stopped.set()
+        if self._delegate is not None:
+            try:
+                self._delegate.close()
+            except Exception:
+                pass
         ws, self._ws = self._ws, None
         if ws is not None:
             try:

@@ -105,6 +105,23 @@ public sealed class BotAccessService : IBotAccessService
         }
 
         var connected = IsLive(client);
+        if (!connected &&
+            !string.Equals(broker, Brokers.Binolla, StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                if (await _sessions.TryAdoptAsync(userId, broker, ct, fresh: true).ConfigureAwait(false))
+                {
+                    client = _sessions.Get(userId, broker);
+                    connected = IsLive(client);
+                }
+            }
+            catch
+            {
+                // Status stays cheap; restore will retry.
+            }
+        }
+
         var accountType = (link?.AccountType ?? BinollaAccountType.Demo).ToString();
         var approvalStatus = (link?.ApprovalStatus ?? AdminApprovalStatus.Pending).ToString();
         var adminApproved = link?.AdminApproved == true;

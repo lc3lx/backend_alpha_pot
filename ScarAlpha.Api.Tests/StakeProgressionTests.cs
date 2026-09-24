@@ -10,7 +10,7 @@ public sealed class StakeProgressionTests
     [InlineData(StakeProgression.RedSignalPro, 25, 40, 25)]
     [InlineData(StakeProgression.AlphaMomentum, 25, 25, 37.5)]
     [InlineData(StakeProgression.ScarPrecision, 25, 25, 50)]
-    [InlineData(StakeProgression.TrendBreaker, 25, 25, 75)]
+    [InlineData(StakeProgression.TrendBreaker, 25, 25, 62.5)]
     public void Loss_progression_uses_base_or_last_trade(string mode, decimal baseAmount, decimal last, decimal expected)
     {
         StakeProgression.CalculateNextAfterLoss(mode, baseAmount, last).Should().Be(expected);

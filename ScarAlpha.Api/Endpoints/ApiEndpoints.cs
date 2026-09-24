@@ -241,7 +241,7 @@ public static class TradeEndpoints
             if (!http.Headers.TryGetValue("Idempotency-Key", out var key) || string.IsNullOrWhiteSpace(key))
                 return Results.BadRequest(new ApiErrorResponse("VALIDATION_ERROR", "Idempotency-Key header is required."));
 
-            var trade = await svc.PlaceTradeAsync(request, key.ToString(), ct);
+            var trade = await svc.PlaceTradeAsync(request, key.ToString(), ct, interactive: true);
             return Results.Ok(trade);
         });
 
@@ -303,7 +303,7 @@ public static class StrategyEndpoints
             [FromQuery] int rsiLength = 14,
             [FromQuery] decimal oversold = 25m,
             [FromQuery] decimal overbought = 75m,
-            [FromQuery] int backtestCandles = 400,
+            [FromQuery] int backtestCandles = 200,
             [FromQuery] int expiryCandles = 5,
             [FromQuery] decimal minimumSuccessRate = 75m) =>
         {
@@ -328,6 +328,16 @@ public static class StrategyEndpoints
             // trade source. BotSignalWorker is the only writer.
             return Results.Ok(await svc.GetSignalAsync(
                 asset, timeframe, options, autoExecute: false, ct, strategyId: strategyId));
+        });
+        group.MapGet("/rsi/board", async (
+            RsiSignalAppService svc,
+            CancellationToken ct,
+            [FromQuery] string? assets = null) =>
+        {
+            IReadOnlyList<string>? list = string.IsNullOrWhiteSpace(assets)
+                ? null
+                : assets.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            return Results.Ok(await svc.GetBoardAsync(list, ct));
         });
         return group;
     }

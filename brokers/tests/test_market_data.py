@@ -48,6 +48,20 @@ async def test_one_subscription_serves_every_account(market):
     assert market.feeder("EURUSD_otc", 60) == "user-a"
 
 
+async def test_twenty_readers_share_starting_feed_and_retry_if_it_stays_silent(market):
+    import asyncio
+    calls = []
+    async def subscribe():
+        calls.append('subscribe')
+        await asyncio.sleep(0.01)
+    await asyncio.gather(*(market.ensure_feed('EURUSD', 60, f'u{i}', subscribe, lambda: True)
+                           for i in range(20)))
+    assert len(calls) == 1
+    market._feed_started[('EURUSD', 60)] -= 11
+    await market.ensure_feed('EURUSD', 60, 'u1', subscribe, lambda: True)
+    assert len(calls) == 2
+
+
 async def test_a_second_account_sees_the_first_accounts_bars(market):
     await market.ensure_feed("EURUSD_otc", 60, "user-a", lambda: None, lambda: True)
     market.apply_candle("EURUSD_otc", 60, candle(1_800_000_000, 1.1))
@@ -179,6 +193,7 @@ async def test_a_gappy_series_reloads_history_even_when_ticks_are_fresh(market):
         "EURUSD_otc", 60, "user-a", lambda: calls.append("a"), lambda: True
     )
     market._history_reload_at.clear()  # noqa: SLF001
+    market._feed_started[("EURUSD_otc", 60)] -= 11  # first-feed grace elapsed
     await market.ensure_feed(
         "EURUSD_otc", 60, "user-b", lambda: calls.append("b"), lambda: True
     )
@@ -201,3 +216,23 @@ async def test_contiguous_recent_series_does_not_reload(market):
 
     assert market.needs_history("EURUSD_otc", 60) is False
     assert calls == ["a"]
+
+
+def test_stale_last_bar_is_not_current(market):
+    frozen = int(time.time()) - 3000
+    frozen -= frozen % 60
+    market.apply_candle("EURUSD_otc", 60, candle(frozen, 1.10))
+    assert market.is_series_current("EURUSD_otc", 60) is False
+    assert market.should_reload_history("EURUSD_otc", 60) is True
+
+
+def test_frozen_vendor_clock_opens_a_new_minute(market):
+    frozen = int(time.time()) - 3000
+    frozen -= frozen % 60
+    market.apply_candle("EURUSD_otc", 60, candle(frozen, 1.10))
+    market.apply_candle("EURUSD_otc", 60, candle(frozen, 1.11))
+    bucket = market.bars("EURUSD_otc", 60)
+    last = max(bucket)
+    now_min = int(time.time()) - (int(time.time()) % 60)
+    assert last == now_min
+    assert bucket[last][3] == 1.11

@@ -595,10 +595,9 @@ public sealed class BinollaAppService
         // Binolla's manager unconditionally — as this did — reported every Quotex user as
         // disconnected no matter how healthy their session was.
         var broker = Brokers.Normalize(link?.Broker);
-        var client = _brokers.Get(userId, broker);
+        var client = ResolveLiveClient(userId, broker);
 
-        var connected = client is not null &&
-                        client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected;
+        var connected = IsLiveClient(client);
 
         decimal? balance = null;
         if (connected)
@@ -650,15 +649,10 @@ public sealed class BinollaAppService
         // on every one of those polls whenever a session was not up.
         for (var i = 0; i < 4; i++)
         {
-            client = _brokers.Get(_currentUser.UserId, broker);
-            if (client is not null &&
-                client.IsTransportConnected &&
-                client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected)
-            {
+            client = ResolveLiveClient(_currentUser.UserId, broker);
+            if (client is not null)
                 break;
-            }
 
-            client = null;
             try { await Task.Delay(150, ct); }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
         }
@@ -1056,6 +1050,26 @@ public sealed class BinollaAppService
         {
             try
             {
+                var storedAge = DateTimeOffset.UtcNow - (link.LastConnectedAt ?? link.UpdatedAt);
+                if (storedAge > TimeSpan.FromHours(12))
+                {
+                    _logger.LogInformation(
+                        "{Broker} stored SSID for user {UserId} is {Hours}h old; capturing a fresh session",
+                        broker, userId, Math.Round(storedAge.TotalHours, 1));
+                    link.EncryptedSsid = string.Empty;
+                    link.EncryptedCookieHeader = null;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Could not age stored SSID for user {UserId}", userId);
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(link.EncryptedSsid))
+        {
+            try
+            {
                 var storedSsid = _protector.Decrypt(link.EncryptedSsid);
                 var storedCookie = !string.IsNullOrWhiteSpace(link.EncryptedCookieHeader)
                     ? _protector.Decrypt(link.EncryptedCookieHeader)
@@ -1263,16 +1277,42 @@ public sealed class BinollaAppService
         var link = await _links.GetByUserIdAsync(_currentUser.UserId, ct).ConfigureAwait(false);
         var broker = Brokers.Normalize(link?.Broker);
 
-        var client = _brokers.Get(_currentUser.UserId, broker);
-        if (client is null ||
-            client.Lifecycle is not (SessionLifecycleState.Connected or SessionLifecycleState.Reconnected))
+        var client = ResolveLiveClient(_currentUser.UserId, broker);
+        if (client is not null)
+            return client;
+
+        // The account is already linked. Bring its socket back instead of telling the
+        // user to connect again. A second handshake is still refused while one is live.
+        if (link is not null && link.Status == BinollaLinkStatus.Connected)
         {
+            await _restorer.EnsureUserLiveAsync(_currentUser.UserId, ct, waitForRestore: true)
+                .ConfigureAwait(false);
+            client = ResolveLiveClient(_currentUser.UserId, broker);
+            if (client is not null)
+                return client;
+
+            _restorer.EnsureBackgroundRestore(_currentUser.UserId);
             throw new ApiException(
-                ApiErrorCodes.BinollaNotConnected, $"Connect {broker} before continuing.", 409);
+                ApiErrorCodes.BrokerReconnecting, "Reconnecting to the broker.", 409);
         }
 
-        return client;
+        throw new ApiException(
+            ApiErrorCodes.BinollaNotConnected, $"Connect {broker} before continuing.", 409);
     }
+
+    private IBrokerClient? ResolveLiveClient(Guid userId, string broker)
+    {
+        var client = _brokers.Get(userId, broker);
+        if (IsLiveClient(client))
+            return client;
+
+        return null;
+    }
+
+    private static bool IsLiveClient(IBrokerClient? client) =>
+        client is not null &&
+        client.IsTransportConnected &&
+        client.Lifecycle is SessionLifecycleState.Connected or SessionLifecycleState.Reconnected;
 
     /// <summary>
     /// Blocks the Binolla DEMO balance unless an admin has unlocked it for this user.

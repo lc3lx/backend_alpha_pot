@@ -11,13 +11,14 @@ distinguish a working order from the several ways it silently was not one.
 import asyncio
 import json
 import queue
+import time
 from types import SimpleNamespace
 
 import pytest
 
 from app.brokers.base import BrokerError
 from app.models import TradingAsset
-from app.quotex_protocol import QuotexLiveData
+from app.quotex_protocol import QuotexLiveData, get_expiration_time_quotex
 
 
 class Socket:
@@ -173,7 +174,7 @@ async def test_the_deal_id_is_found_even_when_nested(live):
 
     live.on_event("s_orders/open", {"deal": {"id": "nested-deal"}, "requestId": req})
     result = await asyncio.wait_for(task, 1)
-    assert result["deal"]["id"] == "nested-deal"
+    assert result["id"] == "nested-deal"
 
 
 async def test_placing_an_order_needs_nothing_from_the_vendor_client(live):
@@ -188,21 +189,53 @@ async def test_placing_an_order_needs_nothing_from_the_vendor_client(live):
 
 
 async def test_the_order_frame_matches_the_shape_quotex_accepts(live):
-    # The broker drops a frame it does not recognise in silence. These three fields are
-    # exactly the ones that were wrong when every order went unanswered: the option type
-    # was 3 (not a real value), the time was an absolute timestamp (not a duration), and
-    # the amount was a float.
+    # A deal is a timer: time is the duration in seconds, not the close of the
+    # candle that happens to be forming.
     task = asyncio.create_task(live.place_order("EURUSD_otc", 25.0, 60, "call", is_demo=True))
     await asyncio.sleep(0.05)
 
     frame = next(f for f in live.connection._ws.sent if "orders/open" in str(f))
     payload = json.loads(str(frame)[2:])[1]
+    settings = json.loads(str(next(f for f in live.connection._ws.sent if "settings/apply" in str(f)))[2:])[1]
 
     assert payload["optionType"] == 100
     assert payload["time"] == 60
     assert payload["amount"] == 25 and isinstance(payload["amount"], int)
     assert payload["action"] == "call"
     assert payload["isDemo"] == 1
+    assert settings["settings"]["isFastOption"] is False
+    task.cancel()
+
+
+async def test_an_otc_five_minute_setup_runs_for_five_minutes(live):
+    # Analysis is 1-minute. The deal is a 5-minute timer: 300 seconds from the
+    # click, not the remainder of the current candle.
+    task = asyncio.create_task(live.place_order("USDMXN_otc", 5000.0, 300, "put", is_demo=True))
+    await asyncio.sleep(0.05)
+
+    frame = next(f for f in live.connection._ws.sent if "orders/open" in str(f))
+    payload = json.loads(str(frame)[2:])[1]
+    settings = json.loads(str(next(f for f in live.connection._ws.sent if "settings/apply" in str(f)))[2:])[1]
+
+    assert payload["optionType"] == 100
+    assert payload["time"] == 300
+    assert payload["amount"] == 5000
+    assert payload["action"] == "put"
+    assert settings["settings"]["isFastOption"] is False
+    assert settings["settings"]["timePeriod"] == 300
+    task.cancel()
+
+
+async def test_a_five_minute_setup_runs_for_five_minutes(live):
+    task = asyncio.create_task(live.place_order("EURUSD", 25.0, 300, "call", is_demo=True))
+    await asyncio.sleep(0.05)
+
+    frame = next(f for f in live.connection._ws.sent if "orders/open" in str(f))
+    payload = json.loads(str(frame)[2:])[1]
+    settings = json.loads(str(next(f for f in live.connection._ws.sent if "settings/apply" in str(f)))[2:])[1]
+    assert payload["optionType"] == 100
+    assert payload["time"] == 300
+    assert settings["settings"]["isFastOption"] is False
     task.cancel()
 
 

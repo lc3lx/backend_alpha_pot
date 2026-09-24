@@ -170,9 +170,24 @@ publish_api() {
   ok "Publish done"
 }
 
+wait_for_gateway() {
+  local url="${BROKER_GATEWAY_URL:-http://127.0.0.1:8100}/health"
+  local i
+  for i in $(seq 1 20); do
+    if curl -fsS "$url" >/dev/null 2>&1; then
+      ok "Broker gateway ready → $url"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "WARN: broker gateway not ready at $url — API will attach sessions when it comes up"
+}
+
 pm2_start_or_restart() {
   ensure_pm2
   mkdir -p "$LOG_DIR"
+
+  wait_for_gateway
 
   info "Stopping previous $APP_NAME and freeing port ${BACKEND_PORT}"
   pm2 delete "$APP_NAME" >/dev/null 2>&1 || true

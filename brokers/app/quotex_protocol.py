@@ -20,8 +20,9 @@ from uuid import uuid4
 from app.brokers.base import AuthError, BrokerError, NotConnected
 from app.models import AccountType, Balance, TradingAsset
 
-#: Frame-level tracing.
-TRACE_FRAMES = True
+#: Frame-level tracing. Must stay off in production: 40+ quote feeds with flush=True
+#: stall the receive loop, so order acks sit unparsed until the 12s waiter gives up.
+TRACE_FRAMES = os.environ.get("QUOTEX_TRACE_FRAMES", "").strip().lower() in {"1", "true", "yes"}
 
 #: How long a delivered instrument list is reused before another is requested. The list
 #: is also pushed unprompted, so this is an upper bound on staleness, not a poll rate.
@@ -30,6 +31,7 @@ ASSET_TTL_SECONDS = 60.0
 #: Balance is pushed by the broker on every change. This bounds how stale a *served*
 #: value can be before a refresh is started — the refresh never blocks the caller.
 BALANCE_TTL_SECONDS = 10.0
+BALANCE_MAX_AGE_SECONDS = 30.0
 
 
 class SocketIOPackets:
@@ -246,6 +248,7 @@ class QuotexLiveData:
         self.assets_at = 0.0
         self.balances = None
         self.balance_at = 0.0
+        self._balance_times = {}
         self.assets_ready = asyncio.Event()
         self.balance_ready = asyncio.Event()
         self.auth_ready = asyncio.Event()
@@ -275,6 +278,7 @@ class QuotexLiveData:
         self.closed_orders: dict[str, dict] = {}
         self._order_seq = 0
         self._refresh_tasks: set[asyncio.Task] = set()
+        self._refresh_by_kind: dict[str, asyncio.Task] = {}
         # The last few things the broker said, excluding the quote flood. An order that is
         # never acknowledged says nothing about WHY on its own, and reproducing it costs
         # the customer a real entry — so the answer is collected before it is needed.
@@ -292,12 +296,37 @@ class QuotexLiveData:
         ws = getattr(self.connection, "_ws", None)
         if ws is None or not ws.is_connected():
             return False
-        if not getattr(self, "_is_running", False):
-            return False
-        return True
+        return bool(getattr(self, "_is_running", False))
+
+    def seconds_silent(self) -> float:
+        return time.monotonic() - getattr(self, "last_recv_time", 0.0)
+
+    def is_receiving(self, max_silent: float = 45.0) -> bool:
+        """Whether ticks (or pongs) have arrived recently.
+
+        Transport liveness is TCP. Chart freshness is this. Mixing them made
+        keep-alive tear down a healthy socket whenever the feed paused, and the
+        UI then said Connect quotex before continuing.
+        """
+        return self.is_alive() and self.seconds_silent() < max_silent
 
     async def _ignore_callback(self, message):
         pass
+
+    async def close(self):
+        """Release only this session's socket and tasks, including failed handshakes."""
+        self._is_running = False
+        tasks = list(self._refresh_tasks)
+        receiver = getattr(self.connection, "_receive_task", None)
+        if receiver is not None and receiver is not asyncio.current_task():
+            tasks.append(receiver)
+        for task in tasks:
+            task.cancel()
+        ws = getattr(self.connection, "_ws", None)
+        if ws is not None:
+            await asyncio.to_thread(ws.close)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def send_raw(self, message):
         ws = self.connection._ws
@@ -333,6 +362,11 @@ class QuotexLiveData:
     async def receive(self):
         ws = self.connection._ws
         self._is_running = True
+        async def heartbeat():
+            while self._is_running:
+                await asyncio.sleep(5)
+                await self.send_event("tick")
+        heartbeat_task = asyncio.create_task(heartbeat())
         try:
             while ws is not None and ws.is_connected():
                 message = await asyncio.to_thread(ws.recv, 0.5)
@@ -344,7 +378,11 @@ class QuotexLiveData:
                     continue
                 if TRACE_FRAMES and not (
                     isinstance(message, str)
-                    and (message.startswith('42["quotes') or message.startswith("b4"))
+                    and (
+                        message.startswith('42["quotes')
+                        or message.startswith("451-[\"quotes")
+                        or message.startswith("b4")
+                    )
                 ):
                     text = message if isinstance(message, str) else repr(message)
                     print(f"[LIVE RECV] {text[:200]}", flush=True)
@@ -358,7 +396,7 @@ class QuotexLiveData:
                     if parsed is None:
                         continue
                     event, data = parsed
-                    if TRACE_FRAMES and event != "quotes":
+                    if TRACE_FRAMES and event not in {"quotes", "quotes/stream", "depth/change"}:
                         print(f"[LIVE PARSED] event={event} data={str(data)[:200]}", flush=True)
                     self.on_event(event, data)
                     await self.connection._route_socketio_event(event, data)
@@ -367,6 +405,8 @@ class QuotexLiveData:
                     continue
         finally:
             self._is_running = False
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
 
     def on_event(self, event, data):
         if event != "quotes":
@@ -387,8 +427,12 @@ class QuotexLiveData:
         if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict):
             data = data[0]
         if isinstance(data, dict):
-            cur_real, cur_demo = self.balances if self.balances is not None else (0.0, 10000.0)
+            cur_real, cur_demo = self.balances if self.balances is not None else (None, None)
             has_update = False
+            now = time.monotonic()
+            if self.balances is not None and not self._balance_times:
+                self._balance_times = {AccountType.REAL: self.balance_at or now,
+                                       AccountType.DEMO: self.balance_at or now}
 
             # Format 1: Quotex dynamic balance push from trades/orders
             # e.g. event="s_balance", data={'uid': ..., 'isDemo': 1/0, 'balance': 2699.52}
@@ -400,8 +444,10 @@ class QuotexLiveData:
                     if math.isfinite(b_val):
                         if is_demo:
                             cur_demo = b_val
+                            self._balance_times[AccountType.DEMO] = now
                         else:
                             cur_real = b_val
+                            self._balance_times[AccountType.REAL] = now
                         has_update = True
                 except (ValueError, TypeError):
                     pass
@@ -414,6 +460,7 @@ class QuotexLiveData:
                     live_val = float(live)
                     if math.isfinite(live_val):
                         cur_real = live_val
+                        self._balance_times[AccountType.REAL] = now
                         has_update = True
                 except (ValueError, TypeError):
                     pass
@@ -422,14 +469,17 @@ class QuotexLiveData:
                     demo_val = float(demo)
                     if math.isfinite(demo_val):
                         cur_demo = demo_val
+                        self._balance_times[AccountType.DEMO] = now
                         has_update = True
                 except (ValueError, TypeError):
                     pass
 
-            if has_update and math.isfinite(cur_real) and math.isfinite(cur_demo):
+            if has_update:
                 self.balances = (cur_real, cur_demo)
-                self.balance_at = time.monotonic()
+                self.balance_at = now
                 self.balance_ready.set()
+                if self.auth_error is None:
+                    self.auth_ready.set()
 
         if event == "instruments/list":
             if not self.auth_ready.is_set():
@@ -690,28 +740,29 @@ class QuotexLiveData:
         await self.send_event("authorization", {"session": ssid,
             "isDemo": int(account_type is AccountType.DEMO), "tournamentId": 0})
         try:
-            await asyncio.wait_for(self.auth_ready.wait(), 3)
+            await asyncio.wait_for(self.auth_ready.wait(), 15)
         except asyncio.TimeoutError as exc:
             if self.auth_error:
                 raise self.auth_error
-            # A fresh token answers with instruments/list, then (if it is dead) with
-            # authorization/reject a moment later. Waiting the full 15s and disconnecting
-            # is what turned a captured session into HTTP 409.
-            if self._instruments_during_auth:
-                await asyncio.sleep(1.2)
-                if self.auth_error:
-                    raise self.auth_error
-                self.auth_ready.set()
-            else:
-                try:
-                    await asyncio.wait_for(self.auth_ready.wait(), 12)
-                except asyncio.TimeoutError:
-                    if self._instruments_during_auth and self.auth_error is None:
-                        self.auth_ready.set()
-                    else:
-                        raise AuthError("Quotex authorization timed out. Sign in again.") from exc
+            # Quotes and instruments can arrive before account authorization.
+            # They cannot prove that private balances or orders are accessible.
+            raise AuthError("Quotex authorization timed out. Sign in again.") from exc
         if self.auth_error:
             raise self.auth_error
+
+    def balance_age(self):
+        # Keep balance_at as the last event marker used to detect order activity.
+        # Serving balances also requires the inactive account to be current.
+        oldest = min([self.balance_at, *self._balance_times.values()])
+        return time.monotonic() - oldest
+
+    def balance_is_current(self):
+        # Quotex pushes changes; an idle account does not emit an unchanged
+        # balance on a timer. A continuous authenticated stream keeps its last
+        # balance valid, while a silent/disconnected stream cannot do so.
+        return (self.balances is not None and None not in self.balances
+                and (self.balance_age() < BALANCE_MAX_AGE_SECONDS
+                     or (self.auth_ready.is_set() and self.is_receiving())))
 
     async def get_balance(self, account_type):
         self.require_connected()
@@ -721,22 +772,22 @@ class QuotexLiveData:
         # between this endpoint answering instantly and it costing the caller seconds —
         # and this endpoint is polled by every open page AND checked before every trade,
         # where the wait was turning a healthy account into "unable to verify balance".
-        if self.balances is not None:
-            if time.monotonic() - self.balance_at >= BALANCE_TTL_SECONDS:
+        if self.balance_is_current():
+            if self.balance_age() >= BALANCE_TTL_SECONDS:
                 self._refresh_in_background(self._request_balance())
             real, demo = self.balances
             return Balance(real=real, demo=demo, current_type=account_type)
 
         async with self.balance_lock:
-            if self.balances is None:
+            if not self.balance_is_current():
                 self.balance_ready.clear()
                 try:
                     await self.send_event("s_balance/list", {"_placeholder": True, "num": 0})
-                    await asyncio.wait_for(self.balance_ready.wait(), 2.5)
+                    await asyncio.wait_for(self.balance_ready.wait(), 2.0)
                 except (asyncio.TimeoutError, Exception):
                     pass
-            if self.balances is None:
-                raise NotConnected("Quotex did not deliver live balance.")
+            if not self.balance_is_current():
+                raise NotConnected("Quotex did not deliver a current live balance.")
             real, demo = self.balances
             return Balance(real=real, demo=demo, current_type=account_type)
 
@@ -774,6 +825,12 @@ class QuotexLiveData:
         A caller with a usable stored value gets it now; the next caller gets the newer
         one. A failure here is not the caller's problem and must not surface as theirs.
         """
+        kind = coro.cr_code.co_name
+        previous = self._refresh_by_kind.get(kind)
+        if previous is not None and not previous.done():
+            coro.close()
+            return
+
         async def guarded():
             try:
                 await coro
@@ -786,6 +843,7 @@ class QuotexLiveData:
             coro.close()
             return
         self._refresh_tasks.add(task)
+        self._refresh_by_kind[kind] = task
         task.add_done_callback(self._refresh_tasks.discard)
 
     async def _request_assets(self):
@@ -817,6 +875,27 @@ class QuotexLiveData:
             ev = self._history_waiters.get(key)
             if ev is not None and not ev.is_set():
                 ev.set()
+
+    async def load_older_history(self, asset: str, period: int, end_ts: int) -> None:
+        """Ask for the window that ends at the oldest bar we already have.
+
+        This is history/load only. It does not follow depth or replace the live stream,
+        so a short series can grow to the backtest window without another handshake.
+        """
+        ws = getattr(self.connection, "_ws", None)
+        if ws is None or not getattr(ws, "is_connected", lambda: False)():
+            return
+        formatted = asset if str(asset).endswith("_otc") else f"{asset}_otc"
+        offset = max(int(period) * 720, 14400)
+        end = int(end_ts)
+        self._last_history_request = (formatted, int(period))
+        await self.send_event("history/load", {
+            "asset": formatted,
+            "index": int(time.time() * 100),
+            "time": end,
+            "offset": offset,
+            "period": int(period),
+        })
 
     async def subscribe(self, asset, period):
         key = (asset, period)
@@ -914,7 +993,7 @@ class QuotexLiveData:
 
         # Ensure chart subscription & depth stream are active for this asset
         try:
-            await self.send_event("instruments/update", {"asset": clean_asset, "period": int(duration_seconds)})
+            await self.send_event("instruments/update", {"asset": clean_asset, "period": 60})
             await self.send_event("chart_notification/get", {"asset": clean_asset, "version": "1.0.0"})
             await self.send_event("depth/follow", clean_asset)
         except Exception as e:
@@ -930,7 +1009,14 @@ class QuotexLiveData:
         self._pending_orders.append(entry)
 
         now_ts = int(time.time())
-        exp_time = get_expiration_time_quotex(now_ts, int(duration_seconds))
+        duration = max(1, int(duration_seconds))
+        # Quotex sells two products. optionType 1 expires at the close of the
+        # current candle, so a click mid-candle dies with that candle. The timer
+        # (optionType 100, time = seconds from now) runs the whole duration:
+        # a 5-minute deal is 300 seconds from the click.
+        option_type = 100
+        order_time = duration
+        exp_time = now_ts + duration
 
         settings_payload = {
             "chartId": "graph",
@@ -938,7 +1024,7 @@ class QuotexLiveData:
                 "chartId": "graph",
                 "chartType": 2,
                 "currentExpirationTime": exp_time,
-                "isFastOption": True,
+                "isFastOption": False,
                 "isFastAmountOption": False,
                 "isIndicatorsMinimized": False,
                 "isIndicatorsShowing": True,
@@ -948,7 +1034,7 @@ class QuotexLiveData:
                 "dealValue": amount_int,
                 "dealPercentValue": 1,
                 "isVisible": True,
-                "timePeriod": int(duration_seconds),
+                "timePeriod": duration,
                 "gridOpacity": 8,
                 "isAutoScrolling": 1,
                 "isOneClickTrade": True,
@@ -961,12 +1047,12 @@ class QuotexLiveData:
         order_payload = {
             "asset": clean_asset,
             "amount": amount_int,
-            "time": int(duration_seconds),
+            "time": int(order_time),
             "action": direction.lower(),
             "isDemo": 1 if is_demo else 0,
             "tournamentId": 0,
             "requestId": req_id,
-            "optionType": 100,
+            "optionType": option_type,
         }
 
         sent_at = time.time()
@@ -1011,5 +1097,6 @@ class QuotexLiveData:
             raise BrokerError(str(msg))
         # The resolver guarantees an id — the broker's own when it sent one, the request id
         # as a fallback — so a confirmed order is never rejected here for a thin ack.
+        response["_scar_duration"] = duration
         return response
 

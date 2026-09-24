@@ -77,11 +77,11 @@ public sealed class Phase9SessionRestoreTests : IClassFixture<ApiFactory>
     }
 
     [Fact]
-    public async Task Restore_skips_pending_users()
+    public async Task Restore_reconnects_pending_connected_users()
     {
         var pendingToken = await LoginAsync(9301);
         await ConnectAsync(pendingToken, "42[\"authorization\",{\"token\":\"pending-ssid\"}]");
-        // not approved
+        // pending approval still has a live SSID — restore it so market data is warm
 
         var approvedToken = await LoginAsync(9302);
         await ConnectAsync(approvedToken, "42[\"authorization\",{\"token\":\"approved-ssid\"}]");
@@ -91,7 +91,7 @@ public sealed class Phase9SessionRestoreTests : IClassFixture<ApiFactory>
         var restorer = _factory.Services.GetRequiredService<IBinollaSessionRestorer>();
         await restorer.RestoreApprovedSessionsAsync();
 
-        _factory.ConnectedUsers.Should().NotContainKey(await UserIdAsync(pendingToken));
+        _factory.ConnectedUsers.Should().ContainKey(await UserIdAsync(pendingToken));
         _factory.ConnectedUsers.Should().ContainKey(await UserIdAsync(approvedToken));
     }
 

@@ -100,6 +100,27 @@ def test_health_lists_brokers(client):
     assert "quotex" in body["brokers"]
 
 
+def test_quotex_accounts_connect_and_disconnect_independently(client, monkeypatch):
+    class IsolatedQuotex(FakeBroker):
+        broker = 'quotex'
+
+        async def get_balance(self):
+            return Balance(real=11 if self.user_id == 'first' else 22,
+                           demo=0, current_type=self.account_type)
+
+    monkeypatch.setitem(main.ADAPTERS, 'quotex', IsolatedQuotex)
+    for uid in ('first', 'second'):
+        response = client.post('/sessions/connect', json={
+            'user_id': uid, 'broker': 'quotex', 'ssid': uid, 'account_type': 'Real'})
+        assert response.status_code == 200
+    for uid, amount in [('first', 11), ('second', 22)]:
+        response = client.get('/account/balance', params={'user_id': uid, 'broker': 'quotex'})
+        assert response.json()['real'] == amount
+    client.post('/sessions/disconnect', params={'user_id': 'second', 'broker': 'quotex'})
+    first = client.get('/sessions/status', params={'user_id': 'first', 'broker': 'quotex'})
+    assert first.json()['transport_connected'] is True
+
+
 def test_connect_then_read_market_data(client):
     assert _connect(client).status_code == 200
 
@@ -116,9 +137,91 @@ def test_market_calls_need_a_session(client):
     assert res.status_code == 409
 
 
+def test_second_user_does_not_inherit_another_accounts_balance(client):
+    assert _connect(client).status_code == 200
+    candles = client.get("/market/candles", params={"user_id": "u2", "broker": "fake", "asset": "EURUSD"})
+    assert candles.status_code == 200
+    balance = client.get("/account/balance", params={"user_id": "u2", "broker": "fake"})
+    assert balance.status_code == 409
+    status = client.get("/sessions/status", params={"user_id": "u2", "broker": "fake"})
+    assert status.status_code == 409
+
+
+class FakeQuotex(FakeBroker):
+    broker = "quotex"
+
+
+def test_second_quotex_login_does_not_steal_the_live_socket(client):
+    previous = main.ADAPTERS.get("quotex")
+    main.ADAPTERS["quotex"] = FakeQuotex
+    try:
+        first = client.post(
+            "/sessions/connect",
+            json={"user_id": "u1", "broker": "quotex", "ssid": "s", "account_type": "Real"},
+        )
+        assert first.status_code == 200
+        second = client.post(
+            "/sessions/connect",
+            json={"user_id": "u2", "broker": "quotex", "ssid": "s2", "account_type": "Real"},
+        )
+        assert second.status_code == 200
+        assert client.get("/sessions/status", params={"user_id": "u1", "broker": "quotex"}).status_code == 200
+        assert client.get("/account/balance", params={"user_id": "u1", "broker": "quotex"}).json()["real"] == 250.0
+        assert client.get("/account/balance", params={"user_id": "u2", "broker": "quotex"}).status_code == 200
+    finally:
+        if previous is None:
+            main.ADAPTERS.pop("quotex", None)
+        else:
+            main.ADAPTERS["quotex"] = previous
+        main.registry._sessions.clear()
+
+
 def test_unknown_broker_is_rejected(client):
     res = client.post("/sessions/connect", json={"user_id": "u1", "broker": "nope"})
     assert res.status_code == 400
+
+
+def test_missing_credentials_does_not_leave_a_login_in_flight(client):
+    res = client.post('/sessions/connect', json={'user_id': 'u1', 'broker': 'fake'})
+    assert res.status_code == 409
+    assert not main.registry.throttle('fake').is_connecting('u1')
+    assert _connect(client).status_code == 200
+
+
+async def test_twenty_users_keep_distinct_balances_during_concurrent_reads(monkeypatch):
+    import asyncio
+    import httpx
+    import time
+
+    class IsolatedBroker(FakeBroker):
+        async def get_balance(self):
+            await asyncio.sleep(0.001)
+            return Balance(real=float(self.user_id[1:]), demo=1000, current_type=self.account_type)
+
+    monkeypatch.setitem(main.ADAPTERS, 'fake', IsolatedBroker)
+    # Other synchronous tests create different event loops.
+    monkeypatch.setattr(main, '_handshake_locks', {})
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url='http://test') as http:
+        connected = await asyncio.gather(*(http.post('/sessions/connect', json={
+            'user_id': f'u{i}', 'broker': 'fake', 'ssid': f's{i}'}) for i in range(20)))
+        assert all(r.status_code == 200 for r in connected)
+        latencies = []
+
+        async def reader(i):
+            for _ in range(100):
+                start = time.perf_counter()
+                r = await http.get('/account/balance', params={'user_id': f'u{i}', 'broker': 'fake'})
+                latencies.append(time.perf_counter() - start)
+                assert r.status_code == 200
+                assert r.json()['real'] == i
+
+        await asyncio.gather(*(reader(i) for i in range(20)))
+        await http.post('/sessions/disconnect', params={'user_id': 'u0', 'broker': 'fake'})
+        remaining = await asyncio.gather(*(http.get('/account/balance', params={
+            'user_id': f'u{i}', 'broker': 'fake'}) for i in range(1, 20)))
+        assert all(r.status_code == 200 and r.json()['real'] == i
+                   for i, r in enumerate(remaining, 1))
+        print(f'20 simulated accounts, 2000 balance reads, p95={sorted(latencies)[1899]*1000:.1f}ms')
 
 
 def test_captcha_maps_to_its_own_status(client):
@@ -170,21 +273,21 @@ def test_connecting_again_with_the_same_session_reuses_the_socket(client):
     assert FakeBroker.connects == 1
 
 
-def test_a_newly_captured_session_replaces_a_live_one(client):
-    """
-    The rule the whole browser capture depends on.
+@pytest.mark.parametrize('disconnected', [False, True])
+def test_new_credentials_reconnect_a_dead_session_but_preserve_a_live_one(client, disconnected):
+    """Live authenticated sessions stay up; dead sessions use the new credentials.
 
-    A Quotex session opened from a password reports itself connected and then answers
-    every poll with "Session ID unknown", because Cloudflare refused its socket upgrade.
-    Reusing it because it "looks live" meant a freshly captured SSID was thrown away and
-    the account stayed on the dead session — no candles, no balance, five assets.
+    Quotex protocol tests separately require private authorization before reporting
+    a transport as usable; public market frames alone are insufficient.
     """
     FakeBroker.connects = 0
     assert _connect(client).status_code == 200
+    if disconnected:
+        main.registry.get('u1', 'fake').lifecycle = LifecycleState.DISCONNECTED
 
     replaced = client.post(
         "/sessions/connect",
         json={"user_id": "u1", "broker": "fake", "ssid": "captured-in-a-browser", "account_type": "Real"},
     )
     assert replaced.status_code == 200
-    assert FakeBroker.connects == 2
+    assert FakeBroker.connects == (2 if disconnected else 1)

@@ -150,6 +150,23 @@ public sealed class BotFanOutTests
     }
 
     [Fact]
+    public void A_second_hold_on_the_same_user_is_refused_until_the_first_ends()
+    {
+        var user = Guid.NewGuid();
+        OpenTradeGate.ReleaseUser(user);
+        try
+        {
+            OpenTradeGate.TryHold(user, 300).Should().BeTrue();
+            OpenTradeGate.TryHold(user, 300).Should().BeFalse();
+            OpenTradeGate.IsUserHeld(user).Should().BeTrue();
+        }
+        finally
+        {
+            OpenTradeGate.ReleaseUser(user);
+        }
+    }
+
+    [Fact]
     public void Releasing_one_user_leaves_the_others_held()
     {
         var a = Guid.NewGuid();

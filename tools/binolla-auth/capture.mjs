@@ -16,7 +16,50 @@
  * IMPORTANT: API/storage session tokens are NOT the live trading Socket.IO token.
  * Prefer wsToken from 42["authorization",{"token":"..."}] over apiToken.
  */
+import fs from 'fs';
 import { chromium } from 'playwright';
+
+const captureLockPath = '/tmp/scar-qx-capture.lock';
+let captureLockHeld = false;
+
+function releaseCaptureLock() {
+  if (!captureLockHeld) return;
+  captureLockHeld = false;
+  try { fs.unlinkSync(captureLockPath); } catch { /* already gone */ }
+}
+
+async function acquireCaptureLock() {
+  const deadline = Date.now() + 90_000;
+  while (Date.now() < deadline) {
+    try {
+      const fd = fs.openSync(captureLockPath, 'wx');
+      fs.writeSync(fd, String(process.pid));
+      fs.closeSync(fd);
+      captureLockHeld = true;
+      return;
+    } catch {
+      let alive = false;
+      try {
+        const pid = Number(fs.readFileSync(captureLockPath, 'utf8'));
+        if (pid > 0) {
+          process.kill(pid, 0);
+          alive = true;
+        }
+      } catch {
+        alive = false;
+      }
+      if (!alive) {
+        try { fs.unlinkSync(captureLockPath); } catch { /* raced */ }
+        continue;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    }
+  }
+  process.stdout.write(JSON.stringify({ ok: false, error: 'another server login is still running' }));
+  process.exit(1);
+}
+
+process.on('exit', releaseCaptureLock);
 
 // Token recognition and proxy parsing are shared with interactive-server.mjs so both
 // login paths accept exactly the same sessions.
@@ -324,6 +367,7 @@ async function tryInPageAuthApi(page, { isSignup, email, password, lid, paths })
  */
 
 async function main() {
+  await acquireCaptureLock();
   const mode = arg('mode', 'login');
   const email = arg('email') || process.env.BINOLLA_AUTH_EMAIL || '';
   const password = arg('password') || process.env.BINOLLA_AUTH_PASSWORD || '';

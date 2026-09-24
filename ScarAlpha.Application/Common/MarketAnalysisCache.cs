@@ -94,6 +94,26 @@ public sealed class MarketAnalysisCache
         return IsFresh(entry.Value, expected) ? entry.Value : null;
     }
 
+    /// <summary>
+    /// Analyses still usable for the live board: this bar, or the previous one while
+    /// the worker is recomputing the new close.
+    /// </summary>
+    public IReadOnlyList<MarketAnalysis> ListRecent(string broker, int timeframeSeconds, DateTimeOffset now)
+    {
+        var prefix = broker.Trim().ToLowerInvariant() + ":";
+        var list = new List<MarketAnalysis>();
+        foreach (var (key, entry) in _entries)
+        {
+            if (!key.StartsWith(prefix, StringComparison.Ordinal)) continue;
+            var value = entry.Value;
+            if (value is null || value.TimeframeSeconds != timeframeSeconds) continue;
+            var ageBars = (now - value.ClosedBarTime).TotalSeconds / timeframeSeconds;
+            if (ageBars < 0 || ageBars > 2) continue;
+            list.Add(value);
+        }
+        return list;
+    }
+
     private static bool IsFresh(MarketAnalysis? value, DateTimeOffset expectedBar) =>
         value is not null && value.ClosedBarTime == expectedBar;
 
