@@ -253,10 +253,13 @@ class QuotexLiveData:
         self.balance_ready = asyncio.Event()
         self.auth_ready = asyncio.Event()
         self.auth_error = None
+        # Lock ensuring only one history/load is in-flight at a time
+        self._history_lock = asyncio.Lock()
+        # The actively awaited history/load request: (formatted_asset, period, waiter_event)
+        self._current_history_request: tuple[str, int, asyncio.Event] | None = None
         # Waiters for history/load so the chart can draw closed bars before live ticks.
         self._history_waiters: dict[tuple[str, int], asyncio.Event] = {}
-        # Last history/load we sent, used when the broker replies with a bare candle
-        # list and no asset name.
+        # Last history/load request (kept for backward compatibility and test fallback)
         self._last_history_request: tuple[str, int] | None = None
         # Set when instruments/list arrives while authenticate() is waiting. Fresh
         # captures often never get s_authorization on this transport; they get the
@@ -274,6 +277,12 @@ class QuotexLiveData:
         # here rather than through the vendor's pub/sub: this object already sees every
         # frame, and depending on the vendor meant an order could fail on an attribute.
         self._pending_orders: list[tuple[int, str, asyncio.Future]] = []
+        # `settings/apply` sets the chart's asset and expiry, and Quotex validates the
+        # `orders/open` that follows against it. Two orders placed in the same instant
+        # would otherwise interleave — A's settings, B's settings, A's open — and A would
+        # be judged against B's expiry. The lock covers only the send, never the wait, so
+        # orders still overlap on the wire.
+        self._order_send_lock = asyncio.Lock()
         # order id -> settlement payload, for outcomes of orders the vendor never saw.
         self.closed_orders: dict[str, dict] = {}
         self._order_seq = 0
@@ -282,7 +291,10 @@ class QuotexLiveData:
         # The last few things the broker said, excluding the quote flood. An order that is
         # never acknowledged says nothing about WHY on its own, and reproducing it costs
         # the customer a real entry — so the answer is collected before it is needed.
-        self._recent_events: deque[tuple[float, str, str]] = deque(maxlen=40)
+        # 200 rather than 40: with several orders in flight the buffer is the only record
+        # of which of them the broker answered, and forty frames is about a second of
+        # traffic once more than one order is pending.
+        self._recent_events: deque[tuple[float, str, str]] = deque(maxlen=200)
         self.last_recv_time = time.monotonic()
         self._is_running = True
         # The vendor delivers each packet through BOTH callback and recv(). Use only
@@ -519,14 +531,8 @@ class QuotexLiveData:
                     tick = {"time": ts, "price": price}
                     self.market.apply_quote(symbol, tick)
                     for asset, period in list(self.periods):
-                        if (
-                            asset == symbol
-                            or (symbol.endswith("_otc") and asset == symbol[:-4])
-                            or (not symbol.endswith("_otc") and f"{symbol}_otc" == asset)
-                        ):
+                        if asset == symbol:
                             self.market.apply_candle(asset, period, tick)
-                            counterpart = symbol[:-4] if symbol.endswith("_otc") else f"{symbol}_otc"
-                            self.market.apply_candle(counterpart, period, tick)
                 except (ValueError, TypeError):
                     continue
 
@@ -552,12 +558,17 @@ class QuotexLiveData:
             )
             if not raw_candles and isinstance(data, list):
                 raw_candles = data
-            pending = self._last_history_request
-            if pending:
-                if not asset_name:
-                    asset_name = pending[0]
-                if not period:
-                    period = pending[1]
+            # If no asset name is in the frame (Quotex bare candle list):
+            if not asset_name:
+                if self._current_history_request is not None:
+                    asset_name = self._current_history_request[0]
+                    if not period:
+                        period = self._current_history_request[1]
+                elif self._last_history_request is not None:
+                    asset_name = self._last_history_request[0]
+                    if not period:
+                        period = self._last_history_request[1]
+
             if not period:
                 period = 60
             if asset_name and isinstance(raw_candles, list) and raw_candles:
@@ -568,16 +579,30 @@ class QuotexLiveData:
                         applied = int(result or 0)
                     except (TypeError, ValueError):
                         applied = len(normalized)
-                    if asset_name.endswith("_otc"):
-                        self.market.apply_candles(asset_name[:-4], period, normalized)
-                    else:
-                        self.market.apply_candles(f"{asset_name}_otc", period, normalized)
                     print(
                         f"[quotex] history event={event} asset={asset_name} "
                         f"period={period} rows={len(normalized)} applied={applied}",
                         flush=True,
                     )
                     self._signal_history(asset_name, period)
+                    # Resolve active history request waiter and clear pending request
+                    if self._current_history_request is not None:
+                        curr_asset, curr_period, curr_event = self._current_history_request
+                        if (
+                            curr_asset == asset_name
+                            or (asset_name.endswith("_otc") and curr_asset == asset_name[:-4])
+                            or (not asset_name.endswith("_otc") and f"{asset_name}_otc" == curr_asset)
+                        ):
+                            if not curr_event.is_set():
+                                curr_event.set()
+                            self._current_history_request = None
+                    self._last_history_request = None
+            elif not asset_name:
+                print(
+                    f"[quotex] history ignored event={event}: unprompted bare candles with no pending request "
+                    f"rows={len(raw_candles) if isinstance(raw_candles, list) else 0}",
+                    flush=True,
+                )
             elif TRACE_FRAMES:
                 kind = type(data).__name__
                 keys = list(payload_dict)[:8] if payload_dict else []
@@ -695,9 +720,12 @@ class QuotexLiveData:
                 if row_asset == entry[1]:
                     return hand_to(entry)
 
-        # A definitive ack with neither — orders go out one at a time, so the oldest
-        # waiter is the one this answers.
-        if definitive or rejected:
+        # A definitive ack naming neither a request id nor an instrument. With a single
+        # waiter it can only be answering that one. With several in flight it is a guess,
+        # and a wrong guess is worse than none: the caller would be handed another
+        # order's id and would then track the wrong trade's outcome. Leave it unmatched
+        # and let the order resend or fail with a diagnostic instead.
+        if (definitive or rejected) and len(self._pending_orders) == 1:
             return hand_to(self._pending_orders[0])
 
     async def wait_outcome(self, order_id, timeout_seconds):
@@ -888,22 +916,33 @@ class QuotexLiveData:
         formatted = asset if str(asset).endswith("_otc") else f"{asset}_otc"
         offset = max(int(period) * 720, 14400)
         end = int(end_ts)
-        self._last_history_request = (formatted, int(period))
-        await self.send_event("history/load", {
-            "asset": formatted,
-            "index": int(time.time() * 100),
-            "time": end,
-            "offset": offset,
-            "period": int(period),
-        })
+        waiter = asyncio.Event()
+        self._history_waiters[(formatted, int(period))] = waiter
+        try:
+            async with self._history_lock:
+                self._current_history_request = (formatted, int(period), waiter)
+                self._last_history_request = (formatted, int(period))
+                try:
+                    await self.send_event("history/load", {
+                        "asset": formatted,
+                        "index": int(time.time() * 100),
+                        "time": end,
+                        "offset": offset,
+                        "period": int(period),
+                    })
+                    await asyncio.wait_for(waiter.wait(), 4.0)
+                except asyncio.TimeoutError:
+                    pass
+                finally:
+                    if self._current_history_request and self._current_history_request[0] == formatted:
+                        self._current_history_request = None
+        finally:
+            self._history_waiters.pop((formatted, int(period)), None)
 
     async def subscribe(self, asset, period):
         key = (asset, period)
         self.periods.add(key)
-        formatted = asset if asset.endswith("_otc") else f"{asset}_otc"
-        self.periods.add((formatted, period))
-        if asset.endswith("_otc"):
-            self.periods.add((asset[:-4], period))
+        formatted = asset
         try:
             ws = getattr(self.connection, "_ws", None)
             if ws is None or not getattr(ws, "is_connected", lambda: False)():
@@ -924,24 +963,18 @@ class QuotexLiveData:
             }
             waiter = asyncio.Event()
             self._history_waiters[(formatted, period)] = waiter
-            self._last_history_request = (formatted, period)
             try:
-                await self.send_event("history/load", hist_payload)
-                if formatted != asset:
+                async with self._history_lock:
+                    self._current_history_request = (formatted, period, waiter)
+                    self._last_history_request = (formatted, period)
                     try:
-                        await self.send_event("history/load", {
-                            "asset": asset,
-                            "index": browser_index,
-                            "time": now_sec,
-                            "offset": offset,
-                            "period": period,
-                        })
-                    except Exception:
+                        await self.send_event("history/load", hist_payload)
+                        await asyncio.wait_for(waiter.wait(), 4.0)
+                    except asyncio.TimeoutError:
                         pass
-                try:
-                    await asyncio.wait_for(waiter.wait(), 5.0)
-                except asyncio.TimeoutError:
-                    pass
+                    finally:
+                        if self._current_history_request and self._current_history_request[0] == formatted:
+                            self._current_history_request = None
             finally:
                 self._history_waiters.pop((formatted, period), None)
 
@@ -978,6 +1011,33 @@ class QuotexLiveData:
             f"isDemo={order_payload['isDemo']}, optionType={order_payload['optionType']}, "
             f"expiry={order_payload['time']}. Heard back: {heard}."
         )
+
+    def _order_opened(self, req_id, asset, balance_before, sent_at):
+        """
+        Did THIS order open, as opposed to any order?
+
+        The distinction did not matter while orders went out one at a time, and the test
+        was simply "did the balance move or did an s_orders frame arrive". Under
+        concurrency that test is satisfied by somebody else's order: every pending order
+        then believes it opened, stops resending, and waits out an acknowledgement that
+        was never addressed to it — which is how a batch of parallel entries turned into
+        a row of bare TimeoutErrors with the account untouched.
+
+        So the evidence has to name this order: its request id or its instrument. A bare
+        balance move is accepted only when nothing else is in flight to explain it.
+        """
+        for ts, name, data in self._recent_events:
+            if ts < sent_at or not name.startswith("s_orders"):
+                continue
+            if str(req_id) in data or (asset and asset in data):
+                return True
+        if len(self._pending_orders) <= 1:
+            # Nothing else could have moved the balance, so the old global test is sound.
+            return self.balance_at != balance_before or any(
+                name == "s_balance" or name.startswith("s_orders")
+                for ts, name, _ in self._recent_events if ts >= sent_at
+            )
+        return False
 
     async def place_order(
         self, asset: str, amount: float, duration_seconds: int, direction: str, is_demo: bool
@@ -1061,13 +1121,14 @@ class QuotexLiveData:
         try:
             for attempt in range(1, max_attempts + 1):
                 balance_before = self.balance_at
-                try:
-                    await self.send_event("settings/apply", settings_payload)
-                    await self.send_raw('42["tick"]')
-                except Exception as e:
-                    print(f"[ORDER WARN] settings/apply or tick error: {e}", flush=True)
+                async with self._order_send_lock:
+                    try:
+                        await self.send_event("settings/apply", settings_payload)
+                        await self.send_raw('42["tick"]')
+                    except Exception as e:
+                        print(f"[ORDER WARN] settings/apply or tick error: {e}", flush=True)
 
-                await self.send_event("orders/open", order_payload)
+                    await self.send_event("orders/open", order_payload)
 
                 try:
                     # Shielded, so a timeout here leaves the order still pending: a late
@@ -1075,13 +1136,15 @@ class QuotexLiveData:
                     response = await asyncio.wait_for(asyncio.shield(future), per_attempt)
                     break
                 except asyncio.TimeoutError:
-                    opened = self.balance_at != balance_before or any(
-                        name == "s_balance" or name.startswith("s_orders")
-                        for ts, name, _ in self._recent_events if ts >= sent_at
-                    )
-                    if opened:
-                        # Something opened. Never resend — wait out the ack instead.
-                        response = await asyncio.wait_for(future, 8.0)
+                    if self._order_opened(req_id, clean_asset, balance_before, sent_at):
+                        # Something of OURS opened. Never resend — wait out the ack.
+                        try:
+                            response = await asyncio.wait_for(future, 8.0)
+                        except asyncio.TimeoutError:
+                            # A bare TimeoutError escaping here told the caller nothing.
+                            raise BrokerError(
+                                self._describe_silence(order_payload, sent_at)
+                            ) from None
                         break
                     if attempt >= max_attempts:
                         raise BrokerError(self._describe_silence(order_payload, sent_at))
