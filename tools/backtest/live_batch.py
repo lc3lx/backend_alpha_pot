@@ -156,11 +156,17 @@ def main():
 
     while placed < args.trades:
         bal_before, kind, err = balance(args.user_id, token)
-        if bal_before is None:
+        # A failed read and a real zero are different things, and conflating them ended a
+        # run at 443 trades with $766 still in the account: the endpoint returned nothing,
+        # it was read as $0.00, and that tripped the floor. Only a figure the broker
+        # actually reported can stop the run.
+        if bal_before is None or bal_before <= 0.0:
             errors += 1
             if errors >= 15:
-                print("too many balance failures; stopping", flush=True)
+                print("too many unusable balance reads; stopping", flush=True)
                 break
+            print(f"[{time.strftime('%H:%M:%S')}] balance unreadable "
+                  f"({err or 'returned 0'}); retrying", flush=True)
             time.sleep(25)
             continue
         errors = 0
@@ -237,6 +243,8 @@ def main():
         # Let the credits land, then reconcile the batch against the ledger.
         time.sleep(4)
         bal_after, _, _ = balance(args.user_id, token)
+        if bal_after is not None and bal_after <= 0.0:
+            bal_after = None          # unusable, not a wiped account
         batch_ledger = None if bal_after is None else bal_after - bal_before
         if batch_ledger is not None:
             ledger_total += batch_ledger
