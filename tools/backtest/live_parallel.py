@@ -176,6 +176,16 @@ def window(candle_dir, symbol, period, want=80, min_bars=40):
 # ---- rules ---------------------------------------------------------------------------
 
 
+#: Contiguous closed bars each rule needs to be computed at all. Asking for more than
+#: that costs symbols for nothing: every gateway restart leaves a gap in the candle files,
+#: and a symbol is unusable until it has recorded a clean run again — at a flat 40 bars
+#: that is forty minutes of blackout per restart, even for a rule that reads one bar.
+RULE_MIN_BARS = {
+    "rsi7": 12, "rsi7-20": 12, "rsi5": 10, "rsi14": 20,
+    "wick": 2, "body-60": 2, "body-75": 2,
+}
+
+
 def make_rule(name):
     """
     Entry rules, keyed by the name used in optimise.py so the two cannot drift apart.
@@ -346,6 +356,7 @@ def main():
         sys.exit("BROKER_GATEWAY_TOKEN not set")
 
     rule = make_rule(args.rule)
+    min_bars = RULE_MIN_BARS.get(args.rule, 40)
     hold = args.duration // args.period
 
     bal, kind, err = balance(args.user_id, token)
@@ -434,7 +445,7 @@ def main():
                 symbol = a.get("symbol")
                 if not symbol:
                     continue
-                w = window(args.candle_dir, symbol, args.period)
+                w = window(args.candle_dir, symbol, args.period, min_bars=min_bars)
                 if w is None:
                     continue
                 scanned += 1
