@@ -1060,14 +1060,6 @@ class QuotexLiveData:
         if asset_info is not None and not asset_info.is_open:
             raise BrokerError(f"Market for {clean_asset} is currently closed on Quotex.")
 
-        # Ensure chart subscription & depth stream are active for this asset
-        try:
-            await self.send_event("instruments/update", {"asset": clean_asset, "period": 60})
-            await self.send_event("chart_notification/get", {"asset": clean_asset, "version": "1.0.0"})
-            await self.send_event("depth/follow", clean_asset)
-        except Exception as e:
-            print(f"[ORDER WARN] pre-order stream subscription error: {e}", flush=True)
-
         # Milliseconds plus a counter within safe integer range.
         self._order_seq = (self._order_seq + 1) % 1000
         req_id = int(time.time() * 1000) % 10000000000 + self._order_seq
@@ -1146,6 +1138,23 @@ class QuotexLiveData:
                     await asyncio.sleep(gap)
                 self._pending_orders.append(entry)
                 sent_at = time.time()      # the queue wait is not part of the silence
+
+                # Point the chart at this instrument. This belongs inside the lock with
+                # the order it prepares: done on arrival instead, six queued orders sent
+                # eighteen subscription frames in the same instant, switching the chart
+                # six times before any order went out, and Quotex then answered only the
+                # first order and ignored the next five for a minute. Sent one group at a
+                # time, the same six orders all succeed.
+                try:
+                    await self.send_event("instruments/update",
+                                          {"asset": clean_asset, "period": 60})
+                    await self.send_event("chart_notification/get",
+                                          {"asset": clean_asset, "version": "1.0.0"})
+                    await self.send_event("depth/follow", clean_asset)
+                except Exception as e:
+                    print(f"[ORDER WARN] pre-order stream subscription error: {e}",
+                          flush=True)
+
                 for attempt in range(1, max_attempts + 1):
                     balance_before = self.balance_at
                     try:
