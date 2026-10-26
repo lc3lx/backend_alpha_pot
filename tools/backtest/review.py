@@ -69,6 +69,7 @@ def load_live(path):
             "rule": r.get("rule"),
             "duration": int(r.get("duration") or 0),
             "entry_lag": r.get("entry_lag"),
+            "bars": r.get("bars"),
         })
     return out
 
@@ -292,6 +293,20 @@ def main():
                     return f"<{edge}s"
             return ">=30s"
         slice_table(rows, lag_bucket, "by entry lag past the bar close", min_n=30)
+
+    # Also pre-stated: the per-rule minimum history was lowered from a flat 40 bars, which
+    # admits symbols whose recording has only just resumed after a gap. If those trade
+    # worse, the minimum was lowered too far and this is where it shows.
+    if any(r["bars"] is not None for r in rows):
+        def bars_bucket(r):
+            b = r["bars"]
+            if b is None:
+                return "unknown"
+            for edge in (10, 20, 40, 80):
+                if b < edge:
+                    return f"<{edge} bars"
+            return ">=80 bars"
+        slice_table(rows, bars_bucket, "by history available at entry", min_n=30)
 
     print("\n" + "-" * 88)
     print("CONFIRMATION ON RECORDED CANDLES  (a different sample; this decides)")

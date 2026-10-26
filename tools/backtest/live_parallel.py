@@ -286,7 +286,7 @@ class Book:
                     self.inflight, self.settled_pnl)
 
 
-def trade(args, token, book, log_lock, symbol, payout, side, bar_time):
+def trade(args, token, book, log_lock, symbol, payout, side, bar_time, bars):
     """Place one option and wait for it alone. Runs in its own thread."""
     # Generous, because the gateway paces order sends: an order late in a wave waits its
     # turn before it is even transmitted, and cutting it off here would discard a trade
@@ -319,6 +319,11 @@ def trade(args, token, book, log_lock, symbol, payout, side, bar_time):
     row = {"ts": placed_at, "symbol": symbol, "payout": payout, "side": side,
            "stake": args.stake, "duration": args.duration, "rule": args.rule,
            "bar_time": bar_time, "entry_lag": round(entry_lag, 1),
+           # How much clean history the symbol had. Recorded because lowering the minimum
+           # from a flat 40 bars is a change that could admit symbols whose recording has
+           # only just resumed after a gap — so the review can test that rather than take
+           # my word that reading one bar needs only one bar.
+           "bars": bars,
            "result": result, "pnl": pnl, "order_id": oid}
     with log_lock:
         try:
@@ -459,13 +464,14 @@ def main():
                     seen[symbol] = w["bar_time"]   # do not chase it next cycle either
                     continue
                 seen[symbol] = w["bar_time"]
-                picks.append((symbol, a.get("payout") or 0, side, w["bar_time"]))
+                picks.append((symbol, a.get("payout") or 0, side, w["bar_time"],
+                              len(w["closes"])))
                 if len(picks) >= room:
                     break
 
-            for symbol, payout, side, bar_time in picks:
+            for symbol, payout, side, bar_time, bars in picks:
                 pool.submit(trade, args, token, book, log_lock,
-                            symbol, payout, side, bar_time)
+                            symbol, payout, side, bar_time, bars)
 
             cycles += 1
             placed, wins, losses, ties, unknown, inflight, settled = book.snapshot()
