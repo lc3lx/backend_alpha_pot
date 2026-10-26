@@ -68,6 +68,7 @@ def load_live(path):
             "ts": float(r.get("ts") or 0),
             "rule": r.get("rule"),
             "duration": int(r.get("duration") or 0),
+            "entry_lag": r.get("entry_lag"),
         })
     return out
 
@@ -275,6 +276,22 @@ def main():
     slice_table(rows, lambda r: r["side"], "by direction", min_n=30)
     slice_table(rows, lambda r: f"h{int((r['ts'] // 3600) % 24):02d}",
                 "by hour of day", min_n=40)
+
+    # The backtest enters at the deciding bar's close; live entries land seconds later
+    # because order sends are paced. This is the one slice with a reason to exist before
+    # the data is seen, so a difference here is evidence rather than a coincidence found
+    # by looking: if the late entries win less, the lag is costing real money and the wave
+    # cap belongs lower.
+    if any(r["entry_lag"] is not None for r in rows):
+        def lag_bucket(r):
+            lag = r["entry_lag"]
+            if lag is None:
+                return "unknown"
+            for edge in (5, 10, 15, 20, 30):
+                if lag < edge:
+                    return f"<{edge}s"
+            return ">=30s"
+        slice_table(rows, lag_bucket, "by entry lag past the bar close", min_n=30)
 
     print("\n" + "-" * 88)
     print("CONFIRMATION ON RECORDED CANDLES  (a different sample; this decides)")

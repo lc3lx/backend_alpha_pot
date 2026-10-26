@@ -278,11 +278,14 @@ class Book:
 
 def trade(args, token, book, log_lock, symbol, payout, side, bar_time):
     """Place one option and wait for it alone. Runs in its own thread."""
+    # Generous, because the gateway paces order sends: an order late in a wave waits its
+    # turn before it is even transmitted, and cutting it off here would discard a trade
+    # the broker was about to accept.
     res, err = call("/orders", token, {
         "user_id": args.user_id, "broker": BROKER, "asset": symbol,
         "amount": args.stake, "duration_seconds": args.duration,
         "direction": side,
-    }, timeout=45)
+    }, timeout=120)
     if res is None:
         return
     oid = res.get("order_id") or res.get("id")
@@ -290,6 +293,10 @@ def trade(args, token, book, log_lock, symbol, payout, side, bar_time):
         return
     book.on_place()
     placed_at = time.time()
+    # How far past the deciding bar's close this actually entered. The backtest enters at
+    # that close, so this is the size of the discrepancy, recorded per trade so a review
+    # can test whether the late ones performed worse rather than assuming they did not.
+    entry_lag = placed_at - (bar_time + args.period)
 
     out, err = call(
         f"/orders/outcome?user_id={args.user_id}&broker={BROKER}"
@@ -301,7 +308,8 @@ def trade(args, token, book, log_lock, symbol, payout, side, bar_time):
 
     row = {"ts": placed_at, "symbol": symbol, "payout": payout, "side": side,
            "stake": args.stake, "duration": args.duration, "rule": args.rule,
-           "bar_time": bar_time, "result": result, "pnl": pnl, "order_id": oid}
+           "bar_time": bar_time, "entry_lag": round(entry_lag, 1),
+           "result": result, "pnl": pnl, "order_id": oid}
     with log_lock:
         try:
             with open(args.log, "a", encoding="utf-8") as fh:
@@ -323,6 +331,9 @@ def main():
     ap.add_argument("--rule", default="rsi7")
     ap.add_argument("--max-age", type=float, default=25.0,
                     help="skip a signal this many seconds after its bar closed")
+    ap.add_argument("--order-gap", type=float, default=1.5,
+                    help="the gateway's measured pacing between order sends; used here "
+                         "only to cap a wave to what can be sent while still fresh")
     ap.add_argument("--max-inflight", type=int, default=40)
     ap.add_argument("--workers", type=int, default=24)
     ap.add_argument("--trades", type=int, default=5000)
@@ -393,7 +404,12 @@ def main():
                       f"${inflight*args.stake:,.2f} at risk reached the floor", flush=True)
                 break
 
-            room = min(args.max_inflight - inflight, args.trades - placed)
+            # The gateway paces order sends, so a wave longer than the freshness window
+            # would have its tail entered at a price the rule never saw. Cap the wave at
+            # what fits instead, and let the rest of the signals go untaken: entering late
+            # is measuring a different rule, which is worse than entering less often.
+            fits = max(1, int(args.max_age / max(args.order_gap, 0.01)))
+            room = min(args.max_inflight - inflight, args.trades - placed, fits)
             if room <= 0:
                 time.sleep(3)
                 continue

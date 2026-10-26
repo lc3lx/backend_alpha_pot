@@ -283,6 +283,17 @@ class QuotexLiveData:
         # be judged against B's expiry. The lock covers only the send, never the wait, so
         # orders still overlap on the wire.
         self._order_send_lock = asyncio.Lock()
+        # Quotex drops orders that arrive too close together — it does not reject them,
+        # it simply never answers, so the sender sees a timeout and the account shows
+        # nothing. Sending a wave of signals at once lost about half of them, the same
+        # instruments succeeding and failing alternately. Sends are therefore paced.
+        # Measured with tools/backtest/probe_order_rate.py: six orders sent together got
+        # 1 of 6 acknowledged, while a 1.0s gap got 6 of 6, as did 2.0s and 3.0s. 1.5s is
+        # that floor with a margin, and still allows forty orders a minute. Re-measure
+        # before lowering it; a gap that is too small loses orders silently, which is the
+        # worst of the available failures.
+        self._min_order_gap = float(os.environ.get("QUOTEX_ORDER_MIN_GAP", "1.5"))
+        self._last_order_sent = 0.0
         # order id -> settlement payload, for outcomes of orders the vendor never saw.
         self.closed_orders: dict[str, dict] = {}
         self._order_seq = 0
@@ -1122,6 +1133,11 @@ class QuotexLiveData:
             for attempt in range(1, max_attempts + 1):
                 balance_before = self.balance_at
                 async with self._order_send_lock:
+                    # Paced inside the lock, so waiting for the gap also holds back every
+                    # other order rather than letting them bunch up behind it.
+                    wait = self._min_order_gap - (time.monotonic() - self._last_order_sent)
+                    if wait > 0:
+                        await asyncio.sleep(wait)
                     try:
                         await self.send_event("settings/apply", settings_payload)
                         await self.send_raw('42["tick"]')
@@ -1129,6 +1145,7 @@ class QuotexLiveData:
                         print(f"[ORDER WARN] settings/apply or tick error: {e}", flush=True)
 
                     await self.send_event("orders/open", order_payload)
+                    self._last_order_sent = time.monotonic()
 
                 try:
                     # Shielded, so a timeout here leaves the order still pending: a late
