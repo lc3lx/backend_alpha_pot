@@ -425,6 +425,10 @@ def main():
                            and (a.get("payout") or 0) >= args.min_payout]
             pool_assets.sort(key=lambda a: -(a.get("payout") or 0))
 
+            # Deliberately NOT skipping symbols that already have an option open:
+            # probe_same_asset.py checked, and Quotex accepts a second order on an
+            # instrument whose first is still live. Skipping them would have cost real
+            # signals to prevent a restriction the broker does not impose.
             picks, scanned, stale = [], 0, 0
             for a in pool_assets:
                 symbol = a.get("symbol")

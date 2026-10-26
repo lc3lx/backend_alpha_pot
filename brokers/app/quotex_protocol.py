@@ -277,22 +277,20 @@ class QuotexLiveData:
         # here rather than through the vendor's pub/sub: this object already sees every
         # frame, and depending on the vendor meant an order could fail on an attribute.
         self._pending_orders: list[tuple[int, str, asyncio.Future]] = []
-        # `settings/apply` sets the chart's asset and expiry, and Quotex validates the
-        # `orders/open` that follows against it. Two orders placed in the same instant
-        # would otherwise interleave — A's settings, B's settings, A's open — and A would
-        # be judged against B's expiry. The lock covers only the send, never the wait, so
-        # orders still overlap on the wire.
+        # Held for a whole placement — send AND acknowledgement — because Quotex answers
+        # one order at a time. It also keeps `settings/apply`, which sets the chart's
+        # asset and expiry that the following `orders/open` is validated against, from
+        # interleaving as A's settings, B's settings, A's open.
         self._order_send_lock = asyncio.Lock()
         # Quotex drops orders that arrive too close together — it does not reject them,
         # it simply never answers, so the sender sees a timeout and the account shows
         # nothing. Sending a wave of signals at once lost about half of them, the same
         # instruments succeeding and failing alternately. Sends are therefore paced.
-        # Measured with tools/backtest/probe_order_rate.py: six orders sent together got
-        # 1 of 6 acknowledged, while a 1.0s gap got 6 of 6, as did 2.0s and 3.0s. 1.5s is
-        # that floor with a margin, and still allows forty orders a minute. Re-measure
-        # before lowering it; a gap that is too small loses orders silently, which is the
-        # worst of the available failures.
-        self._min_order_gap = float(os.environ.get("QUOTEX_ORDER_MIN_GAP", "1.5"))
+        # A small extra breath after the previous order's acknowledgement. Serialising
+        # placements is what actually fixed the losses; this is belt and braces, measured
+        # with tools/backtest/probe_order_rate.py (orders sent together: 1 of 6
+        # acknowledged; 1s apart: 6 of 6).
+        self._min_order_gap = float(os.environ.get("QUOTEX_ORDER_MIN_GAP", "0.6"))
         self._last_order_sent = 0.0
         # order id -> settlement payload, for outcomes of orders the vendor never saw.
         self.closed_orders: dict[str, dict] = {}
@@ -1077,7 +1075,12 @@ class QuotexLiveData:
 
         future = asyncio.get_running_loop().create_future()
         entry = (req_id, clean_asset, future)
-        self._pending_orders.append(entry)
+        # Registered inside the send lock below, NOT here. Registering on arrival put
+        # every queued order on the pending list at once, so each acknowledgement had
+        # several candidates to belong to and was discarded as ambiguous — six orders
+        # submitted together got one through, the last survivor, while the same six sent
+        # one at a time all succeeded in under 1.2s each. Since placements are
+        # serialised, exactly one order is ever waiting, and matching is never a guess.
 
         now_ts = int(time.time())
         duration = max(1, int(duration_seconds))
@@ -1130,14 +1133,21 @@ class QuotexLiveData:
         max_attempts = 3
         per_attempt = 4.0
         try:
-            for attempt in range(1, max_attempts + 1):
-                balance_before = self.balance_at
-                async with self._order_send_lock:
-                    # Paced inside the lock, so waiting for the gap also holds back every
-                    # other order rather than letting them bunch up behind it.
-                    wait = self._min_order_gap - (time.monotonic() - self._last_order_sent)
-                    if wait > 0:
-                        await asyncio.sleep(wait)
+            # The lock spans the acknowledgement, not just the send. Quotex will not take
+            # a second order while it is still answering the first: three placed two
+            # seconds apart produced exactly one s_orders/open and nothing at all for the
+            # other two, retries included, while the same three placed one-after-another
+            # all succeeded. So orders are serialised by COMPLETION rather than merely
+            # spaced in time. At roughly two seconds each this still clears a wave of
+            # signals well inside the window where an entry is still fresh.
+            async with self._order_send_lock:
+                gap = self._min_order_gap - (time.monotonic() - self._last_order_sent)
+                if gap > 0:
+                    await asyncio.sleep(gap)
+                self._pending_orders.append(entry)
+                sent_at = time.time()      # the queue wait is not part of the silence
+                for attempt in range(1, max_attempts + 1):
+                    balance_before = self.balance_at
                     try:
                         await self.send_event("settings/apply", settings_payload)
                         await self.send_raw('42["tick"]')
@@ -1147,25 +1157,27 @@ class QuotexLiveData:
                     await self.send_event("orders/open", order_payload)
                     self._last_order_sent = time.monotonic()
 
-                try:
-                    # Shielded, so a timeout here leaves the order still pending: a late
-                    # acknowledgement on the next wait still resolves it.
-                    response = await asyncio.wait_for(asyncio.shield(future), per_attempt)
-                    break
-                except asyncio.TimeoutError:
-                    if self._order_opened(req_id, clean_asset, balance_before, sent_at):
-                        # Something of OURS opened. Never resend — wait out the ack.
-                        try:
-                            response = await asyncio.wait_for(future, 8.0)
-                        except asyncio.TimeoutError:
-                            # A bare TimeoutError escaping here told the caller nothing.
-                            raise BrokerError(
-                                self._describe_silence(order_payload, sent_at)
-                            ) from None
+                    try:
+                        # Shielded, so a timeout here leaves the order still pending: a
+                        # late acknowledgement on the next wait still resolves it.
+                        response = await asyncio.wait_for(
+                            asyncio.shield(future), per_attempt)
                         break
-                    if attempt >= max_attempts:
-                        raise BrokerError(self._describe_silence(order_payload, sent_at))
-                    # Genuinely silent: nothing opened, so it is safe to send again.
+                    except asyncio.TimeoutError:
+                        if self._order_opened(req_id, clean_asset, balance_before, sent_at):
+                            # Something of OURS opened. Never resend — wait out the ack.
+                            try:
+                                response = await asyncio.wait_for(future, 8.0)
+                            except asyncio.TimeoutError:
+                                # A bare TimeoutError here told the caller nothing.
+                                raise BrokerError(
+                                    self._describe_silence(order_payload, sent_at)
+                                ) from None
+                            break
+                        if attempt >= max_attempts:
+                            raise BrokerError(
+                                self._describe_silence(order_payload, sent_at))
+                        # Genuinely silent: nothing opened, so it is safe to send again.
         finally:
             if entry in self._pending_orders:
                 self._pending_orders.remove(entry)
