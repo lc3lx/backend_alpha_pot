@@ -181,7 +181,7 @@ def window(candle_dir, symbol, period, want=80, min_bars=40):
 #: and a symbol is unusable until it has recorded a clean run again — at a flat 40 bars
 #: that is forty minutes of blackout per restart, even for a rule that reads one bar.
 RULE_MIN_BARS = {
-    "rsi7": 12, "rsi7-20": 12, "rsi5": 10, "rsi14": 20,
+    "rsi-any": 12, "rsi7": 12, "rsi7-20": 12, "rsi5": 10, "rsi14": 20,
     "wick": 2, "body-60": 2, "body-75": 2,
 }
 
@@ -228,7 +228,23 @@ def make_rule(name):
             return "PUT" if w["c"] > w["o"] else "CALL"
         return rule
 
+    def rsi_union(specs):
+        """
+        Any of several RSI extremes fires. One rule, not a vote: the first to trigger
+        decides. Its purpose is throughput — the individual RSI extremes are rare, and
+        the union roughly doubles the rate without loosening any of their thresholds.
+        """
+        rules = [rsi_rule(p, lo, hi) for p, lo, hi in specs]
+        def rule(w):
+            for r in rules:
+                side = r(w)
+                if side is not None:
+                    return side
+            return None
+        return rule
+
     table = {
+        "rsi-any": rsi_union([(5, 15, 85), (7, 20, 80), (7, 15, 85)]),
         "rsi7": rsi_rule(7, 15, 85),
         "rsi7-20": rsi_rule(7, 20, 80),
         "rsi5": rsi_rule(5, 15, 85),

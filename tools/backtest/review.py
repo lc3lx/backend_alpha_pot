@@ -155,7 +155,19 @@ def rsi_rule(period, low, high):
 #: Keyed by the names live_parallel.py writes into each log row, so a review always
 #: re-tests the rule that was actually traded. Confirming a rule the run was not using
 #: is worse than not confirming at all: it reads as evidence while describing nothing.
+def rsi_union(specs):
+    rules = [rsi_rule(p, lo, hi) for p, lo, hi in specs]
+    def rule(ctx):
+        for fn in rules:
+            side = fn(ctx)
+            if side is not None:
+                return side
+        return None
+    return rule
+
+
 RULES = {
+    "rsi-any": rsi_union([(5, 15, 85), (7, 20, 80), (7, 15, 85)]),
     "rsi7": rsi_rule(7, 15, 85),
     "rsi7-20": rsi_rule(7, 20, 80),
     "rsi5": rsi_rule(5, 15, 85),
