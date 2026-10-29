@@ -1014,7 +1014,11 @@ class QuotexLiveData:
             else ("open" if known.is_open else "listed but closed")
         )
         return (
-            "Quotex did not acknowledge the order within 12s. "
+            # UNCONFIRMED, not "failed": with no acknowledgement we cannot tell whether
+            # the deal opened, and on a half-deaf socket it usually has. Callers must
+            # treat the stake as possibly at risk rather than as never spent.
+            "UNCONFIRMED: Quotex did not acknowledge the order within 12s; it may "
+            "still have opened. "
             f"Sent asset={order_payload['asset']} ({listed}), "
             f"action={order_payload['action']}, amount={order_payload['amount']}, "
             f"isDemo={order_payload['isDemo']}, optionType={order_payload['optionType']}, "
@@ -1122,8 +1126,16 @@ class QuotexLiveData:
         }
 
         sent_at = time.time()
-        max_attempts = 3
-        per_attempt = 4.0
+        # ONE send by default, never a resend. Retrying on silence assumed that silence
+        # meant nothing had opened. That held while the socket heard everything, and it
+        # failed badly the moment the socket went half-deaf — still receiving quotes,
+        # no longer receiving order or balance frames. Each "unanswered" order had in
+        # fact opened, so three resends turned three signals into nine live trades the
+        # bookkeeping never saw. A lost order costs one missed signal; a duplicated one
+        # costs real, untracked exposure. Raise QUOTEX_ORDER_SEND_ATTEMPTS only on a
+        # connection known to deliver every order frame.
+        max_attempts = max(1, int(os.environ.get("QUOTEX_ORDER_SEND_ATTEMPTS", "1")))
+        per_attempt = 12.0 if max_attempts == 1 else 4.0
         try:
             # The lock spans the acknowledgement, not just the send. Quotex will not take
             # a second order while it is still answering the first: three placed two

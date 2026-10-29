@@ -277,6 +277,7 @@ class Book:
         # how fast the account can be drawn down while nobody is watching.
         self.loss_streak = 0
         self.paused_until = 0.0
+        self.unconfirmed = 0
 
     def on_place(self):
         with self.lock:
@@ -361,6 +362,26 @@ def trade(args, token, book, log_lock, symbol, payout, side, bar_time, bars,
         "direction": side,
     }, timeout=120)
     if res is None:
+        # An UNCONFIRMED order may well have opened — that is how a half-deaf socket
+        # turned three signals into nine live trades. It is logged so the ledger can
+        # account for it, and it trips the stop in the main loop: a connection that
+        # cannot confirm orders cannot be traded on without hidden exposure.
+        if err and ("UNCONFIRMED" in err or "did not acknowledge" in err):
+            with book.lock:
+                book.unconfirmed += 1
+            with log_lock:
+                try:
+                    with open(args.log, "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps({
+                            "ts": time.time(), "symbol": symbol, "side": side,
+                            "stake": args.stake, "rule": args.rule,
+                            "result": "UNCONFIRMED", "pnl": 0.0,
+                            "error": err[:200]}) + "\n")
+                except OSError:
+                    pass
+            print(f"[{time.strftime('%H:%M:%S')}] UNCONFIRMED order on {symbol}: "
+                  f"the broker did not acknowledge it, so it may be open unseen",
+                  flush=True)
         return
     oid = res.get("order_id") or res.get("id")
     if not oid:
@@ -485,6 +506,13 @@ def main():
                 break
             # The floor has to account for money already at risk, or a losing wave can
             # take the balance through it while the check still reads clear.
+            if book.unconfirmed:
+                print(f"STOPPING: {book.unconfirmed} order(s) went unconfirmed — the "
+                      f"connection is not delivering order frames, so further orders "
+                      f"could open without being tracked. Restore the session "
+                      f"(restart the gateway, then scaralpha-api) before resuming.",
+                      flush=True)
+                break
             # Target first: the mission is to stop at it, not to trade past it. Money
             # still at risk counts against reaching it, so an open option cannot carry
             # the account over the line and then lose it back.
