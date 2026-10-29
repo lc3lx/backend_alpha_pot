@@ -272,6 +272,11 @@ class Book:
         self.placed = 0
         self.inflight = 0
         self.settled_pnl = 0.0
+        # Consecutive settled losses, for the pause. Measured over 5,054 trades a streak
+        # does NOT predict the next outcome, so this is not a forecast — it is a cap on
+        # how fast the account can be drawn down while nobody is watching.
+        self.loss_streak = 0
+        self.paused_until = 0.0
 
     def on_place(self):
         with self.lock:
@@ -283,8 +288,10 @@ class Book:
             self.inflight -= 1
             if "WIN" in result:
                 self.wins += 1
+                self.loss_streak = 0
             elif "LOSS" in result or "LOSE" in result:
                 self.losses += 1
+                self.loss_streak += 1
             elif "TIE" in result:
                 self.ties += 1
             else:
@@ -411,6 +418,11 @@ def main():
     ap.add_argument("--workers", type=int, default=24)
     ap.add_argument("--trades", type=int, default=5000)
     ap.add_argument("--min-balance", type=float, default=250.0)
+    ap.add_argument("--target-balance", type=float, default=0.0,
+                    help="stop as soon as the balance reaches this; 0 = no target")
+    ap.add_argument("--pause-after-losses", type=int, default=0,
+                    help="consecutive losses that trigger a pause; 0 = never")
+    ap.add_argument("--pause-minutes", type=float, default=15.0)
     ap.add_argument("--log", default="/home/web/backtest/parallel.jsonl")
     args = ap.parse_args()
 
@@ -473,6 +485,22 @@ def main():
                 break
             # The floor has to account for money already at risk, or a losing wave can
             # take the balance through it while the check still reads clear.
+            # Target first: the mission is to stop at it, not to trade past it. Money
+            # still at risk counts against reaching it, so an open option cannot carry
+            # the account over the line and then lose it back.
+            if args.target_balance and bal_now - inflight * args.stake >= args.target_balance:
+                print(f"TARGET REACHED: ${bal_now:,.2f} (target "
+                      f"${args.target_balance:,.2f}); stopping", flush=True)
+                break
+            if args.pause_after_losses and book.loss_streak >= args.pause_after_losses:
+                with book.lock:
+                    book.loss_streak = 0
+                    book.paused_until = time.time() + args.pause_minutes * 60
+                print(f"[{time.strftime('%H:%M:%S')}] {args.pause_after_losses} losses in "
+                      f"a row; pausing {args.pause_minutes:.0f} min", flush=True)
+            if time.time() < book.paused_until:
+                time.sleep(20)
+                continue
             if bal_now - inflight * args.stake < args.min_balance:
                 print(f"STOPPING: ${bal_now:,.2f} with "
                       f"${inflight*args.stake:,.2f} at risk reached the floor", flush=True)
