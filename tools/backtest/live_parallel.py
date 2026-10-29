@@ -302,7 +302,48 @@ class Book:
                     self.inflight, self.settled_pnl)
 
 
-def trade(args, token, book, log_lock, symbol, payout, side, bar_time, bars):
+def signal_strength(rule_name, w):
+    """
+    How strong the entry signal was, measured on the exact window the decision used.
+
+    Recorded at entry because it cannot be rebuilt afterwards: the candle files are pruned
+    after a retention window and their recent bars are revised as ticks arrive, so a
+    reconstruction from disk disagreed with what the trader actually saw — trades that
+    fired on an RSI extreme came back with no extreme at all. The question this answers
+    is whether a stronger-looking signal wins more often, which is the only condition
+    under which staking more on it could help.
+
+      rsi*   RSI points past whichever threshold fired (0 = just over the line)
+      body*  body as a fraction of the bar's range
+      wick   the longer wick as a fraction of the range
+    """
+    if rule_name.startswith("rsi"):
+        specs = {"rsi7": [(7, 15, 85)], "rsi7-20": [(7, 20, 80)],
+                 "rsi5": [(5, 15, 85)], "rsi14": [(14, 20, 80)],
+                 "rsi-any": [(5, 15, 85), (7, 20, 80), (7, 15, 85)]}.get(rule_name, [])
+        best = None
+        for p, lo, hi in specs:
+            r = rsi_last(w["closes"], p)
+            if r is None:
+                continue
+            past = lo - r if r <= lo else (r - hi if r >= hi else None)
+            if past is not None:
+                best = past if best is None else max(best, past)
+        return None if best is None else round(best, 3)
+    rng = w["h"] - w["l"]
+    if rng <= 0:
+        return None
+    if rule_name.startswith("body"):
+        return round(abs(w["c"] - w["o"]) / rng, 4)
+    if rule_name == "wick":
+        up = (w["h"] - max(w["o"], w["c"])) / rng
+        dn = (min(w["o"], w["c"]) - w["l"]) / rng
+        return round(max(up, dn), 4)
+    return None
+
+
+def trade(args, token, book, log_lock, symbol, payout, side, bar_time, bars,
+          strength=None):
     """Place one option and wait for it alone. Runs in its own thread."""
     # Generous, because the gateway paces order sends: an order late in a wave waits its
     # turn before it is even transmitted, and cutting it off here would discard a trade
@@ -340,6 +381,7 @@ def trade(args, token, book, log_lock, symbol, payout, side, bar_time, bars):
            # only just resumed after a gap — so the review can test that rather than take
            # my word that reading one bar needs only one bar.
            "bars": bars,
+           "strength": strength,
            "result": result, "pnl": pnl, "order_id": oid}
     with log_lock:
         try:
@@ -481,13 +523,13 @@ def main():
                     continue
                 seen[symbol] = w["bar_time"]
                 picks.append((symbol, a.get("payout") or 0, side, w["bar_time"],
-                              len(w["closes"])))
+                              len(w["closes"]), signal_strength(args.rule, w)))
                 if len(picks) >= room:
                     break
 
-            for symbol, payout, side, bar_time, bars in picks:
+            for symbol, payout, side, bar_time, bars, strength in picks:
                 pool.submit(trade, args, token, book, log_lock,
-                            symbol, payout, side, bar_time, bars)
+                            symbol, payout, side, bar_time, bars, strength)
 
             cycles += 1
             placed, wins, losses, ties, unknown, inflight, settled = book.snapshot()
