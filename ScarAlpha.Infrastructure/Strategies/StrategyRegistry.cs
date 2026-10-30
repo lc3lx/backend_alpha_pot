@@ -11,6 +11,7 @@ public sealed class StrategyRegistry : IStrategyRegistry
         new("ema", "EMA 9/21 + RSI Scalping", StrategyCatalogStatus.Active, Enabled: true),
         new("alt5", "Alternating Candles (5m)", StrategyCatalogStatus.Active, Enabled: true),
         new("time_analysis", "التحليل الزمني (Time Analysis)", StrategyCatalogStatus.Active, Enabled: true),
+        new("iphone_journey", "رحلة الآيفون مع Scar Alpha AI (iPhone Journey)", StrategyCatalogStatus.Active, Enabled: true),
         new("macd", "MACD", StrategyCatalogStatus.ComingSoon, Enabled: false),
         new("ai", "AI", StrategyCatalogStatus.ComingSoon, Enabled: false)
     ];

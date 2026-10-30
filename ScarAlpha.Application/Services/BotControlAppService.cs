@@ -54,6 +54,9 @@ public sealed class BotControlAppService
             throw new ApiException(ApiErrorCodes.ValidationError, "Select at least one trading pair before starting the bot.");
         var access = await _access.CheckAsync(_currentUser.UserId, ct);
         AccountAppService.EnsureAllowed(access);
+        var strategyId = RequireRunnableStrategy(request.StrategyId);
+        if (IPhoneJourneyStrategy.Is(strategyId))
+            request = JourneyLimits(request);
         return Map(_runtime.Start(
             _currentUser.UserId,
             assets,
@@ -66,15 +69,58 @@ public sealed class BotControlAppService
             request.SignalConfirmationEnabled,
             request.RiskLevel,
             request.NotificationsEnabled,
-            RequireRunnableStrategy(request.StrategyId),
+            strategyId,
             request.StakeMode,
             request.MarketTypeId));
+    }
+
+    /// <summary>
+    /// iPhone Journey runs on fixed terms whatever the client sends: a flat $1-2 stake with
+    /// no progression, a five-minute option, and BOTH session limits switched on. The
+    /// target and the loss limit are the user's to choose, but a journey can never start
+    /// without them — an open-ended run of a rule with no measured edge is exactly how
+    /// an account is drained slowly instead of stopped early.
+    /// </summary>
+    private static BotStartRequest JourneyLimits(BotStartRequest request)
+    {
+        static decimal Bound(decimal value, decimal fallback, decimal max) =>
+            value <= 0 ? fallback : Math.Min(value, max);
+
+        return request with
+        {
+            Amount = IPhoneJourneyStrategy.ClampStake(request.Amount),
+            DurationSeconds = IPhoneJourneyStrategy.ExpiryCandles * 60,
+            StakeMode = StakeProgression.RedSignalPro,
+            DailyProfitTarget = Bound(request.DailyProfitTarget, 20m, 1_000m),
+            DailyLossLimit = Bound(request.DailyLossLimit, 20m, 1_000m),
+            AutoStopAtProfit = true,
+            AutoStopAtLoss = true,
+        };
     }
 
     public BotRuntimeDto Pause() => Map(_runtime.Pause(_currentUser.UserId));
     public BotRuntimeDto Stop() => Map(_runtime.Stop(_currentUser.UserId));
 
-    public BotRuntimeDto Apply(BotApplyRequest request) =>
+    public BotRuntimeDto Apply(BotApplyRequest request)
+    {
+        // A running journey keeps its fixed terms: Apply can change the target, the loss
+        // limit or the pairs, never the stake progression, the expiry, or switch a limit off.
+        var effective = request.StrategyId ?? _runtime.Get(_currentUser.UserId).StrategyId;
+        if (IPhoneJourneyStrategy.Is(effective))
+        {
+            request = request with
+            {
+                Amount = request.Amount is decimal a ? IPhoneJourneyStrategy.ClampStake(a) : null,
+                DurationSeconds = request.DurationSeconds is null ? null : IPhoneJourneyStrategy.ExpiryCandles * 60,
+                StakeMode = StakeProgression.RedSignalPro,
+                AutoStopAtProfit = true,
+                AutoStopAtLoss = true,
+            };
+        }
+        return ApplyCore(request);
+    }
+
+    private BotRuntimeDto ApplyCore(BotApplyRequest request) =>
         Map(_runtime.Apply(
             _currentUser.UserId,
             request.Asset,

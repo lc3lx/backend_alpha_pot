@@ -534,6 +534,14 @@ public sealed class TradeOutcomeWorker : ITradeOutcomeWorker, IHostedService
             var wasLoss = next == TradeStatus.Loss;
             botRuntime.ApplyStakeAfterOutcome(trade.UserId, trade.Amount, wasLoss);
 
+            if (IPhoneJourneyStrategy.Is(PairCooldownRegistry.StrategyFromBotKey(trade.IdempotencyKey)))
+            {
+                IPhoneJourneyStrategy.RecordOutcome(
+                    trade.UserId,
+                    next == TradeStatus.Tie ? null : next == TradeStatus.Profit,
+                    DateTimeOffset.UtcNow);
+            }
+
             if (wasLoss)
             {
                 // Bench the pair for this user so their bot stops re-entering a setup the market just

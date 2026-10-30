@@ -452,6 +452,7 @@ public sealed class BotRuntimeService : IBotRuntimeService
         if (string.Equals(id, "ema", StringComparison.OrdinalIgnoreCase)) return "ema";
         if (string.Equals(id, "smart", StringComparison.OrdinalIgnoreCase)) return "smart";
         if (string.Equals(id, "alt5", StringComparison.OrdinalIgnoreCase)) return "alt5";
+        if (IPhoneJourneyStrategy.Is(id)) return IPhoneJourneyStrategy.Id;
         if (string.Equals(id, "time_analysis", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(id, "temporal", StringComparison.OrdinalIgnoreCase)) return "time_analysis";
         return "rsi";

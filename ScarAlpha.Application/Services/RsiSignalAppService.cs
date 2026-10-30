@@ -507,6 +507,19 @@ public sealed class RsiSignalAppService
                 return await ExecuteIfRequestedAsync(altSignal, options, autoExecute, ct, analysis.Regime);
             }
 
+            // iPhone Journey reads only the closed series — never the live-quote overlay —
+            // because the rule was measured on closed bars and enters at their close.
+            if (IPhoneJourneyStrategy.Is(strategyId))
+            {
+                var journeySignal = IPhoneJourneyStrategy.BuildSignal(
+                    symbol,
+                    analysis.Closes,
+                    analysis.ClosedCandles[^1].Timestamp,
+                    wirePeriod,
+                    now);
+                return await ExecuteIfRequestedAsync(journeySignal, options, autoExecute, ct, analysis.Regime);
+            }
+
             // Smart mode hands engine choice to the regime; an explicit choice is kept.
             var engineId = RegimeRouting.IsSmart(strategyId)
                 ? RegimeRouting.EngineFor(analysis.Regime?.Regime ?? MarketRegime.Unclear)
@@ -882,6 +895,21 @@ public sealed class RsiSignalAppService
         if (AlternatingStrategy.Is(bot.StrategyId) != AlternatingStrategy.Is(signal.StrategyId))
             return signal with { AutomationError = "STRATEGY_MISMATCH", Signal = "None" };
 
+        // Without this an RSI setup polled by the Mini App would pass the EMA check below
+        // (neither side is EMA) and trade underneath an iPhone Journey bot.
+        if (IPhoneJourneyStrategy.Is(bot.StrategyId) != IPhoneJourneyStrategy.Is(signal.StrategyId))
+            return signal with { AutomationError = "STRATEGY_MISMATCH", Signal = "None" };
+
+        if (IPhoneJourneyStrategy.Is(signal.StrategyId))
+        {
+            if (IPhoneJourneyStrategy.IsPaused(userId, DateTimeOffset.UtcNow, out _))
+                return signal with { AutomationError = "LOSS_STREAK_PAUSE", Signal = "None" };
+            // The shared gate allows 30s; the journey was measured entering within 25s of
+            // the close, and a setup scanned at 20s can reach execution after that.
+            if ((DateTimeOffset.UtcNow - signal.CandleTime).TotalSeconds > IPhoneJourneyStrategy.EntryWindowSeconds)
+                return signal with { AutomationError = "SETUP_EXPIRED", Signal = "None" };
+        }
+
         if (!RegimeRouting.IsSmart(bot.StrategyId) &&
             !AlternatingStrategy.Is(bot.StrategyId) &&
             IsEma(bot.StrategyId) != IsEma(signal.StrategyId))
@@ -919,13 +947,19 @@ public sealed class RsiSignalAppService
         if (selected.Count > 0 && !BotAssetList.Contains(selected, signal.Asset))
             return signal with { AutomationError = "ASSET_NOT_SELECTED" };
 
-        if (PairPayoutGate.MinPayoutPercent > 0)
+        var journey = IPhoneJourneyStrategy.Is(signal.StrategyId);
+        if (PairPayoutGate.MinPayoutPercent > 0 || journey)
         {
             var client = await EnsureLiveClientAsync(ct);
             if (client is not null)
             {
                 var payout = await PairPayoutGate.TryGetPayoutAsync(client, signal.Asset, ct).ConfigureAwait(false);
                 if (payout is int known && !PairPayoutGate.IsTradable(known))
+                    return signal with { AutomationError = "PAYOUT_TOO_LOW", Signal = "None" };
+                // The journey's own floor, stricter than the global one: breakeven is
+                // 1/(1+payout), so every point of payout below 90 raises the bar the rule
+                // already fails to clear. An unknown payout is refused, not assumed.
+                if (journey && (payout is not int jp || jp < IPhoneJourneyStrategy.MinPayoutPercent))
                     return signal with { AutomationError = "PAYOUT_TOO_LOW", Signal = "None" };
             }
         }
@@ -1010,6 +1044,7 @@ public sealed class RsiSignalAppService
 
             var strategyKey = AlternatingStrategy.Is(signal.StrategyId)
                 ? AlternatingStrategy.Id
+                : IPhoneJourneyStrategy.Is(signal.StrategyId) ? IPhoneJourneyStrategy.Id
                 : IsEma(signal.StrategyId) ? "ema" : "rsi";
             var key = $"bot:{strategyKey}:{signal.Asset.Trim().ToUpperInvariant()}:{signal.CandleTime.ToUnixTimeSeconds()}:{signal.Signal}";
             try
@@ -1039,7 +1074,9 @@ public sealed class RsiSignalAppService
                 var trade = await _trades.PlaceTradeAsync(new PlaceTradeRequest(
                     Asset: signal.Asset,
                     Direction: signal.Signal.ToUpperInvariant(),
-                    Amount: bot.Amount,
+                    // The journey's stake is flat and bounded server-side, whatever the
+                    // runtime holds: no client can turn it into a progression.
+                    Amount: journey ? IPhoneJourneyStrategy.ClampStake(bot.Amount) : bot.Amount,
                     DurationSeconds: durationSeconds,
                     StrategyId: strategyKey), key, ct);
 
@@ -1073,6 +1110,11 @@ public sealed class RsiSignalAppService
                             durationBars: expiryCandles,
                             timeframeSeconds: options.TimeframeSeconds);
                     }
+                }
+                else if (journey)
+                {
+                    // Nothing to mark: the idempotency key carries the bar and direction,
+                    // so the same setup cannot place twice.
                 }
                 else
                 {
