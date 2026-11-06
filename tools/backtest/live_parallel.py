@@ -42,6 +42,8 @@ import argparse
 import json
 import math
 import os
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -278,15 +280,31 @@ class Book:
         self.loss_streak = 0
         self.paused_until = 0.0
         self.unconfirmed = 0
+        # Stakes vary per trade under risk sizing, so exposure is a sum, not a count.
+        self.inflight_stake = 0.0
+        self.turnover = 0.0
+        # Results since the last review, for the "re-assess after 3 trades" rule.
+        self.batch = []
 
-    def on_place(self):
+    def on_place(self, stake=None):
+        stake = self.stake if stake is None else stake
         with self.lock:
             self.placed += 1
             self.inflight += 1
+            self.inflight_stake += stake
+            self.turnover += stake
 
-    def on_settle(self, result, pnl):
+    def take_batch(self):
+        with self.lock:
+            out, self.batch = self.batch, []
+            return out
+
+    def on_settle(self, result, pnl, stake=None):
+        stake = self.stake if stake is None else stake
         with self.lock:
             self.inflight -= 1
+            self.inflight_stake -= stake
+            self.batch.append((result, pnl))
             if "WIN" in result:
                 self.wins += 1
                 self.loss_streak = 0
@@ -302,7 +320,7 @@ class Book:
 
     def expected(self):
         with self.lock:
-            return self.opening - self.inflight * self.stake + self.settled_pnl
+            return self.opening - self.inflight_stake + self.settled_pnl
 
     def snapshot(self):
         with self.lock:
@@ -350,15 +368,117 @@ def signal_strength(rule_name, w):
     return None
 
 
+# ---- risk sizing: 1-3% of the balance, set by what each signal band actually achieved -----
+
+# Strength bands, split at the quartiles of 1,244 settled rsi-any trades (Nov 2026).
+STRENGTH_BANDS = [(0.0, 1.27), (1.27, 3.0), (3.0, 5.28), (5.28, float("inf"))]
+
+
+class Sizer:
+    """
+    Stake as a share of the balance, per strength band, earned from the trade log rather
+    than assumed. Measured on that log, a stronger-looking RSI extreme did NOT win more
+    often (weakest quarter 56.3%, strongest 52.4%), so "bigger on strong signals" would
+    have been a bet on intuition the data contradicts. Instead a band is staked by its own
+    record against breakeven at its own average payout:
+      3%  its 95% Wilson lower bound clears breakeven (the edge is statistically there)
+      2%  its win rate is above breakeven, but not yet provably
+      1%  otherwise, or fewer than MIN_N trades to judge by
+    Recomputed at every review, so the tiers follow new results instead of freezing.
+    """
+
+    MIN_N = 100
+
+    def __init__(self, log_path, rule, duration):
+        self.log_path, self.rule, self.duration = log_path, rule, duration
+        self.table = [(1, 0, 0.0, 0.0, 0.0)] * len(STRENGTH_BANDS)
+        self.refresh()
+
+    @staticmethod
+    def band(strength):
+        if strength is None:
+            return None
+        for i, (lo, hi) in enumerate(STRENGTH_BANDS):
+            if lo <= strength < hi:
+                return i
+        return len(STRENGTH_BANDS) - 1
+
+    def refresh(self):
+        stats = [[0, 0, 0.0] for _ in STRENGTH_BANDS]          # n, wins, payout sum
+        try:
+            with open(self.log_path, encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    if r.get("rule") != self.rule or r.get("duration") != self.duration:
+                        continue
+                    res = str(r.get("result", "")).upper()
+                    if res not in ("WIN", "LOSS"):
+                        continue
+                    b = self.band(r.get("strength"))
+                    if b is None:
+                        continue
+                    stats[b][0] += 1
+                    stats[b][1] += res == "WIN"
+                    stats[b][2] += float(r.get("payout") or 90)
+        except OSError:
+            pass
+        table = []
+        for n, k, psum in stats:
+            if n < self.MIN_N:
+                table.append((1, n, k / n if n else 0.0, 0.0, 0.0))
+                continue
+            be = 1 / (1 + psum / n / 100)
+            lo, _ = wilson(k, n)
+            pct = 3 if lo > be else (2 if k / n > be else 1)
+            table.append((pct, n, k / n, lo, be))
+        self.table = table
+
+    def pct(self, strength):
+        b = self.band(strength)
+        return 1 if b is None else self.table[b][0]
+
+    def describe(self):
+        return "  ".join(f"[{lo:g}-{hi:g}) {t[0]}% (n={t[1]}, {t[2]*100:.1f}% vs be {t[4]*100:.1f}%)"
+                         for (lo, hi), t in zip(STRENGTH_BANDS, self.table))
+
+
+def stake_for(balance_now, pct, cap_pct=3.0):
+    """Whole dollars (the gateway rounds anyway), never above cap_pct of the balance."""
+    cap = math.floor(balance_now * cap_pct / 100)
+    if cap < 1:
+        return None                      # even the $1 minimum would exceed the cap
+    return min(cap, max(1, math.floor(balance_now * pct / 100)))
+
+
+def external_open(user_id):
+    """
+    Options open on this account by the website bot, which trades through the .NET API and
+    so is invisible to this process. The 3-open limit is for the account, not for one bot.
+    None when it cannot be read: the caller then opens nothing rather than guess.
+    """
+    try:
+        out = subprocess.run(
+            ["bash", "/root/db.sh", "-N", "-e",
+             f"select count(*) from trades where UserId='{user_id}' and Status in (0,1)"],
+            capture_output=True, text=True, timeout=10)
+        return int(out.stdout.strip()) if out.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
 def trade(args, token, book, log_lock, symbol, payout, side, bar_time, bars,
-          strength=None):
+          strength=None, stake=None, pct=None):
     """Place one option and wait for it alone. Runs in its own thread."""
+    stake = args.stake if stake is None else stake
     # Generous, because the gateway paces order sends: an order late in a wave waits its
     # turn before it is even transmitted, and cutting it off here would discard a trade
     # the broker was about to accept.
     res, err = call("/orders", token, {
         "user_id": args.user_id, "broker": BROKER, "asset": symbol,
-        "amount": args.stake, "duration_seconds": args.duration,
+        "amount": stake, "duration_seconds": args.duration,
         "direction": side,
     }, timeout=120)
     if res is None:
@@ -374,7 +494,7 @@ def trade(args, token, book, log_lock, symbol, payout, side, bar_time, bars,
                     with open(args.log, "a", encoding="utf-8") as fh:
                         fh.write(json.dumps({
                             "ts": time.time(), "symbol": symbol, "side": side,
-                            "stake": args.stake, "rule": args.rule,
+                            "stake": stake, "rule": args.rule,
                             "result": "UNCONFIRMED", "pnl": 0.0,
                             "error": err[:200]}) + "\n")
                 except OSError:
@@ -386,7 +506,7 @@ def trade(args, token, book, log_lock, symbol, payout, side, bar_time, bars,
     oid = res.get("order_id") or res.get("id")
     if not oid:
         return
-    book.on_place()
+    book.on_place(stake)
     placed_at = time.time()
     # How far past the deciding bar's close this actually entered. The backtest enters at
     # that close, so this is the size of the discrepancy, recorded per trade so a review
@@ -399,10 +519,10 @@ def trade(args, token, book, log_lock, symbol, payout, side, bar_time, bars,
         token, timeout=args.duration + 150)
     result = str((out or {}).get("result", "")).upper()
     pnl = float((out or {}).get("profit_loss") or 0.0)
-    book.on_settle(result, pnl)
+    book.on_settle(result, pnl, stake)
 
     row = {"ts": placed_at, "symbol": symbol, "payout": payout, "side": side,
-           "stake": args.stake, "duration": args.duration, "rule": args.rule,
+           "stake": stake, "pct": pct, "duration": args.duration, "rule": args.rule,
            "bar_time": bar_time, "entry_lag": round(entry_lag, 1),
            # How much clean history the symbol had. Recorded because lowering the minimum
            # from a flat 40 bars is a change that could admit symbols whose recording has
@@ -445,11 +565,27 @@ def main():
                     help="consecutive losses that trigger a pause; 0 = never")
     ap.add_argument("--pause-minutes", type=float, default=15.0)
     ap.add_argument("--log", default="/home/web/backtest/parallel.jsonl")
+    # ── capital rules (the user's, mandatory) ──
+    ap.add_argument("--risk-sizing", action="store_true",
+                    help="stake 1-3%% of the balance by signal band instead of a flat --stake")
+    ap.add_argument("--capital", type=float, default=0.0,
+                    help="starting capital the loss limit is measured on; 0 = balance at start")
+    ap.add_argument("--max-loss-pct", type=float, default=0.0,
+                    help="stop for good once this %% of --capital is lost; 0 = use --min-balance")
+    ap.add_argument("--daily-target-pct", type=float, default=0.0,
+                    help="stop for the day at +this %% of the day's opening balance; 0 = none")
+    ap.add_argument("--review-every", type=int, default=0,
+                    help="after this many trades, wait for them to settle and re-assess "
+                         "before entering again; 0 = never")
+    ap.add_argument("--count-account-open", action="store_true",
+                    help="count the website bot's open trades against --max-inflight")
     args = ap.parse_args()
 
     token = os.environ.get("BROKER_GATEWAY_TOKEN")
     if not token:
         sys.exit("BROKER_GATEWAY_TOKEN not set")
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", args.user_id):
+        sys.exit("--user-id must be a UUID")
 
     rule = make_rule(args.rule)
     min_bars = RULE_MIN_BARS.get(args.rule, 40)
@@ -461,28 +597,52 @@ def main():
     if "demo" not in kind.lower():
         sys.exit(f"REFUSING: account type {kind!r} is not demo")
 
+    capital = args.capital or bal
+    floor = capital * (1 - args.max_loss_pct / 100) if args.max_loss_pct else args.min_balance
+    sizer = Sizer(args.log, args.rule, args.duration) if args.risk_sizing else None
+
     book = Book(bal, args.stake)
     log_lock = threading.Lock()
     seen = {}                 # symbol -> bar_time already traded, so one entry per bar
     errors = 0
     cycles = 0
+    futures = []              # one per option still open (or still being placed)
+    since_review = 0          # trades submitted since the last re-assessment
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    day_open = bal
+    day_done = False
+    last_drift = 0.0
 
-    print(f"[{time.strftime('%H:%M:%S')}] parallel run: target {args.trades} trades",
-          flush=True)
-    print(f"  balance ${bal:,.2f}  stake ${args.stake:.2f} flat  "
-          f"expiry {args.duration}s ({hold} x {args.period}s bars)", flush=True)
+    def stamp():
+        return time.strftime("%H:%M:%S")
+
+    print(f"[{stamp()}] parallel run: target {args.trades} trades", flush=True)
+    if sizer:
+        print(f"  balance ${bal:,.2f}  stake 1-3% of balance by signal band  "
+              f"expiry {args.duration}s ({hold} x {args.period}s bars)", flush=True)
+        print(f"  bands: {sizer.describe()}", flush=True)
+    else:
+        print(f"  balance ${bal:,.2f}  stake ${args.stake:.2f} flat  "
+              f"expiry {args.duration}s ({hold} x {args.period}s bars)", flush=True)
     print(f"  rule {args.rule}  payout>={args.min_payout}%  "
           f"signal fresh within {args.max_age:.0f}s of bar close", flush=True)
-    print(f"  up to {args.max_inflight} trades open at once "
-          f"(${args.max_inflight*args.stake:,.0f} exposure)", flush=True)
-    print(f"  ledger identity checked every cycle: "
-          f"opening - inflight*stake + settled\n", flush=True)
+    print(f"  capital ${capital:,.2f}  hard floor ${floor:,.2f}"
+          + (f" ({args.max_loss_pct:.0f}% max loss)" if args.max_loss_pct else ""), flush=True)
+    if args.daily_target_pct:
+        print(f"  daily target +{args.daily_target_pct:g}% of the day's opening balance (UTC day)",
+              flush=True)
+    print(f"  up to {args.max_inflight} trades open at once"
+          + (" across the whole account" if args.count_account_open else ""), flush=True)
+    if args.review_every:
+        print(f"  re-assess after every {args.review_every} trades", flush=True)
+    print("", flush=True)
 
     pool = ThreadPoolExecutor(max_workers=args.workers)
     try:
         while True:
+            futures = [f for f in futures if not f.done()]
             placed, wins, losses, ties, unknown, inflight, settled = book.snapshot()
-            if placed >= args.trades and inflight == 0:
+            if placed >= args.trades and not futures:
                 break
             if placed >= args.trades:
                 time.sleep(5)
@@ -496,16 +656,14 @@ def main():
                 if errors >= 15:
                     print("too many unusable balance reads; stopping", flush=True)
                     break
-                print(f"[{time.strftime('%H:%M:%S')}] balance unreadable "
-                      f"({err or 'returned 0'}); retrying", flush=True)
+                print(f"[{stamp()}] balance unreadable ({err or 'returned 0'}); retrying",
+                      flush=True)
                 time.sleep(20)
                 continue
             errors = 0
             if "demo" not in kind.lower():
                 print(f"STOPPING: account is now {kind!r}", flush=True)
                 break
-            # The floor has to account for money already at risk, or a losing wave can
-            # take the balance through it while the check still reads clear.
             if book.unconfirmed:
                 print(f"STOPPING: {book.unconfirmed} order(s) went unconfirmed — the "
                       f"connection is not delivering order frames, so further orders "
@@ -513,33 +671,101 @@ def main():
                       f"(restart the gateway, then scaralpha-api) before resuming.",
                       flush=True)
                 break
-            # Target first: the mission is to stop at it, not to trade past it. Money
-            # still at risk counts against reaching it, so an open option cannot carry
-            # the account over the line and then lose it back.
-            if args.target_balance and bal_now - inflight * args.stake >= args.target_balance:
+
+            # An outside change to the balance (a demo reset or top-up) is not a result.
+            # One last time it read as "TARGET REACHED: $10,000" — so it stops instead.
+            drift = bal_now - book.expected()
+            jump = abs(drift - last_drift)
+            if jump > max(25.0, 0.2 * capital):
+                print(f"STOPPING: EXTERNAL BALANCE CHANGE of {drift - last_drift:+,.2f} "
+                      f"(balance ${bal_now:,.2f}) that no trade explains — the account was "
+                      f"reset or topped up outside this run. Restart with new capital.",
+                      flush=True)
+                break
+            last_drift = drift
+
+            # Rule 2 — the loss limit. The balance already excludes money on open options,
+            # so it is the worst case if every open option loses. Within one minimum stake
+            # of the floor counts as reached: no trade could be placed without crossing it.
+            if bal_now - 1 < floor:
+                if futures:
+                    time.sleep(5)            # let the open options settle first
+                    continue
+                print(f"STOPPING: ${bal_now:,.2f} reached the floor ${floor:,.2f}", flush=True)
+                break
+            if args.target_balance and bal_now >= args.target_balance:
                 print(f"TARGET REACHED: ${bal_now:,.2f} (target "
                       f"${args.target_balance:,.2f}); stopping", flush=True)
                 break
+
+            # Rule 3 — the daily target. Reached: no new trades until the next UTC day.
+            today = time.strftime("%Y-%m-%d", time.gmtime())
+            if today != day:
+                day, day_open, day_done = today, bal_now, False
+                print(f"[{stamp()}] new day {day}: opening balance ${day_open:,.2f}, "
+                      f"target ${day_open * (1 + args.daily_target_pct / 100):,.2f}",
+                      flush=True)
+            if args.daily_target_pct and not day_done and \
+                    bal_now >= day_open * (1 + args.daily_target_pct / 100):
+                day_done = True
+                print(f"[{stamp()}] DAILY TARGET REACHED: ${day_open:,.2f} -> ${bal_now:,.2f} "
+                      f"({(bal_now / day_open - 1) * 100:+.2f}%); no new trades until "
+                      f"00:00 UTC", flush=True)
+            if day_done:
+                time.sleep(60)
+                continue
+
+            # Rule 8 — re-assess after every N trades: wait for them all to settle, read the
+            # results, refresh the sizing bands from the log, then decide whether to go on.
+            if args.review_every and since_review >= args.review_every:
+                if futures:
+                    time.sleep(5)
+                    continue
+                batch = book.take_batch()
+                bw = sum("WIN" in r for r, _ in batch)
+                bl = sum(("LOSS" in r or "LOSE" in r) for r, _ in batch)
+                bp = sum(p for _, p in batch)
+                if sizer:
+                    sizer.refresh()
+                verdict = "continue"
+                if batch and bl == len(batch):
+                    with book.lock:
+                        book.paused_until = time.time() + args.pause_minutes * 60
+                    verdict = f"all {bl} lost: pause {args.pause_minutes:.0f} min"
+                print(f"[{stamp()}] REVIEW after {len(batch)} trades: W{bw}/L{bl} "
+                      f"{bp:+.2f}  balance ${bal_now:,.2f} (day {(bal_now / day_open - 1) * 100:+.2f}%)"
+                      f"  -> {verdict}" + (f"\n  bands: {sizer.describe()}" if sizer else ""),
+                      flush=True)
+                since_review = 0
+
             if args.pause_after_losses and book.loss_streak >= args.pause_after_losses:
                 with book.lock:
                     book.loss_streak = 0
                     book.paused_until = time.time() + args.pause_minutes * 60
-                print(f"[{time.strftime('%H:%M:%S')}] {args.pause_after_losses} losses in "
+                print(f"[{stamp()}] {args.pause_after_losses} losses in "
                       f"a row; pausing {args.pause_minutes:.0f} min", flush=True)
             if time.time() < book.paused_until:
                 time.sleep(20)
                 continue
-            if bal_now - inflight * args.stake < args.min_balance:
-                print(f"STOPPING: ${bal_now:,.2f} with "
-                      f"${inflight*args.stake:,.2f} at risk reached the floor", flush=True)
-                break
+
+            # Rule 7 — open trades are counted for the whole account, the website bot's too.
+            ext = 0
+            if args.count_account_open:
+                ext = external_open(args.user_id)
+                if ext is None:
+                    print(f"[{stamp()}] cannot read the account's other open trades; "
+                          f"opening nothing this bar", flush=True)
+                    time.sleep(args.period)
+                    continue
 
             # The gateway paces order sends, so a wave longer than the freshness window
             # would have its tail entered at a price the rule never saw. Cap the wave at
             # what fits instead, and let the rest of the signals go untaken: entering late
             # is measuring a different rule, which is worse than entering less often.
             fits = max(1, int(args.max_age / max(args.order_gap, 0.01)))
-            room = min(args.max_inflight - inflight, args.trades - placed, fits)
+            room = min(args.max_inflight - len(futures) - ext, args.trades - placed, fits)
+            if args.review_every:
+                room = min(room, args.review_every - since_review)
             if room <= 0:
                 time.sleep(3)
                 continue
@@ -557,8 +783,7 @@ def main():
 
             # Deliberately NOT skipping symbols that already have an option open:
             # probe_same_asset.py checked, and Quotex accepts a second order on an
-            # instrument whose first is still live. Skipping them would have cost real
-            # signals to prevent a restriction the broker does not impose.
+            # instrument whose first is still live.
             picks, scanned, stale = [], 0, 0
             for a in pool_assets:
                 symbol = a.get("symbol")
@@ -583,27 +808,37 @@ def main():
                 if len(picks) >= room:
                     break
 
+            # Rule 4 — size each trade by its band, 1-3% of the balance, never above 3%,
+            # and never so large that losing it would cross the floor.
+            budget = bal_now
+            sent = 0
             for symbol, payout, side, bar_time, bars, strength in picks:
-                pool.submit(trade, args, token, book, log_lock,
-                            symbol, payout, side, bar_time, bars, strength)
+                pct = sizer.pct(strength) if sizer else None
+                stake = stake_for(budget, pct) if sizer else args.stake
+                if stake is None or budget - stake < floor:
+                    print(f"[{stamp()}] skip {symbol}: a ${stake or 0} stake would breach "
+                          f"the 3% cap or the floor", flush=True)
+                    continue
+                futures.append(pool.submit(trade, args, token, book, log_lock, symbol, payout,
+                                           side, bar_time, bars, strength, stake, pct))
+                budget -= stake
+                sent += 1
+                since_review += 1
 
             cycles += 1
             placed, wins, losses, ties, unknown, inflight, settled = book.snapshot()
             n = wins + losses
-            drift = bal_now - book.expected()
             lo, hi = wilson(wins, n) if n >= 30 else (0.0, 0.0)
             ci = f" CI=[{lo*100:.1f},{hi*100:.1f}]" if n >= 30 else ""
-            # A trade whose outcome never arrived is excluded from settled P&L, so it
-            # legitimately moves the identity by up to stake*(1+payout). Allowing for that
-            # is what keeps the flag meaningful instead of permanently lit.
             tolerance = max(5.0, args.stake * 3) + unknown * args.stake * 2.0
             flag = f"  DRIFT {drift:+.2f} (tol {tolerance:.0f})" if abs(drift) > tolerance else ""
-            if picks or cycles % 10 == 0:
-                print(f"[{time.strftime('%H:%M:%S')}] {placed:>5}/{args.trades}  "
-                      f"+{len(picks)} new, {inflight} open  "
-                      f"W{wins}/L{losses}/T{ties}/U{unknown}  "
+            if sent or cycles % 10 == 0:
+                print(f"[{stamp()}] {placed:>5}/{args.trades}  "
+                      f"+{sent} new, {len(futures)} open" + (f" (+{ext} site)" if ext else "") +
+                      f"  W{wins}/L{losses}/T{ties}/U{unknown}  "
                       f"win={wins/n*100 if n else 0:.1f}%{ci}  "
                       f"pnl={settled:+.2f}  bal=${bal_now:,.2f}  "
+                      f"day={(bal_now / day_open - 1) * 100:+.2f}%  "
                       f"[scan {scanned}, stale {stale}]{flag}", flush=True)
 
             # Wake just after the next bar closes. Signals exist only in the seconds after
@@ -640,7 +875,7 @@ def main():
         print(f"  ledger drift         {final - book.expected():+.2f}  "
               f"(of which up to {unknown*args.stake*2:.2f} is the {unknown} unsettled)")
     if placed:
-        turnover = placed * args.stake
+        turnover = book.turnover
         print(f"  turnover             ${turnover:,.2f}")
         print(f"  return on turnover   {settled/turnover*100:+.3f}%")
     print(f"  log                  {args.log}")
