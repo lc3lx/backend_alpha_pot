@@ -200,8 +200,12 @@ public sealed class BinollaAuthAppService
             // here is what lets them answer the challenge: the guided-login endpoints
             // require a token, and failing the whole login would leave them without one.
             await StoreLoginPasswordAsync(user, request.Password, ct);
+            // Quotex has no guided login: its check is Cloudflare in front of the sign-in
+            // page. The user goes on the waiting list with credentials saved on the link,
+            // so the reconnect endpoint can link the account once the broker lets it in.
+            var queued = await QueueForBrokerAsync(user, request, ct);
             _logger.LogInformation(
-                "Binolla web login needs a human check user={UserId}", user.Id);
+                "Binolla web login needs a human check user={UserId} queued={Queued}", user.Id, queued);
 
             return new BinollaAuthResponse(
                 AccessToken: _jwt.CreateToken(user),
@@ -213,7 +217,8 @@ public sealed class BinollaAuthAppService
                 ApprovalStatus: AdminApprovalStatus.Pending.ToString(),
                 LastConnectedAt: null,
                 Balance: null,
-                RequiresGuidedLogin: true);
+                RequiresGuidedLogin: !queued,
+                Queued: queued);
         }
 
         await StoreLoginPasswordAsync(user, request.Password, ct);
@@ -330,6 +335,46 @@ public sealed class BinollaAuthAppService
     /// Keeps the login password so a later silent re-login does not need the user again.
     /// Encrypted at rest; a failure here must never fail the sign-in itself.
     /// </summary>
+    /// <summary>
+    /// Saves a Quotex user's credentials on a pending, disconnected link — the waiting list.
+    /// Returns false for any other broker (Binolla keeps its guided login) or on failure.
+    /// An existing link keeps its approval and connection history; only the credentials and
+    /// venue are refreshed, so a re-queued user is not reset to unapproved.
+    /// </summary>
+    private async Task<bool> QueueForBrokerAsync(User user, BinollaCredentialRequest request, CancellationToken ct)
+    {
+        try
+        {
+            var link = await _links.GetByUserIdAsync(user.Id, ct);
+            var broker = Brokers.Normalize(request.Broker ?? link?.Broker);
+            if (!string.Equals(broker, "quotex", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            var now = DateTimeOffset.UtcNow;
+            link ??= new BinollaLink
+            {
+                Id = Guid.NewGuid(),
+                UserId = user.Id,
+                AccountType = DomainAccount.Real,
+                Status = BinollaLinkStatus.Disconnected,
+                AdminApproved = false,
+                ApprovalStatus = AdminApprovalStatus.Pending,
+                CreatedAt = now,
+            };
+            link.Broker = broker;
+            link.EncryptedBinollaEmail = _protector.Encrypt(request.Email.Trim());
+            link.EncryptedBinollaPassword = _protector.Encrypt(request.Password);
+            link.UpdatedAt = now;
+            await _links.UpsertAsync(link, ct);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to queue user {UserId} for the broker", user.Id);
+            return false;
+        }
+    }
+
     private async Task StoreLoginPasswordAsync(User user, string password, CancellationToken ct)
     {
         try

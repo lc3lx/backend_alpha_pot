@@ -411,6 +411,10 @@ public sealed class NodeBinollaCredentialAuth : IBinollaCredentialAuth
         if (blob.Contains("captchaRequired\":true", StringComparison.OrdinalIgnoreCase)
             || blob.Contains("captcharequired\": true", StringComparison.OrdinalIgnoreCase))
             return "captcha-required";
+        // Quotex's Cloudflare stopped the browser before the sign-in form loaded. Same
+        // meaning as a CAPTCHA: the credentials were never submitted, let alone refused.
+        if (blob.Contains("requires browser verification", StringComparison.OrdinalIgnoreCase))
+            return "captcha-required";
 
         // A 403 on Binolla's auth endpoint is an edge/WAF refusal — the request was
         // rejected before the password was ever checked. Wrong credentials come back as

@@ -36,7 +36,13 @@ public sealed record BinollaAuthResponse(
     /// broker is not linked yet. The client should open the guided login and let the user
     /// answer the challenge; the access token above is what authorises those calls.
     /// </summary>
-    bool RequiresGuidedLogin = false);
+    bool RequiresGuidedLogin = false,
+    /// <summary>
+    /// The broker blocked the login with a check this server cannot answer (Quotex's
+    /// Cloudflare). The account and its encrypted credentials are saved and waiting: the
+    /// client shows the waiting list, and a later reconnect links it without a new login.
+    /// </summary>
+    bool Queued = false);
 
 public sealed record MeResponse(
     string UserId,
