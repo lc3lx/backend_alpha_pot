@@ -184,7 +184,11 @@ public sealed class BinollaAuthAppService
                     AdminApproved: access.AdminApproved,
                     ApprovalStatus: access.ApprovalStatus,
                     LastConnectedAt: link?.LastConnectedAt,
-                    Balance: balance);
+                    Balance: balance,
+                    // Never linked to Quotex yet: still on the waiting list, so the client
+                    // goes straight back to it instead of opening an empty dashboard.
+                    Queued: !isLive && link is not null && link.LastConnectedAt is null &&
+                            string.Equals(broker, "quotex", StringComparison.OrdinalIgnoreCase));
             }
         }
 
@@ -193,19 +197,22 @@ public sealed class BinollaAuthAppService
         {
             connect = await _binolla.LoginWithCredentialsForUserAsync(user.Id, request, ct);
         }
-        catch (ApiException ex) when (ex.Code == ApiErrorCodes.BinollaCaptchaRequired)
+        catch (Exception ex) when (!ct.IsCancellationRequested && !NeedsTheUser(ex))
         {
-            // The credentials were never judged — the broker interrupted with a human
-            // check. The app account is real and already resolved, so signing the user in
-            // here is what lets them answer the challenge: the guided-login endpoints
-            // require a token, and failing the whole login would leave them without one.
+            // The broker could not be reached or would not let this server in: a human
+            // check, Cloudflare, a dead proxy tunnel, a timeout. None of it is the user's
+            // fault, so the user is not shown an error. A Quotex user goes on the waiting
+            // list with the credentials saved on the link, and the reconnect endpoint links
+            // the account once the broker lets it in. Binolla keeps its guided login for a
+            // CAPTCHA; any other Binolla failure is reported as before.
+            var captcha = ex is ApiException { Code: ApiErrorCodes.BinollaCaptchaRequired };
             await StoreLoginPasswordAsync(user, request.Password, ct);
-            // Quotex has no guided login: its check is Cloudflare in front of the sign-in
-            // page. The user goes on the waiting list with credentials saved on the link,
-            // so the reconnect endpoint can link the account once the broker lets it in.
             var queued = await QueueForBrokerAsync(user, request, ct);
             _logger.LogInformation(
-                "Binolla web login needs a human check user={UserId} queued={Queued}", user.Id, queued);
+                "Broker login did not complete user={UserId} queued={Queued} reason={Reason}",
+                user.Id, queued, ex.Message.Length > 160 ? ex.Message[..160] : ex.Message);
+            if (!queued && !captcha)
+                throw;
 
             return new BinollaAuthResponse(
                 AccessToken: _jwt.CreateToken(user),
@@ -341,6 +348,17 @@ public sealed class BinollaAuthAppService
     /// An existing link keeps its approval and connection history; only the credentials and
     /// venue are refreshed, so a re-queued user is not reset to unapproved.
     /// </summary>
+    /// <summary>
+    /// Failures only the user can fix, which waiting would never resolve: a wrong password,
+    /// or Quotex mailing a PIN that must be confirmed on Quotex first. These are still shown.
+    /// </summary>
+    private static bool NeedsTheUser(Exception ex) =>
+        ex is ApiException api &&
+        (api.Code is ApiErrorCodes.QuotexPinRequired or ApiErrorCodes.InvalidCredentials ||
+         api.Message.Contains("Invalid email or password", StringComparison.OrdinalIgnoreCase) ||
+         api.Message.Contains("wrong password", StringComparison.OrdinalIgnoreCase) ||
+         api.Message.Contains("This account was deleted", StringComparison.OrdinalIgnoreCase));
+
     private async Task<bool> QueueForBrokerAsync(User user, BinollaCredentialRequest request, CancellationToken ct)
     {
         try

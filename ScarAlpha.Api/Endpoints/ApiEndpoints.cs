@@ -56,7 +56,9 @@ public static class AuthEndpoints
                 adminApproved = result.AdminApproved,
                 approvalStatus = result.ApprovalStatus,
                 lastConnectedAt = result.LastConnectedAt,
-                balance = result.Balance
+                balance = result.Balance,
+                requiresGuidedLogin = result.RequiresGuidedLogin,
+                queued = result.Queued
             });
         }).RequireRateLimiting("connect");
 
@@ -76,7 +78,9 @@ public static class AuthEndpoints
                 adminApproved = result.AdminApproved,
                 approvalStatus = result.ApprovalStatus,
                 lastConnectedAt = result.LastConnectedAt,
-                balance = result.Balance
+                balance = result.Balance,
+                requiresGuidedLogin = result.RequiresGuidedLogin,
+                queued = result.Queued
             });
         }).RequireRateLimiting("connect");
 
