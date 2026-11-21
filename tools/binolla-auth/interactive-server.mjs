@@ -113,6 +113,7 @@ function view(session, { withFrame = true } = {}) {
 function finish(session, state, message) {
   session.state = state;
   session.message = message ?? null;
+  if (state !== 'awaiting-user' && state !== 'starting') clearInterval(session.ticker);
   log('session_state', { id: session.id.slice(0, 8), state });
 }
 
@@ -160,7 +161,17 @@ function watchForToken(session) {
 
 /** Has the login completed? Checked after every relayed event. */
 async function pollForSuccess(session) {
-  if (session.state !== 'awaiting-user') return;
+  if (session.state !== 'awaiting-user' || session.polling) return;
+  session.polling = true;
+  try { await pollOnce(session); } finally { session.polling = false; }
+}
+
+async function pollOnce(session) {
+  // Where the page is, logged on change so a stalled login shows the step it stopped at.
+  try {
+    const where = `${new URL(session.page.url()).pathname} | ${(await session.page.title()).slice(0, 40)}`;
+    if (where !== session.lastWhere) { session.lastWhere = where; log('page', { id: session.id.slice(0, 8), where }); }
+  } catch { /* navigating */ }
 
   if (!session.token && session.broker !== 'quotex') {
     try {
@@ -264,6 +275,9 @@ async function startSession({ email, password, proxy, broker }) {
   };
   sessions.set(session.id, session);
   watchForToken(session);
+  // Progress without waiting for the client to poll: fill, submit and take the SSID as
+  // soon as the page allows it.
+  session.ticker = setInterval(() => { pollForSuccess(session).then(() => shot(session)).catch(() => {}); }, 2000);
 
   try {
     await page.goto(urls.loginUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
@@ -290,6 +304,18 @@ async function prefill(session) {
   session.prefilled = true;
   // The credentials are in the page now; nothing else needs them in memory.
   session.password = null;
+  log('prefilled', { id: session.id.slice(0, 8) });
+  // Quotex: press Sign in for the user too. The only step left to them is Cloudflare's
+  // box (if it shows); a PIN or a second check still appears in the relayed page.
+  if (session.broker === 'quotex') {
+    await page.waitForTimeout(400);
+    for (const sel of ['button[type="submit"]:visible', 'button:has-text("Sign in"):visible', 'button:has-text("Log in"):visible']) {
+      try {
+        const btn = page.locator(sel).first();
+        if (await btn.count()) { await btn.click({ timeout: 4000 }); log('submitted', { id: session.id.slice(0, 8) }); break; }
+      } catch { /* try the next one */ }
+    }
+  }
 }
 
 async function fillIfPresent(page, selectors, value) {
@@ -360,6 +386,7 @@ function clamp(value, min, max) {
 
 async function closeSession(session) {
   sessions.delete(session.id);
+  clearInterval(session.ticker);
   try {
     await session.browser.close();
   } catch {
