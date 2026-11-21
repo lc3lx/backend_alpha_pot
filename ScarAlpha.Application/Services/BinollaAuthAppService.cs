@@ -185,9 +185,9 @@ public sealed class BinollaAuthAppService
                     ApprovalStatus: access.ApprovalStatus,
                     LastConnectedAt: link?.LastConnectedAt,
                     Balance: balance,
-                    // Never linked to Quotex yet: still on the waiting list, so the client
-                    // goes straight back to it instead of opening an empty dashboard.
-                    Queued: !isLive && link is not null && link.LastConnectedAt is null &&
+                    // Quotex not live right now (never linked, or the session dropped):
+                    // the client opens the guided login instead of an empty dashboard.
+                    Queued: !isLive && link is not null &&
                             string.Equals(broker, "quotex", StringComparison.OrdinalIgnoreCase));
             }
         }
