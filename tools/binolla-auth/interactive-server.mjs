@@ -299,8 +299,17 @@ async function prefill(session) {
   const { page } = session;
   const email = await page.locator('input[type="email"]:visible, input[name="email"]:visible').count().catch(() => 0);
   if (!email) return;
-  await fillIfPresent(page, ['input[type="email"]', 'input[name="email"]', '#email'], session.email);
-  await fillIfPresent(page, ['input[type="password"]', 'input[name="password"]', '#password'], session.password);
+  const okEmail = await fillIfPresent(page, ['input[name="email"]', 'input[type="email"]', '#email'], session.email);
+  const okPass = await fillIfPresent(page, ['input[name="password"]', 'input[type="password"]', '#password'], session.password);
+  if (!okEmail || !okPass) {
+    // Not filled — try again on the next tick rather than submit an empty form.
+    session.fillTries = (session.fillTries || 0) + 1;
+    log('prefill_retry', { id: session.id.slice(0, 8), email: okEmail, password: okPass, tries: session.fillTries });
+    if (session.fillTries < 6) return;
+    session.prefilled = true;           // give up filling; the user can type in the relayed page
+    session.password = null;
+    return;
+  }
   session.prefilled = true;
   // The credentials are in the page now; nothing else needs them in memory.
   session.password = null;
@@ -319,14 +328,20 @@ async function prefill(session) {
 }
 
 async function fillIfPresent(page, selectors, value) {
+  // Only a VISIBLE field counts: Quotex keeps the hidden registration form's inputs earlier
+  // in the page, and filling the first match typed the credentials into a form nobody sees.
   if (!value) return false;
   for (const selector of selectors) {
+    const el = page.locator(`${selector}:visible`).first();
     try {
-      const el = page.locator(selector).first();
-      if (await el.count()) {
-        await el.fill(value, { timeout: 4_000 });
-        return true;
-      }
+      if (!(await el.count())) continue;
+      await el.click({ timeout: 3_000 }).catch(() => {});
+      await el.fill(value, { timeout: 4_000 });
+      if ((await el.inputValue().catch(() => '')) === value) return true;
+      // A framework that ignores fill(): type it like a person would.
+      await el.fill('', { timeout: 2_000 }).catch(() => {});
+      await el.pressSequentially(value, { delay: 30, timeout: 10_000 });
+      if ((await el.inputValue().catch(() => '')) === value) return true;
     } catch {
       /* try the next selector */
     }
