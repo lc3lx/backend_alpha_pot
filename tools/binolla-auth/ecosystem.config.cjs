@@ -18,8 +18,11 @@ module.exports = {
     {
       name: 'scaralpha-login',
       cwd: __dirname,
-      script: path.join(__dirname, 'interactive-server.mjs'),
-      interpreter: 'node',
+      // Under a virtual display, so the page the user drives is a full browser. Quotex puts
+      // a Cloudflare "Verify you are human" box in front of its sign-in; the user ticks it.
+      script: '/usr/bin/xvfb-run',
+      args: ['-a', '-s', '-screen 0 1280x900x24', 'node', path.join(__dirname, 'interactive-server.mjs')],
+      interpreter: 'none',
       instances: 1,
       // Sessions and their browsers live in this process's memory, so a second copy would
       // answer with a browser that never saw the user's login. Never cluster this.

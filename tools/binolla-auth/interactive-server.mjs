@@ -37,6 +37,7 @@ import { randomUUID } from 'node:crypto';
 import { chromium } from 'playwright';
 
 import {
+  brokerPreset,
   buildCookieHeader,
   extractToken,
   extractWsAuthorizationToken,
@@ -50,6 +51,19 @@ const PORT = Number(process.env.BINOLLA_INTERACTIVE_PORT || 8110);
 const TOKEN = process.env.BINOLLA_INTERACTIVE_TOKEN || '';
 const LOGIN_URL = process.env.BINOLLA_LOGIN_URL || 'https://binolla.com/login/';
 const TRADING_URL = process.env.BINOLLA_TRADING_URL || 'https://binolla.com/trading';
+
+/**
+ * Login and trading pages per broker. Binolla keeps its env overrides; Quotex comes from
+ * the shared presets so the guided and the automatic login agree on where things are.
+ */
+function urlsFor(broker) {
+  const key = String(broker || 'binolla').trim().toLowerCase();
+  if (key !== 'quotex') {
+    return { key: 'binolla', loginUrl: LOGIN_URL, tradingUrl: TRADING_URL, cookieHosts: ['binolla.com'] };
+  }
+  const p = brokerPreset('quotex');
+  return { key, loginUrl: p.loginUrl, tradingUrl: p.tradingUrl, cookieHosts: p.cookieHosts };
+}
 
 /** The page the user is shown. Wide enough for the login form, small enough to relay. */
 const VIEWPORT = { width: 900, height: 760 };
@@ -114,7 +128,9 @@ function watchForToken(session) {
 
   page.on('websocket', (ws) => {
     const inspect = (payload) => {
-      if (session.token) return;
+      // The socket's authorization is the token that trades; it replaces an earlier one
+      // picked up from storage or an API body, never the other way round.
+      if (session.tokenSource === 'ws-auth') return;
       const token = extractWsAuthorizationToken(String(payload ?? ''));
       if (token) {
         session.token = token;
@@ -146,7 +162,7 @@ function watchForToken(session) {
 async function pollForSuccess(session) {
   if (session.state !== 'awaiting-user') return;
 
-  if (!session.token) {
+  if (!session.token && session.broker !== 'quotex') {
     try {
       const stored = await scanStorage(session.page);
       const token = normalizeToken(stored);
@@ -159,6 +175,25 @@ async function pollForSuccess(session) {
     }
   }
 
+  // Quotex shows a Cloudflare page first, so the form only exists once the user has
+  // answered it. Fill the credentials the moment it appears, once.
+  if (!session.prefilled) await prefill(session);
+
+  if (session.broker === 'quotex') {
+    // Quotex: storage and API tokens are not the SSID. Once the sign-in has left the
+    // login page, open the trading page and wait for the socket's authorization frame.
+    const url = session.page.url();
+    if (!session.token && !session.visitedTrading && session.prefilled && !/sign-in|sign-up/i.test(url)
+        && /quotex\.com|qxbroker\.com/i.test(url)) {
+      session.visitedTrading = true;
+      try {
+        await session.page.goto(session.urls.tradingUrl, { waitUntil: 'domcontentloaded', timeout: 25_000 });
+        await session.page.waitForTimeout(6_000);
+      } catch { /* the next poll tries again via the socket watcher */ }
+    }
+    if (session.tokenSource !== 'ws-auth') return;
+  }
+
   if (!session.token) return;
 
   // A token from storage or the API is not yet proof of a live trading session: the
@@ -167,7 +202,7 @@ async function pollForSuccess(session) {
   if (session.tokenSource !== 'ws-auth' && !session.visitedTrading) {
     session.visitedTrading = true;
     try {
-      await session.page.goto(TRADING_URL, { waitUntil: 'domcontentloaded', timeout: 25_000 });
+      await session.page.goto(session.urls.tradingUrl, { waitUntil: 'domcontentloaded', timeout: 25_000 });
       await session.page.waitForTimeout(6_000);
     } catch {
       /* keep whatever token we have */
@@ -175,7 +210,7 @@ async function pollForSuccess(session) {
   }
 
   try {
-    session.cookies = await buildCookieHeader(session.context);
+    session.cookies = await buildCookieHeader(session.context, session.urls.cookieHosts);
   } catch {
     /* optional */
   }
@@ -185,12 +220,15 @@ async function pollForSuccess(session) {
   await shot(session);
 }
 
-async function startSession({ email, password, proxy }) {
+async function startSession({ email, password, proxy, broker }) {
   const proxyConfig = parseProxy(proxy || process.env.BINOLLA_AUTH_PROXY || '');
+  const urls = urlsFor(broker);
 
   const launchOpts = {
-    // Headful is impossible on a headless VPS; the relay is what the user sees instead.
-    headless: true,
+    // A real (headful) browser when the process has a display — PM2 starts it under
+    // xvfb-run. The user drives it through the relay either way; this only decides
+    // whether the page they see is a full browser or a headless one.
+    headless: !process.env.DISPLAY,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -207,6 +245,11 @@ async function startSession({ email, password, proxy }) {
 
   const session = {
     id: randomUUID(),
+    broker: urls.key,
+    urls,
+    email,
+    password,
+    prefilled: false,
     browser,
     context,
     page,
@@ -223,16 +266,11 @@ async function startSession({ email, password, proxy }) {
   watchForToken(session);
 
   try {
-    await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    await page.goto(urls.loginUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
 
     // Pre-fill so the user only has to deal with the challenge, not retype credentials
-    // they already gave us.
-    await fillIfPresent(page, ['input[type="email"]', 'input[name="email"]', '#email'], email);
-    await fillIfPresent(
-      page,
-      ['input[type="password"]', 'input[name="password"]', '#password'],
-      password,
-    );
+    // they already gave us. Behind a challenge the form is not there yet; polling retries.
+    await prefill(session);
 
     finish(session, 'awaiting-user', null);
     await shot(session);
@@ -241,6 +279,17 @@ async function startSession({ email, password, proxy }) {
   }
 
   return session;
+}
+
+async function prefill(session) {
+  const { page } = session;
+  const email = await page.locator('input[type="email"]:visible, input[name="email"]:visible').count().catch(() => 0);
+  if (!email) return;
+  await fillIfPresent(page, ['input[type="email"]', 'input[name="email"]', '#email'], session.email);
+  await fillIfPresent(page, ['input[type="password"]', 'input[name="password"]', '#password'], session.password);
+  session.prefilled = true;
+  // The credentials are in the page now; nothing else needs them in memory.
+  session.password = null;
 }
 
 async function fillIfPresent(page, selectors, value) {

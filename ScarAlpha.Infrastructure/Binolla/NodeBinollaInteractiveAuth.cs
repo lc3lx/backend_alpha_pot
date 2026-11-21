@@ -36,13 +36,14 @@ public sealed class NodeBinollaInteractiveAuth : IBinollaInteractiveAuth
     }
 
     public async Task<InteractiveLoginState> StartAsync(
-        string email, string password, CancellationToken ct = default)
+        string email, string password, CancellationToken ct = default, string? broker = null)
     {
         // Launching a browser and loading the login page through a proxy is slow; the
         // budget has to cover it or the user gets an error while it is still working.
         var dto = await PostAsync<SessionDto>(
             "/session/start",
-            new { email, password },
+            // The broker decides which login page opens (Quotex or Binolla).
+            new { email, password, broker = Brokers.Normalize(broker) },
             TimeSpan.FromSeconds(90),
             ct).ConfigureAwait(false);
 

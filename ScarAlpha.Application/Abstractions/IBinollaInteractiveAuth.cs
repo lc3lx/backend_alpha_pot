@@ -22,7 +22,7 @@ public interface IBinollaInteractiveAuth
     /// first frame. Nothing is submitted — the user drives from here.
     /// </summary>
     Task<InteractiveLoginState> StartAsync(
-        string email, string password, CancellationToken ct = default);
+        string email, string password, CancellationToken ct = default, string? broker = null);
 
     /// <summary>Replays one user action into the live page and returns the next frame.</summary>
     Task<InteractiveLoginState> SendEventAsync(

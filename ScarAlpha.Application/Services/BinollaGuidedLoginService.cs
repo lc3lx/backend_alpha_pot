@@ -62,7 +62,7 @@ public sealed class BinollaGuidedLoginService
 
         var userId = _currentUser.UserId;
         var state = await _interactive
-            .StartAsync(request.Email.Trim(), request.Password, ct)
+            .StartAsync(request.Email.Trim(), request.Password, ct, request.Broker)
             .ConfigureAwait(false);
 
         Pending[state.SessionId] = new PendingLogin(userId, request);
